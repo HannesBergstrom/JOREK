@@ -33,7 +33,7 @@ module mod_particle_types
 #endif
 
   !> buffer size in bits for each particle type
-  integer,parameter :: particle_base_size                 = 480
+  integer,parameter :: particle_base_size                 = 544
   integer,parameter :: particle_fieldline_size            = 736
   integer,parameter :: particle_gc_size                   = 640
   integer,parameter :: particle_gc_vpar_size              = 640
@@ -60,6 +60,7 @@ module mod_particle_types
     integer*4 :: i_elm = 0        !< index in element_list. Negative indices indicate lost particles on the edge of - that element.
     integer*4 :: i_life = 0       !< particle lifetime index (i.e. is this still the same particle?)
     real*4    :: t_birth = 0.0    !< birth time of this particle
+    real*8    :: t_loss = 0.0     !< loss time of this particle (double precision needed to capture timescale of e.g. FO RE pushing)
     !< zero means lost without location specification.
   contains
     procedure :: copy => copy_particle
@@ -177,6 +178,7 @@ contains
     out%i_elm  = in%i_elm
     out%i_life = in%i_life
     out%t_birth= in%t_birth
+    out%t_loss = in%t_loss
   end subroutine copy_particle_base
 
   !> Copy one particle of a type kinetic_leapfrog to another
@@ -189,6 +191,7 @@ contains
     out%i_elm   = in%i_elm
     out%i_life  = in%i_life
     out%t_birth = in%t_birth
+    out%t_loss  = in%t_loss
     out%v       = in%v
     out%q       = in%q
   end subroutine copy_particle_kinetic_leapfrog
@@ -210,6 +213,7 @@ contains
     particle_out%i_elm    = particle_in%i_elm
     particle_out%i_life   = particle_in%i_life
     particle_out%t_birth  = particle_in%t_birth
+    particle_out%t_loss   = particle_in%t_loss
 
     select type (p_out => particle_out)
     type is (particle_fieldline)
@@ -592,6 +596,7 @@ contains
     call MPI_PACK(p_in%i_elm,1,MPI_INTEGER,buffer,particle_base_size,buff_position,MPI_COMM_WORLD,ierr)
     call MPI_PACK(p_in%i_life,1,MPI_INTEGER,buffer,particle_base_size,buff_position,MPI_COMM_WORLD,ierr)
     call MPI_PACK(p_in%t_birth,1,MPI_REAL,buffer,particle_base_size,buff_position,MPI_COMM_WORLD,ierr)
+    call MPI_PACK(p_in%t_loss,1,MPI_DOUBLE_PRECISION,buffer,particle_base_size,buff_position,MPI_COMM_WORLD,ierr)
   end subroutine mpi_pack_particle_base
 
   !> unpack the particle base type
@@ -611,11 +616,12 @@ contains
     call MPI_UNPACK(buffer,particle_base_size,buff_position,p_out%i_elm,1,MPI_INTEGER,MPI_COMM_WORLD,ierr)
     call MPI_UNPACK(buffer,particle_base_size,buff_position,p_out%i_life,1,MPI_INTEGER,MPI_COMM_WORLD,ierr)
     call MPI_UNPACK(buffer,particle_base_size,buff_position,p_out%t_birth,1,MPI_REAL,MPI_COMM_WORLD,ierr)
+    call MPI_UNPACK(buffer,particle_base_size,buff_position,p_out%t_loss,1,MPI_DOUBLE_PRECISION,MPI_COMM_WORLD,ierr)
   end subroutine mpi_unpack_particle_base
 
 !> Allocate and re-order a particle list in arrays
 subroutine particle_arrays_from_list(particle_list,n_particles,i_elm_arr,i_life_arr,&
-q_arr,t_birth_arr,weight_arr,v_1d_arr,E_arr,mu_arr,vpar_arr,B_norm_arr,vpar_m_arr,&
+q_arr,t_birth_arr,t_loss_arr,weight_arr,v_1d_arr,E_arr,mu_arr,vpar_arr,B_norm_arr,vpar_m_arr,&
 st_arr,x_arr,B_hat_prev_arr,v_2d_arr,x_m_arr,Astar_m_arr,Astar_k_arr,&
 Bn_k_arr,dBn_k_arr,Bnorm_k_arr,E_k_arr,dAstar_k_arr,particle_type_str)
   implicit none
@@ -625,6 +631,7 @@ Bn_k_arr,dBn_k_arr,Bnorm_k_arr,E_k_arr,dAstar_k_arr,particle_type_str)
   integer*4,dimension(:),    allocatable,intent(out) :: i_elm_arr,i_life_arr
   integer*4,dimension(:),    allocatable,intent(out) :: q_arr
   real*4,   dimension(:),    allocatable,intent(out) :: t_birth_arr
+  real*8,   dimension(:),    allocatable,intent(out) :: t_loss_arr
   real*8,   dimension(:),    allocatable,intent(out) :: weight_arr,v_1d_arr
   real*8,   dimension(:),    allocatable,intent(out) :: E_arr,mu_arr,vpar_arr
   real*8,   dimension(:),    allocatable,intent(out) :: B_norm_arr,vpar_m_arr,Bn_k_arr
@@ -642,6 +649,7 @@ Bn_k_arr,dBn_k_arr,Bnorm_k_arr,E_k_arr,dAstar_k_arr,particle_type_str)
   allocate(st_arr(size(particle_list(1)%st,1),n_particles))
   allocate(weight_arr(n_particles)); allocate(i_elm_arr(n_particles));
   allocate(i_life_arr(n_particles)); allocate(t_birth_arr(n_particles));
+  allocate(t_loss_arr(n_particles))
   select type(p=>particle_list(1))
     type is (particle_fieldline)
     allocate(v_1d_arr(n_particles))
@@ -686,7 +694,7 @@ Bn_k_arr,dBn_k_arr,Bnorm_k_arr,E_k_arr,dAstar_k_arr,particle_type_str)
     particle_type_str = "particle_gc_relativistic";
   end select
   !$omp parallel do default(none) private(ii) firstprivate(n_particles) & 
-  !$omp shared(x_arr,st_arr,t_birth_arr,weight_arr,i_elm_arr,i_life_arr,&
+  !$omp shared(x_arr,st_arr,t_birth_arr,t_loss_arr,weight_arr,i_elm_arr,i_life_arr,&
   !$omp v_1d_arr,B_hat_prev_arr,E_arr,mu_arr,q_arr,vpar_arr,&
   !$omp B_norm_arr,x_m_arr,vpar_m_arr,Astar_m_arr,Astar_k_arr,&
   !$omp dAstar_k_arr,Bn_k_arr,dBn_k_arr,Bnorm_k_arr,E_k_arr,&
@@ -695,6 +703,7 @@ Bn_k_arr,dBn_k_arr,Bnorm_k_arr,E_k_arr,dAstar_k_arr,particle_type_str)
     x_arr(:,ii)             = particle_list(ii)%x 
     st_arr(:,ii)            = particle_list(ii)%st
     t_birth_arr(ii)         = particle_list(ii)%t_birth
+    t_loss_arr(ii)          = particle_list(ii)%t_loss
     weight_arr(ii)          = particle_list(ii)%weight 
     i_elm_arr(ii)           = particle_list(ii)%i_elm
     i_life_arr(ii)          = particle_list(ii)%i_life
@@ -762,6 +771,7 @@ subroutine initialize_particle_list_to_zero(n_particles,particle_list,ierr)
   do ii=1,n_particles
     particle_list(ii)%i_elm=0;    particle_list(ii)%i_life=0; 
     particle_list(ii)%t_birth=0.; particle_list(ii)%weight=0d0;
+    particle_list(ii)%t_loss=0.;
     particle_list(ii)%st=0d0;     particle_list(ii)%x=0d0;
     select type (p=>particle_list(ii))
       type is (particle_fieldline)
@@ -789,7 +799,7 @@ end subroutine initialize_particle_list_to_zero
 
 ! fille a particle list from arrays
 subroutine particle_list_from_arrays(n_particles,particle_list,ierr,&
-i_elm_arr,i_life_arr,t_birth_arr,weight_arr,x_arr,st_arr,q_arr,&
+i_elm_arr,i_life_arr,t_birth_arr,t_loss_arr,weight_arr,x_arr,st_arr,q_arr,&
 v_1d_arr,E_arr,mu_arr,vpar_arr,B_norm_arr,vpar_m_arr,B_hat_prev_arr,&
 v_2d_arr,x_m_arr,Astar_m_arr,Astar_k_arr,Bn_k_arr,dBn_k_arr,&
 Bnorm_k_arr,E_k_arr,dAstar_k_arr)
@@ -798,6 +808,7 @@ Bnorm_k_arr,E_k_arr,dAstar_k_arr)
   integer, intent(in)                                          :: n_particles
   integer*4,dimension(:),    allocatable,intent(in),optional   :: i_elm_arr,i_life_arr
   real*4,   dimension(:),    allocatable,intent(in),optional   :: t_birth_arr
+  real*8,   dimension(:),    allocatable,intent(in),optional   :: t_loss_arr
   real*8,   dimension(:),    allocatable,intent(in),optional   :: weight_arr
   real*8,   dimension(:,:),  allocatable,intent(in),optional   :: x_arr,st_arr
   integer*4,dimension(:),    allocatable,intent(in),optional   :: q_arr
@@ -821,7 +832,7 @@ Bnorm_k_arr,E_k_arr,dAstar_k_arr)
   endif 
   !> store particle base arrays
   !$omp parallel do default(none) private(ii) firstprivate(n_particles) &
-  !$omp shared(particle_list,i_elm_arr,i_life_arr,t_birth_arr,weight_arr,&
+  !$omp shared(particle_list,i_elm_arr,i_life_arr,t_birth_arr,t_loss_arr,weight_arr,&
   !$omp st_arr,x_arr,v_1d_arr,B_hat_prev_arr,E_arr,mu_arr,q_arr,vpar_arr,&
   !$omp B_norm_arr,x_m_arr,vpar_m_arr,Astar_m_arr,Astar_k_arr,dAstar_k_arr,&
   !$omp Bn_k_arr,dBn_k_arr,Bnorm_k_arr,E_k_arr,v_2d_arr)
@@ -829,6 +840,7 @@ Bnorm_k_arr,E_k_arr,dAstar_k_arr)
     if(present(i_elm_arr))        then; if(allocated(i_elm_arr))   particle_list(ii)%i_elm    = i_elm_arr(ii);   endif;
     if(present(i_life_arr))       then; if(allocated(i_life_arr))  particle_list(ii)%i_life   = i_life_arr(ii);  endif;
     if(present(t_birth_arr))      then; if(allocated(t_birth_arr)) particle_list(ii)%t_birth  = t_birth_arr(ii); endif;
+    if(present(t_loss_arr))       then; if(allocated(t_loss_arr))  particle_list(ii)%t_loss   = t_loss_arr(ii);  endif;
     if(present(weight_arr))       then; if(allocated(weight_arr))  particle_list(ii)%weight   = weight_arr(ii);  endif;
     if(present(st_arr))           then; if(allocated(st_arr))      particle_list(ii)%st       = st_arr(:,ii);    endif;
     if(present(x_arr))            then; if(allocated(x_arr))       particle_list(ii)%x        = x_arr(:,ii);     endif;
@@ -878,7 +890,7 @@ end subroutine particle_list_from_arrays
 
 !> deallocate all particle arrays
 subroutine deallocate_particle_arrays(n_particles,i_elm_arr,i_life_arr,q_arr,&
-t_birth_arr,weight_arr,v_1d_arr,E_arr,mu_arr,vpar_arr,B_norm_arr,vpar_m_arr,&
+t_birth_arr,t_loss_arr,weight_arr,v_1d_arr,E_arr,mu_arr,vpar_arr,B_norm_arr,vpar_m_arr,&
 st_arr,x_arr,B_hat_prev_arr,v_2d_arr,x_m_arr,Astar_m_arr,Astar_k_arr,&
 Bn_k_arr,dBn_k_arr,Bnorm_k_arr,E_k_arr,dAstar_k_arr)
   implicit none 
@@ -887,6 +899,7 @@ Bn_k_arr,dBn_k_arr,Bnorm_k_arr,E_k_arr,dAstar_k_arr)
   integer*4,dimension(:),    allocatable,intent(inout) :: i_elm_arr,i_life_arr
   integer*4,dimension(:),    allocatable,intent(inout) :: q_arr
   real*4,   dimension(:),    allocatable,intent(inout) :: t_birth_arr
+  real*8,   dimension(:),    allocatable,intent(inout) :: t_loss_arr
   real*8,   dimension(:),    allocatable,intent(inout) :: weight_arr,v_1d_arr,E_arr,mu_arr
   real*8,   dimension(:),    allocatable,intent(inout) :: B_norm_arr,vpar_arr,vpar_m_arr
   real*8,   dimension(:),    allocatable,intent(inout) :: Bn_k_arr
@@ -900,6 +913,7 @@ Bn_k_arr,dBn_k_arr,Bnorm_k_arr,E_k_arr,dAstar_k_arr)
   if(allocated(i_elm_arr))         deallocate(i_elm_arr)
   if(allocated(i_life_arr))        deallocate(i_life_arr)
   if(allocated(t_birth_arr))       deallocate(t_birth_arr)
+  if(allocated(t_loss_arr))        deallocate(t_loss_arr)
   if(allocated(weight_arr))        deallocate(weight_arr)
   if(allocated(st_arr))            deallocate(st_arr)
   if(allocated(x_arr))             deallocate(x_arr)

@@ -72,6 +72,7 @@ use_hdf5_access_properties,collective_mpio_in,mpi_comm_in,mpi_info_in)
   integer,  dimension(:),    allocatable :: q_arr
   integer,  dimension(:,:),  allocatable :: n_particles_glob
   real*4,   dimension(:),    allocatable :: t_birth_arr
+  real*8,   dimension(:),    allocatable :: t_loss_arr
   real*8,   dimension(:),    allocatable :: weight_arr,v_1d_arr
   real*8,   dimension(:),    allocatable :: E_arr,mu_arr,vpar_arr
   real*8,   dimension(:),    allocatable :: B_norm_arr,vpar_m_arr,Bn_k_arr
@@ -157,7 +158,7 @@ use_hdf5_access_properties,collective_mpio_in,mpi_comm_in,mpi_info_in)
       endif
       !> reorganize and store the particle data in congruent arrays
       call particle_arrays_from_list(sim%groups(ii)%particles,n_particles,&
-      i_elm_arr,i_life_arr,q_arr,t_birth_arr,weight_arr,v_1d_arr,E_arr,mu_arr,&
+      i_elm_arr,i_life_arr,q_arr,t_birth_arr,t_loss_arr,weight_arr,v_1d_arr,E_arr,mu_arr,&
       vpar_arr,B_norm_arr,vpar_m_arr,st_arr,x_arr,B_hat_prev_arr,v_2d_arr,x_m_arr,&
       Astar_m_arr,Astar_k_arr,Bn_k_arr,dBn_k_arr,Bnorm_k_arr,E_k_arr,dAstar_k_arr,&
       particle_type_str)
@@ -185,6 +186,13 @@ use_hdf5_access_properties,collective_mpio_in,mpi_comm_in,mpi_info_in)
       
       if(allocated(t_birth_arr)) call HDF5_array1D_saving_r4_native_or_gatherv(&
       file_id,t_birth_arr,n_particles_per_group,trim(group_name)//"t_birth",&
+      use_gatherv_mpio,dim1_all_tasks=n_particles_glob(:,ii),&
+      displs=particle_displacement,mpi_rank=sim%my_id,n_cpu=sim%n_cpu,&
+      mpi_comm_loc=mpi_comm_loc,start=[n_particles_offset],&
+      use_hdf5_parallel_in=use_hdf5_parallel,mpio_collective_in=collective_mpio_loc)
+
+      if(allocated(t_loss_arr)) call HDF5_array1D_saving_native_or_gatherv(&
+      file_id,t_loss_arr,n_particles_per_group,trim(group_name)//"t_loss",&
       use_gatherv_mpio,dim1_all_tasks=n_particles_glob(:,ii),&
       displs=particle_displacement,mpi_rank=sim%my_id,n_cpu=sim%n_cpu,&
       mpi_comm_loc=mpi_comm_loc,start=[n_particles_offset],&
@@ -344,7 +352,7 @@ use_hdf5_access_properties,collective_mpio_in,mpi_comm_in,mpi_info_in)
       endif
       !> deallocate structures
       call deallocate_particle_arrays(n_particles,i_elm_arr,i_life_arr,q_arr,&
-      t_birth_arr,weight_arr,v_1d_arr,E_arr,mu_arr,vpar_arr,B_norm_arr,vpar_m_arr,&
+      t_birth_arr,t_loss_arr,weight_arr,v_1d_arr,E_arr,mu_arr,vpar_arr,B_norm_arr,vpar_m_arr,&
       st_arr,x_arr,B_hat_prev_arr,v_2d_arr,x_m_arr,Astar_m_arr,Astar_k_arr,&
       Bn_k_arr,dBn_k_arr,Bnorm_k_arr,E_k_arr,dAstar_k_arr)
     enddo
@@ -421,6 +429,7 @@ mpi_comm_in,mpi_info_in,test_in)
   integer*4,        dimension(:),    allocatable :: q_arr
   integer(HSIZE_T), dimension(:),    allocatable :: n_particles_tot,n_particles_max
   real*4,           dimension(:),    allocatable :: t_birth_arr
+  real*8,           dimension(:),    allocatable :: t_loss_arr
   real*8,           dimension(:),    allocatable :: weight_arr,v_1d_arr
   real*8,           dimension(:),    allocatable :: E_arr,mu_arr,vpar_arr
   real*8,           dimension(:),    allocatable :: B_norm_arr,vpar_m_arr,Bn_k_arr
@@ -509,6 +518,8 @@ mpi_comm_in,mpi_info_in,test_in)
     !> Read particle base datasets from HDF5 and fill the particle lists: float 1D array
     call HDF5_allocatable_array1D_reading_r4(file_id,t_birth_arr,trim(group_name)//"t_birth",&
     reqdims_in=[n_particles_hsizet],start=[offset])
+    call HDF5_allocatable_array1D_reading(file_id,t_loss_arr,trim(group_name)//"t_loss",&
+    reqdims_in=[n_particles_hsizet],start=[offset])
     !> Read particle base datasets from HDF5 and fill the particle lists: double 1D array
     call HDF5_allocatable_array1D_reading(file_id,weight_arr,trim(group_name)//"weight",&
     reqdims_in=[n_particles_hsizet],start=[offset])
@@ -552,7 +563,7 @@ mpi_comm_in,mpi_info_in,test_in)
     reqdims_in=[n1_HSIZE_T,n1_HSIZE_T,n_particles_hsizet],start=[i0_HSIZE_T,i0_HSIZE_T,offset])
     !> fill particle list from arrays
     call particle_list_from_arrays(n_particles_per_proc(sim%my_id+1),sim%groups(ii)%particles,ierr,&
-    i_elm_arr=i_elm_arr,i_life_arr=i_life_arr,t_birth_arr=t_birth_arr,weight_arr=weight_arr,&
+    i_elm_arr=i_elm_arr,i_life_arr=i_life_arr,t_birth_arr=t_birth_arr,t_loss_arr=t_loss_arr,weight_arr=weight_arr,&
     x_arr=x_arr,st_arr=st_arr,q_arr=q_arr,v_1d_arr=v_1d_arr,E_arr=E_arr,mu_arr=mu_arr,&
     vpar_arr=vpar_arr,B_norm_arr=B_norm_arr,vpar_m_arr=vpar_m_arr,B_hat_prev_arr=B_hat_prev_arr,&
     v_2d_arr=v_2d_arr,x_m_arr=x_m_arr,Astar_m_arr=Astar_m_arr,Astar_k_arr=Astar_k_arr,&
@@ -560,7 +571,7 @@ mpi_comm_in,mpi_info_in,test_in)
     E_k_arr=E_k_arr,dAstar_k_arr=dAstar_k_arr)
     !> deallocate structures
     call deallocate_particle_arrays(n_particles_per_proc(sim%my_id+1),i_elm_arr,&
-    i_life_arr,q_arr,t_birth_arr,weight_arr,v_1d_arr,E_arr,mu_arr,vpar_arr,&
+    i_life_arr,q_arr,t_birth_arr,t_loss_arr,weight_arr,v_1d_arr,E_arr,mu_arr,vpar_arr,&
     B_norm_arr,vpar_m_arr,st_arr,x_arr,B_hat_prev_arr,v_2d_arr,x_m_arr,&
     Astar_m_arr,Astar_k_arr,Bn_k_arr,dBn_k_arr,Bnorm_k_arr,E_k_arr,dAstar_k_arr)   
   enddo
