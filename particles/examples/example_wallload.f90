@@ -108,13 +108,14 @@ do while (.not. sim%stop_now)
 
              pos_prev = particles(j)%x
 
-             call runge_kutta_fixed_dt_gc_push_jorek(sim%fields,sim%time,timesteps(i), &
+             call runge_kutta_fixed_dt_gc_push_jorek(sim%fields,sim%time+k*timesteps(i),timesteps(i), &
                   sim%groups(i)%mass,particles(j))
              if (particles(j)%i_elm .le. 0) exit
              call mod_wall_collision_check(pos_prev, particles(j)%x, wall, wall_id, wall_pos, iangle(i,j))
              if(wall_id .gt. 0) then
                 particles(j)%x      = wall_pos
                 particles(j)%i_elm  = -wall_id
+                particles(j)%t_loss = sim%time + k*timesteps(i)
              end if
           end do
        end do
@@ -128,12 +129,13 @@ do while (.not. sim%stop_now)
              if (particles(j)%i_elm .le. 0) exit
              pos_prev = particles(j)%x
 
-             call volume_preserving_push_jorek(particles(j),sim%fields,sim%groups(i)%mass,sim%time,timesteps(i),ifail)
+             call volume_preserving_push_jorek(particles(j),sim%fields,sim%groups(i)%mass,sim%time+k*timesteps(i),timesteps(i),ifail)
              if (particles(j)%i_elm .le. 0) exit
              call mod_wall_collision_check(pos_prev, particles(j)%x, wall, wall_id, wall_pos, iangle(i,j))
              if(wall_id .gt. 0) then
                 particles(j)%x      = wall_pos
                 particles(j)%i_elm  = -wall_id
+                particles(j)%t_loss = sim%time + k*timesteps(i)
              end if
           end do
        end do
