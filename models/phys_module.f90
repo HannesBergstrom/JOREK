@@ -991,7 +991,12 @@ module phys_module
   real*8  :: R_valve_loc2     !< R position valve 2
   real*8  :: Z_valve2         !< Z position valve 2
   integer :: n_puff           !< superparticles used per puffing action per valve
-    
+   
+  !> @name Wall collision input parameters
+  character(len=256)  :: wall_collision_model = 'wall.h5'
+  integer(kind=4)     :: max_depth_wall = 6
+ 
+ 
   !> @name Mode families preconditioner parameters
   integer, parameter :: n_fam_max = 100               !< maximum number of families
   integer :: n_mode_families                          !< number of families
