@@ -492,13 +492,15 @@ end subroutine re_eq_update_labels
 
 !=======================================================================
 !> Locate the drift axis of one class: the interior extremum of
-!> A(R,Z) = alpha R - psi, i.e. the solution of
-!>   dpsi/dR = alpha,  dpsi/dZ = 0.
-!> A coarse node scan provides a robust starting point (and fallback);
-!> a damped Newton iteration with a numerical Jacobian on the interpolated
-!> psi refines it. The extremum type of A is opposite to psi's (A ~ -psi
-!> near the axis; the alpha R term only shifts the extremum), which the
-!> node scan uses to pick the right candidate.
+!> A(R,Z) = alpha R - psi. Coarse node scan for the extremal node, then a
+!> local least-squares paraboloid fit of the nodal A values around it;
+!> the fit gives the sub-element extremum position and value analytically.
+!> The extremum type of A is opposite to psi's (A ~ -psi near the axis;
+!> the alpha R term only shifts the extremum).
+!>
+!> This deliberately uses ONLY nodal data: point location (find_RZ) is
+!> unreliable in the whole neighbourhood of the degenerate polar-grid
+!> centre -- exactly where the drift axes of weakly-shifted classes live.
 subroutine re_eq_find_drift_axis(node_list, element_list, alpha, R0, Z0, &
                                  R_ax, Z_ax, A_ax, ifail)
   use data_structure
@@ -509,16 +511,17 @@ subroutine re_eq_find_drift_axis(node_list, element_list, alpha, R0, Z0, &
   type (type_node_list),    intent(in)  :: node_list
   type (type_element_list), intent(in)  :: element_list
   real*8,                   intent(in)  :: alpha    !< gamma m v_par/e of the class [Wb/m]
-  real*8,                   intent(in)  :: R0, Z0   !< search start point (unused if the node scan succeeds)
+  real*8,                   intent(in)  :: R0, Z0   !< unused (kept for interface stability)
   real*8,                   intent(out) :: R_ax, Z_ax
   real*8,                   intent(out) :: A_ax     !< A/e at the drift axis [Wb]
   integer,                  intent(out) :: ifail
 
-  integer, parameter :: max_newton = 50
-  real*8  :: R, Z, g1, g2, g1p, g2p, J11, J12, J21, J22, det, dR, dZ, h
-  real*8  :: psi, dpsi_dR, dpsi_dZ, step_limit, A_node, A_best
-  real*8  :: R_scan, Z_scan, sgn
-  integer :: it, i, ifail_n
+  integer, parameter :: n_fit_min = 10
+  real*8  :: sgn, A_node, A_best, R_scan, Z_scan, r_fit, dx, dy, d2
+  real*8  :: M(6,6), rhs(6), c(6), row(6), det, ddx, ddy
+  integer :: i, k, l, n_fit, i_pass
+
+  ifail = 0
 
   ! --- coarse node scan: extremum of A over the grid nodes; minimum if psi
   !     has its maximum at the axis and vice versa
@@ -535,71 +538,95 @@ subroutine re_eq_find_drift_axis(node_list, element_list, alpha, R0, Z0, &
     endif
   enddo
 
-  R = R_scan;  Z = Z_scan
-  h = 1.d-4 * amin
-  step_limit = 0.2d0 * amin
-  ifail = 0
-
-  do it = 1, max_newton
-    call re_eq_grad_psi(node_list, element_list, R, Z, psi, dpsi_dR, dpsi_dZ, ifail)
-    if (ifail .ne. 0) exit
-    g1 = dpsi_dR - alpha
-    g2 = dpsi_dZ
-
-    if (sqrt(g1*g1 + g2*g2) .lt. 1.d-8 * max(abs(ES%psi_axis - ES%psi_bnd), 1.d-30) / amin) exit
-
-    ! numerical Jacobian of (g1,g2) w.r.t. (R,Z)
-    call re_eq_grad_psi(node_list, element_list, R+h, Z, psi, g1p, g2p, ifail)
-    if (ifail .ne. 0) exit
-    J11 = (g1p - alpha - g1) / h
-    J21 = (g2p - g2) / h
-    call re_eq_grad_psi(node_list, element_list, R, Z+h, psi, g1p, g2p, ifail)
-    if (ifail .ne. 0) exit
-    J12 = (g1p - alpha - g1) / h
-    J22 = (g2p - g2) / h
-
-    det = J11*J22 - J12*J21
-    if (abs(det) .le. 1.d-30) then
-      ifail = 2
-      exit
-    endif
-    dR = -( J22*g1 - J12*g2) / det
-    dZ = -(-J21*g1 + J11*g2) / det
-
-    ! damp the step to stay within the plasma
-    if (abs(dR) .gt. step_limit) dR = sign(step_limit, dR)
-    if (abs(dZ) .gt. step_limit) dZ = sign(step_limit, dZ)
-    R = R + dR
-    Z = Z + dZ
+  ! --- least-squares paraboloid A ~ c1 + c2 x + c3 y + c4 x^2 + c5 xy + c6 y^2
+  !     over the nodes within r_fit of the scan extremum (x = R-R_scan,
+  !     y = Z-Z_scan); grow the radius until enough nodes participate
+  r_fit = 0.05d0 * amin
+  do i_pass = 1, 8
+    M = 0.d0;  rhs = 0.d0;  n_fit = 0
+    do i = 1, node_list%n_nodes
+      dx = node_list%node(i)%x(1,1,1) - R_scan
+      dy = node_list%node(i)%x(1,1,2) - Z_scan
+      d2 = dx*dx + dy*dy
+      if (d2 .gt. r_fit*r_fit) cycle
+      n_fit  = n_fit + 1
+      A_node = alpha * node_list%node(i)%x(1,1,1) - node_list%node(i)%values(1,1,var_psi)
+      row = (/ 1.d0, dx, dy, dx*dx, dx*dy, dy*dy /)
+      do k = 1, 6
+        do l = 1, 6
+          M(k,l) = M(k,l) + row(k)*row(l)
+        enddo
+        rhs(k) = rhs(k) + row(k)*A_node
+      enddo
+    enddo
+    if (n_fit .ge. n_fit_min) exit
+    r_fit = 2.d0 * r_fit
   enddo
-
-  if (ifail .eq. 0) then
-    call re_eq_grad_psi(node_list, element_list, R, Z, psi, dpsi_dR, dpsi_dZ, ifail)
+  if (n_fit .lt. n_fit_min) then
+    ifail = 1
+    return
   endif
 
-  if (ifail .eq. 0) then
-    R_ax = R
-    Z_ax = Z
-    A_ax = alpha * R - psi
+  call re_eq_solve6(M, rhs, c, ifail)
+  if (ifail .ne. 0) return
+
+  ! --- extremum of the paraboloid: grad = 0
+  det = 4.d0*c(4)*c(6) - c(5)*c(5)
+  if (abs(det) .le. 1.d-30) then
+    ! degenerate fit: keep the scan node itself
+    ddx = 0.d0;  ddy = 0.d0
   else
-    ! --- fall back to the node-scan extremum (accurate to the element size;
-    !     the axis is refined again on the next Picard iteration anyway)
-    ifail_n = ifail
-    call re_eq_grad_psi(node_list, element_list, R_scan, Z_scan, psi, dpsi_dR, dpsi_dZ, ifail)
-    if (ifail .ne. 0) then
-      ! even the interpolation at the scan node failed: report the original error
-      ifail = ifail_n
-      return
-    endif
-    R_ax  = R_scan
-    Z_ax  = Z_scan
-    A_ax  = alpha * R_scan - psi
-    ifail = 0
-    write(*,'(A,ES10.2,A)') ' NOTE: re_eq: drift-axis Newton refinement failed (alpha = ', &
-      alpha, '); using the node-scan extremum'
+    ddx = (-2.d0*c(6)*c(2) + c(5)*c(3)) / det
+    ddy = (-2.d0*c(4)*c(3) + c(5)*c(2)) / det
   endif
+  ! clamp the displacement to the fit region
+  if (abs(ddx) .gt. r_fit) ddx = sign(r_fit, ddx)
+  if (abs(ddy) .gt. r_fit) ddy = sign(r_fit, ddy)
+
+  R_ax = R_scan + ddx
+  Z_ax = Z_scan + ddy
+  A_ax = c(1) + c(2)*ddx + c(3)*ddy + c(4)*ddx*ddx + c(5)*ddx*ddy + c(6)*ddy*ddy
 
 end subroutine re_eq_find_drift_axis
+
+
+!=======================================================================
+!> Solve a 6x6 linear system by Gaussian elimination with partial
+!> pivoting (normal equations of the paraboloid fit).
+subroutine re_eq_solve6(A_in, b_in, x, ifail)
+  implicit none
+  real*8,  intent(in)  :: A_in(6,6), b_in(6)
+  real*8,  intent(out) :: x(6)
+  integer, intent(out) :: ifail
+  real*8  :: A(6,6), b(6), piv, fac
+  integer :: i, j, k, ip
+
+  A = A_in;  b = b_in;  ifail = 0
+  do k = 1, 6
+    ip = k
+    do i = k+1, 6
+      if (abs(A(i,k)) .gt. abs(A(ip,k))) ip = i
+    enddo
+    if (abs(A(ip,k)) .le. 1.d-300) then
+      ifail = 4
+      return
+    endif
+    if (ip .ne. k) then
+      do j = 1, 6
+        piv = A(k,j);  A(k,j) = A(ip,j);  A(ip,j) = piv
+      enddo
+      piv = b(k);  b(k) = b(ip);  b(ip) = piv
+    endif
+    do i = k+1, 6
+      fac = A(i,k) / A(k,k)
+      A(i,k:6) = A(i,k:6) - fac * A(k,k:6)
+      b(i)     = b(i)     - fac * b(k)
+    enddo
+  enddo
+  do k = 6, 1, -1
+    x(k) = (b(k) - sum(A(k,k+1:6)*x(k+1:6))) / A(k,k)
+  enddo
+end subroutine re_eq_solve6
 
 
 !=======================================================================
@@ -828,9 +855,9 @@ subroutine re_eq_label_map(my_id, node_list, element_list, n_lmap, l_values, psi
   real*8,                   intent(in)  :: l_values(n_lmap)
   real*8,                   intent(out) :: psihat_m(n_lmap)
 
-  integer :: i, k, ifail, i_ax, np
+  integer :: i, k, l, ifail, i_ax, np
   real*8  :: alpha_eff, cw_sum, R_ax, Z_ax, A_ax, A_edge, dpsi
-  real*8  :: R_lo, R_hi, dR, dum1, dum2, l, ph_out, ph_in, R_out_l, R_in_l
+  real*8  :: R_lo, R_hi, dR, dum1, dum2, lv, ph_out, ph_in, R_out_l, R_in_l
   real*8, allocatable :: Rg(:), psig(:), lhatg(:), phg(:)
 
   np = re_eq_n_midplane
@@ -849,7 +876,10 @@ subroutine re_eq_label_map(my_id, node_list, element_list, n_lmap, l_values, psi
   endif
   A_edge = alpha_eff * re_eq_R_edge - re_eq_psi_bnd
 
-  ! --- midplane scan at the Z of the effective drift axis
+  ! --- midplane scan at the Z of the effective drift axis. Point location
+  !     can fail near the degenerate polar-grid centre; such interior points
+  !     are filled by linear interpolation between their valid neighbours
+  !     (failed points at the ends of the scan get the boundary psi).
   R_lo = minval(node_list%node(1:node_list%n_nodes)%x(1,1,1))
   R_hi = re_eq_R_edge
   dR   = (R_hi - R_lo) / dble(np + 1)
@@ -857,7 +887,30 @@ subroutine re_eq_label_map(my_id, node_list, element_list, n_lmap, l_values, psi
   do i = 1, np
     Rg(i) = R_lo + dR * dble(i)
     call re_eq_grad_psi(node_list, element_list, Rg(i), Z_ax, psig(i), dum1, dum2, ifail)
-    if (ifail .ne. 0) psig(i) = ES%psi_bnd    ! outside the grid: treat as boundary
+    if (ifail .ne. 0) psig(i) = 1.d99          ! mark for the fill below
+  enddo
+  do i = 1, np
+    if (psig(i) .lt. 1.d98) cycle
+    ! nearest valid neighbours left and right
+    k = i - 1
+    do while ((k .ge. 1) .and. (psig(max(k,1)) .gt. 1.d98))
+      k = k - 1
+    enddo
+    l = i + 1
+    do while ((l .le. np) .and. (psig(min(l,np)) .gt. 1.d98))
+      l = l + 1
+    enddo
+    if ((k .ge. 1) .and. (l .le. np)) then
+      psig(i) = psig(k) + (psig(l) - psig(k)) * (Rg(i) - Rg(k)) / (Rg(l) - Rg(k))
+    else if (k .ge. 1) then
+      psig(i) = psig(k)
+    else if (l .le. np) then
+      psig(i) = psig(l)
+    else
+      psig(i) = ES%psi_bnd
+    endif
+  enddo
+  do i = 1, np
     lhatg(i) = (alpha_eff*Rg(i) - psig(i) - A_ax) / (A_edge - A_ax)
     phg(i)   = min(max((psig(i) - ES%psi_axis) / dpsi, 0.d0), 1.d0)
   enddo
@@ -869,13 +922,13 @@ subroutine re_eq_label_map(my_id, node_list, element_list, n_lmap, l_values, psi
   enddo
 
   do k = 1, n_lmap
-    l = min(max(l_values(k), 1.d-9), 1.d0)
+    lv = min(max(l_values(k), 1.d-9), 1.d0)
 
     ! outboard branch: lhat increases from ~0 at the drift axis to 1 at the edge
     R_out_l = Rg(np);  ph_out = phg(np)
     do i = i_ax, np-1
-      if ((lhatg(i) - l) * (lhatg(i+1) - l) .le. 0.d0) then
-        ph_out = phg(i) + (phg(i+1)-phg(i)) * (l - lhatg(i)) / (lhatg(i+1) - lhatg(i))
+      if ((lhatg(i) - lv) * (lhatg(i+1) - lv) .le. 0.d0) then
+        ph_out = phg(i) + (phg(i+1)-phg(i)) * (lv - lhatg(i)) / (lhatg(i+1) - lhatg(i))
         exit
       endif
     enddo
@@ -883,8 +936,8 @@ subroutine re_eq_label_map(my_id, node_list, element_list, n_lmap, l_values, psi
     ! inboard branch; may not reach the label for strong drift shifts
     ph_in = ph_out
     do i = i_ax, 2, -1
-      if ((lhatg(i) - l) * (lhatg(i-1) - l) .le. 0.d0) then
-        ph_in = phg(i) + (phg(i-1)-phg(i)) * (l - lhatg(i)) / (lhatg(i-1) - lhatg(i))
+      if ((lhatg(i) - lv) * (lhatg(i-1) - lv) .le. 0.d0) then
+        ph_in = phg(i) + (phg(i-1)-phg(i)) * (lv - lhatg(i)) / (lhatg(i-1) - lhatg(i))
         exit
       endif
     enddo
