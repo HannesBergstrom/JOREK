@@ -68,9 +68,12 @@ end module data_structure
 
 module phys_module
   implicit none
-  real*8 :: F0    = 3.d0
-  real*8 :: R_geo = 10.d0
-  real*8 :: amin  = 1.d0
+  real*8  :: F0    = 3.d0
+  real*8  :: R_geo = 10.d0
+  real*8  :: amin  = 1.d0
+  real*8  :: FF_coef(10) = (/ 0.d0, 0.d0, 0.d0, 0.03d0, 5.d0, 0.d0, 10.d0, 1.d0, 0.d0, 0.d0 /)
+  real*8  :: T_coef(10)  = (/ 0.d0, 0.d0, 0.d0, 1.d0,   5.d0, 0.d0, 0.d0,  0.d0, 0.d0, 0.d0 /)
+  logical :: num_ffprime = .false.
 end module phys_module
 
 module equil_info
