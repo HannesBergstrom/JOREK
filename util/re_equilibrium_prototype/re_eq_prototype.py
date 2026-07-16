@@ -335,7 +335,7 @@ class REEquilibrium:
                  match_mode='full_q', I_RE=None,
                  alpha_in=0.5, tol_in=1e-10, max_it_in=200,
                  alpha_out=0.3, tol_q=1e-3, max_it_out=50,
-                 transplant='cumulative',
+                 transplant='cumulative', edge_taper=0.2,
                  n_l=101, n_theta_q=256, verbose=True):
         self.cl = classes
         self.gs = solver
@@ -350,6 +350,14 @@ class REEquilibrium:
         if transplant not in ('cumulative', 'pointwise'):
             raise ValueError(f"unknown transplant variant '{transplant}'")
         self.transplant = transplant
+        # Truncation policy for drift surfaces leaving the domain (Ahat > 1):
+        # their current is REMOVED (RE orbits crossing the wall are lost),
+        # with a linear taper of width edge_taper in the label for numerical
+        # smoothness. The clamp alternative (edge_taper=None: keep Nprof(1)
+        # outside) creates an uncontrollable halo current that destabilizes
+        # the outer iteration once the lost fraction is more than a few
+        # percent (observed as stall at ~3e-3 followed by slow divergence).
+        self.edge_taper = edge_taper
         self.n_theta_q = n_theta_q
         self.verbose = verbose
 
@@ -397,19 +405,28 @@ class REEquilibrium:
         return np.clip(l, 0.0, 1.0) if clip else l
 
     # --- GS source ------------------------------------------------------------
+    def _taper(self, l_raw):
+        """Edge truncation factor: 1 on closed drift surfaces (l <= 1),
+        linear decay to 0 over edge_taper beyond, 0 outside."""
+        if self.edge_taper is None:
+            return np.ones_like(l_raw)
+        return np.clip(1.0 - (np.maximum(l_raw, 1.0) - 1.0) / self.edge_taper,
+                       0.0, 1.0)
+
     def source(self, psi):
         """RHS of Delta* psi = mu0 e sum_s v_par,s w_s Nprof(Ahat_s).
         Note: no explicit R factor (the 1/R of n_s cancels the R of the GS RHS).
         Also accumulates the per-class lost-current fraction (drift surfaces
-        with Ahat > 1 that carry nonzero Nprof)."""
+        with Ahat > 1, whose current is removed by the taper policy)."""
         S = np.zeros((self.gs.Nr, self.gs.Nt))
         for s in range(self.cl.n_s):
             l_raw = self.Ahat(s, psi, clip=False)
-            N = self.nprof(l_raw)
+            N = self.nprof(l_raw) * self._taper(l_raw)
             S += MU_ZERO * EL_CHG * self.cl.v_par[s] * self.cl.w[s] * N
             with np.errstate(invalid='ignore'):
-                tot = np.abs(N).sum()
-                lost = np.abs(N[l_raw > 1.0]).sum()
+                N_unt = self.nprof(l_raw)
+                tot = np.abs(N_unt).sum()
+                lost = np.abs(N_unt[l_raw > 1.0]).sum()
             self.lost_fraction[s] = lost / tot if tot > 0 else 0.0
         return S
 
@@ -503,14 +520,15 @@ class REEquilibrium:
         return 0.5 * (lo + hi)
 
     # --- label map Ahat <-> psihat (swappable modelling choice) ----------------
-    def label_to_psihat(self, l_values):
-        """Midplane-average label map for the current-density-weighted
-        effective class:
+    def label_to_psihat(self, l_values, alpha=None):
+        """Midplane-average label map:
             psihat_m(l) = 0.5 * [psihat(R_out(l)) + psihat(R_in(l))]
         where R_out/R_in are the outboard/inboard midplane radii of the
-        effective drift surface with label l.  Handles the near-axis
-        degeneracy where both radii sit on the same side of the psi axis."""
-        alpha_e = self.cl.alpha_eff()
+        drift surface with label l for a class with the given alpha
+        (default: the current-density-weighted effective class). Handles the
+        near-axis degeneracy where both radii sit on the same side of the
+        magnetic axis."""
+        alpha_e = self.cl.alpha_eff() if alpha is None else alpha
         R_ax, Z_ax, psi_ax = self.psi_axis()
         dpsi = self.gs.psi_b - psi_ax
 
@@ -587,39 +605,64 @@ class REEquilibrium:
         if self.nprof is None:
             self.init_nprof_from_qt()
 
+        from scipy.interpolate import PchipInterpolator
+        best_err, best_N, n_stall = np.inf, None, 0
+
+        # current-density weights of the classes for the per-class map
+        cw = np.abs(self.cl.w * self.cl.v_par)
+        cw = cw / cw.sum()
+
         for outer in range(1, self.max_it_out + 1):
             n_in, res_in = self.picard()
             ph, q_now = self.q_profile()
-            phm = self.label_to_psihat(self.nprof.l)
-            # evaluate q_now and q_t at the SAME clamped argument: the label
-            # map reaches psihat values outside the computed q range near the
-            # axis/edge, and evaluating the target at the unclamped value
-            # introduces a bias floor ~ dq_t/dpsihat * clamp distance
-            phm_eval = np.clip(phm, ph[0], ph[-1])
             # monotone cubic interpolation: piecewise-linear q(psihat) has
             # kinks that give the transplant a locally wrong response and
             # stall the iteration at the interpolation-error level
-            from scipy.interpolate import PchipInterpolator
-            q_at = PchipInterpolator(ph, q_now)(phm_eval)
-            qt_at = self.qt(phm_eval)
+            q_i = PchipInterpolator(ph, q_now)
+
+            # --- per-class label maps, combined as a current-weighted
+            # geometric mean. A single effective-class map mis-models which
+            # psihat the update at label l actually controls when the class
+            # drift shifts differ strongly, and the outer iteration then
+            # oscillates/diverges near the edge (M0 finding, 3-class case).
+            # q_now and q_t are evaluated at the SAME clamped argument (an
+            # unclamped target evaluation introduces a bias floor).
+            log_ratio = np.zeros(len(self.nprof.l))
+            q_at = np.zeros(len(self.nprof.l))
+            qt_at = np.zeros(len(self.nprof.l))
+            ph_ctl = ph[0]
+            for s in range(self.cl.n_s):
+                phm_s = self.label_to_psihat(self.nprof.l,
+                                             alpha=self.cl.alpha[s])
+                pe = np.clip(phm_s, ph[0], ph[-1])
+                log_ratio += cw[s] * np.log(q_i(pe) / self.qt(pe))
+                q_at += cw[s] * q_i(pe)
+                qt_at += cw[s] * self.qt(pe)
+                ph_ctl = max(ph_ctl, pe[-1])
 
             if self.match_mode == 'q_shape':
                 # compare shapes only; report the achieved amplitude
                 c = np.sum(q_at * qt_at) / np.sum(qt_at**2)
-                ratio = q_at / (c * qt_at)
+                log_ratio = log_ratio - np.log(c)
             else:
                 c = 1.0
-                ratio = q_at / qt_at
+            ratio = np.exp(log_ratio)
 
             # Convergence metric: compare q and q_t directly on the psihat
             # levels of the q diagnostic (this is the actual goal), restricted
-            # to the range controllable through the label map. The mapped
-            # ratio above is only used to PLACE the update on the l grid --
-            # measuring the error through the map would add label-map
-            # interpolation noise that the update cannot (and need not)
-            # remove.
-            mctl = ph <= phm_eval[-1]
+            # to the range controllable through the label maps. The mapped
+            # ratio above is only used to PLACE the update on the l grid.
+            mctl = ph <= ph_ctl
             err = np.abs(q_now[mctl] / (c * self.qt(ph[mctl])) - 1.0).max()
+
+            # --- best-iterate tracking and stagnation detection: with one
+            # common Nprof and strongly different class maps, exactly
+            # matching q_t can be outside the range of the ansatz; keep the
+            # best profile and stop when no longer improving.
+            if err < 0.98 * best_err:
+                best_err, best_N, n_stall = err, self.nprof.N.copy(), 0
+            else:
+                n_stall += 1
             I_now = self.total_current(self.psi)
             self.log.append(dict(outer=outer, inner_iters=n_in,
                                  inner_res=res_in, q_err=err, I_RE=I_now,
@@ -633,6 +676,17 @@ class REEquilibrium:
                          if self.lost_fraction.max() > 0 else ""))
             if err < self.tol_q:
                 return True
+            if n_stall >= 15:
+                # restore the best profile and re-converge psi on it
+                self.nprof.N = best_N
+                self.picard()
+                if self.verbose:
+                    print(f"  stagnation after {outer} outer iterations: "
+                          f"restored best profile, max|q/q_t-1| = {best_err:.3e}")
+                self.log.append(dict(outer=outer, inner_iters=0, inner_res=0.0,
+                                     q_err=best_err, I_RE=self.total_current(self.psi),
+                                     q_amplitude=c, lost=self.lost_fraction.max()))
+                return best_err < self.tol_q
             ratio = np.clip(ratio, 1.0 / self.RATIO_CLAMP, self.RATIO_CLAMP)
             # smooth the log-ratio (Nprof is smooth; single-point features in
             # the measured ratio are q-evaluation artifacts, and feeding them
@@ -650,6 +704,9 @@ class REEquilibrium:
                 C *= factor
                 N_new = np.gradient(C, l, edge_order=2)
                 self.nprof.N = np.clip(N_new, 0.0, None)
+        if best_N is not None and best_err < np.inf:
+            self.nprof.N = best_N
+            self.picard()
         return False
 
     def solve_fixed_nprof(self, nprof):

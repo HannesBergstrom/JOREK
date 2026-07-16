@@ -35,6 +35,8 @@ module initialisers_RE
   real*8, allocatable         :: req_cl_A_edge(:)   !< label normalization [Wb]
   real*8, allocatable         :: req_nprof_l(:)     !< Nprof l grid
   real*8, allocatable         :: req_nprof(:)       !< Nprof values [m^-2]
+  real*8                      :: req_edge_taper = 0.2d0 !< edge truncation width (read from the file;
+                                                        !< MUST match the equilibrium solver)
   integer                     :: req_active_class = 0  !< class sampled by re_eq_marker_pdf
   real*8                      :: req_sup_pdf = 1.d0    !< sup of Nprof/R for rejection normalization
 
@@ -219,6 +221,7 @@ subroutine read_re_equilibrium_file(my_id)
     select case (trim(key))
     case ('n_class'); read(line,*) key, req_n_class
     case ('n_l');     read(line,*) key, req_n_l
+    case ('taper');   read(line,*) key, req_edge_taper
     case ('I_RE', 'q_err', 'psi_bnd'); read(line,*) key, rdum
     case ('R_edge')
       read(line,*) key, rdum
@@ -280,7 +283,10 @@ end subroutine read_re_equilibrium_file
 
 
 !> Piecewise-linear evaluation of the common profile function Nprof at the
-!> label l, clipped to [0,1] (same convention as the equilibrium solver).
+!> RAW label l with the SAME edge truncation policy as the equilibrium
+!> solver (mod_re_kinetic_equilibrium / re_eq_nprof_at): drift surfaces
+!> leaving the domain carry no current, with a linear taper of width
+!> req_edge_taper (read from re_equilibrium.dat) beyond l = 1.
 pure function req_nprof_eval(l) result(nval)
   implicit none
   real*8, intent(in) :: l
@@ -290,6 +296,9 @@ pure function req_nprof_eval(l) result(nval)
   dl = req_nprof_l(2) - req_nprof_l(1)
   k  = min(int(x/dl) + 1, req_n_l - 1)
   nval = req_nprof(k) + (req_nprof(k+1) - req_nprof(k)) * (x - req_nprof_l(k)) / dl
+  if (l .gt. 1.d0) then
+    nval = nval * max(0.d0, 1.d0 - (l - 1.d0) / max(req_edge_taper, 1.d-12))
+  endif
 end function req_nprof_eval
 
 

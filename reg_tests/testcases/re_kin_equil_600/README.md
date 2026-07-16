@@ -19,6 +19,15 @@ Physics checks when preparing/updating the reference data:
 
 * `re_eq_convergence.log` must end with max|q/q_t - 1| < 1e-3 (typically
   ~10 outer iterations).
+* Current on drift orbits leaving the domain is REMOVED (linear taper of
+  width `re_eq_edge_taper` in the label beyond the last closed surface):
+  RE orbits crossing the wall are lost, and the marker loader applies the
+  identical truncation. When a large current fraction sits on open orbits
+  (high energy at low field), exactly matching q_t is outside the range of
+  the single-Nprof ansatz; the solver then stops at the achievable optimum
+  and accepts it if below `re_eq_tol_q_soft` (with a warning), so choose
+  the class energies of a regression case such that the lost fractions stay
+  at the percent level (as the shipped distribution does).
 * `qprofile.dat` of the equilibrium run must agree with
   `qprofile_target.dat`.
 * The per-class drift-axis positions in `re_equilibrium.dat` (columns

@@ -124,7 +124,8 @@ if (re_kinetic_equilibrium) then
     endif
     stop 1
   endif
-  n_outer_eq      = re_eq_max_it_out
+  n_outer_eq      = re_eq_max_it_out + 1   ! +1: final evaluation pass on the
+                                           ! restored best profile after stagnation
   re_eq_converged = .false.
   if (my_id == 0) call re_eq_init(my_id)
 endif

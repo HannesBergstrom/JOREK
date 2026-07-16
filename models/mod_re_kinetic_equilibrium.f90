@@ -47,7 +47,8 @@ private
 ! --- namelist parameters
 public :: re_kinetic_equilibrium, re_eq_dist_file, re_eq_dist_format,          &
           re_eq_q_file, re_eq_match_mode, re_eq_transplant, re_eq_I_RE,        &
-          re_eq_xi_min, re_eq_alpha_out, re_eq_tol_q, re_eq_ratio_clamp,       &
+          re_eq_xi_min, re_eq_alpha_out, re_eq_tol_q, re_eq_tol_q_soft,        &
+          re_eq_edge_taper, re_eq_ratio_clamp,                                 &
           re_eq_max_it_out, re_eq_n_l, re_eq_n_q_levels, re_eq_n_midplane,     &
           re_eq_finite_pitch
 ! --- driver interface (used by equilibrium.f90 and the GS element assembly)
@@ -69,6 +70,17 @@ real*8             :: re_eq_I_RE        = 0.d0        !< prescribed RE current [
 real*8             :: re_eq_xi_min      = 0.9d0       !< minimum |pitch|; abort below (trapped REs out of scope)
 real*8             :: re_eq_alpha_out   = 0.3d0       !< under-relaxation of the outer transplant update
 real*8             :: re_eq_tol_q       = 1.d-3       !< outer convergence: max|q/q_t - 1|
+real*8             :: re_eq_tol_q_soft  = 1.d-2       !< soft tolerance: a stagnated iteration with best error
+                                                      !< below this is accepted with a warning (with one common
+                                                      !< Nprof and strongly different class drift shifts, exactly
+                                                      !< matching q_t can be outside the range of the ansatz)
+real*8             :: re_eq_edge_taper  = 0.2d0       !< label width of the linear taper that removes the current
+                                                      !< of drift surfaces leaving the domain (Ahat > 1): RE
+                                                      !< orbits crossing the wall are lost. A hard clamp instead
+                                                      !< (keeping Nprof(1) outside) creates an uncontrollable
+                                                      !< halo current that destabilizes the outer iteration; a
+                                                      !< too-narrow taper (< ~0.1) makes the transplant gain
+                                                      !< vanish abruptly at the edge and the iteration treadmills.
 real*8             :: re_eq_ratio_clamp = 2.d0        !< per-iteration clamp of the transplant ratio
 integer            :: re_eq_max_it_out  = 50          !< maximum outer iterations
 integer            :: re_eq_n_l         = 101         !< number of points of the Nprof(l) table
@@ -109,6 +121,12 @@ real*8  :: re_eq_R_edge  = 0.d0         !< outboard midplane boundary radius [m]
 real*8  :: re_eq_psi_bnd = 0.d0         !< boundary psi used in the labels
 real*8  :: re_eq_q_err   = 1.d99        !< latest max|q/q_t - 1|
 real*8  :: re_eq_I_now   = 0.d0         !< latest RE current [A]
+!> best-iterate tracking / stagnation handling of the outer loop
+real*8              :: re_eq_best_err = 1.d99   !< best max|q/q_t - 1| so far
+real*8, allocatable :: re_eq_best_nprof(:)      !< Nprof of the best iterate
+integer             :: re_eq_n_stall  = 0       !< outer iterations without improvement
+logical :: re_eq_finishing     = .false.        !< best profile restored; final evaluation pass
+logical :: re_eq_soft_accepted = .false.        !< finished above tol_q but below tol_q_soft
 
 integer, parameter :: RE_EQ_LOG_UNIT = 437  !< unit of re_eq_convergence.log
 
@@ -367,8 +385,7 @@ end function re_eq_qt_eval
 
 !=======================================================================
 !> Piecewise-linear evaluation of the common profile function Nprof at the
-!> label l; clipped to [0,1] (drift surfaces beyond the outboard edge keep
-!> the edge value -- the associated current is reported as lost).
+!> label l, clipped to [0,1].
 function re_eq_nprof_eval(l) result(nval)
   implicit none
   real*8, intent(in) :: l
@@ -379,6 +396,24 @@ function re_eq_nprof_eval(l) result(nval)
   k  = min(int(x/dl) + 1, re_eq_n_l - 1)
   nval = re_nprof(k) + (re_nprof(k+1) - re_nprof(k)) * (x - re_nprof_l(k)) / dl
 end function re_eq_nprof_eval
+
+
+!=======================================================================
+!> Nprof at the RAW (unclipped) label, with the edge truncation policy:
+!> drift surfaces leaving the domain (lraw > 1) carry no current (RE orbits
+!> crossing the wall are lost); a linear taper of width re_eq_edge_taper in
+!> the label keeps the source numerically smooth. This function MUST be
+!> used wherever the source density is evaluated (and its counterpart in
+!> particles/initialisers/initialisers_RE.f90 kept in sync).
+function re_eq_nprof_at(lraw) result(nval)
+  implicit none
+  real*8, intent(in) :: lraw
+  real*8             :: nval
+  nval = re_eq_nprof_eval(lraw)
+  if (lraw .gt. 1.d0) then
+    nval = nval * max(0.d0, 1.d0 - (lraw - 1.d0) / max(re_eq_edge_taper, 1.d-12))
+  endif
+end function re_eq_nprof_at
 
 
 !=======================================================================
@@ -400,9 +435,14 @@ subroutine re_eq_init_nprof(my_id)
 
   call tr_allocate(re_nprof_l, 1, re_eq_n_l, "re_nprof_l", CAT_GRID)
   call tr_allocate(re_nprof,   1, re_eq_n_l, "re_nprof",   CAT_GRID)
+  call tr_allocate(re_eq_best_nprof, 1, re_eq_n_l, "re_eq_best_nprof", CAT_GRID)
   do k = 1, re_eq_n_l
     re_nprof_l(k) = dble(k-1) / dble(re_eq_n_l - 1)
   enddo
+  re_eq_best_err      = 1.d99
+  re_eq_n_stall       = 0
+  re_eq_finishing     = .false.
+  re_eq_soft_accepted = .false.
 
   B0 = abs(F0) / R_geo
   do i = 1, nr
@@ -732,7 +772,7 @@ function re_eq_source(psi, R) result(S)
   do is = 1, re_eq_n_class
     lhat = (re_cl_alpha(is)*R - psi - re_cl_A_axis(is)) &
            / (re_cl_A_edge(is) - re_cl_A_axis(is))
-    S = S + re_cl_vpar(is) * re_cl_w(is) * re_eq_nprof_eval(lhat)
+    S = S + re_cl_vpar(is) * re_cl_w(is) * re_eq_nprof_at(lhat)
   enddo
   S = MU_ZERO * EL_CHG * S
 end function re_eq_source
@@ -755,14 +795,19 @@ subroutine re_eq_source_derivs(psi, R, S, dS_dpsi, dS_dR)
     denom = re_cl_A_edge(is) - re_cl_A_axis(is)
     lhat  = (re_cl_alpha(is)*R - psi - re_cl_A_axis(is)) / denom
     cw    = re_cl_vpar(is) * re_cl_w(is)
-    Nval  = re_eq_nprof_eval(lhat)
+    Nval  = re_eq_nprof_at(lhat)
     S     = S + cw * Nval
     if ((lhat .gt. 0.d0) .and. (lhat .lt. 1.d0)) then
       k     = min(int(lhat/dl) + 1, re_eq_n_l - 1)
       slope = (re_nprof(k+1) - re_nprof(k)) / dl
-      dS_dpsi = dS_dpsi + cw * slope * (-1.d0/denom)
-      dS_dR   = dS_dR   + cw * slope * (re_cl_alpha(is)/denom)
+    else if ((lhat .gt. 1.d0) .and. (lhat .lt. 1.d0 + re_eq_edge_taper)) then
+      ! inside the edge taper: d/dl of Nprof(1) * (1 - (l-1)/w)
+      slope = -re_nprof(re_eq_n_l) / max(re_eq_edge_taper, 1.d-12)
+    else
+      slope = 0.d0
     endif
+    dS_dpsi = dS_dpsi + cw * slope * (-1.d0/denom)
+    dS_dR   = dS_dR   + cw * slope * (re_cl_alpha(is)/denom)
   enddo
   S       = MU_ZERO * EL_CHG * S
   dS_dpsi = MU_ZERO * EL_CHG * dS_dpsi
@@ -818,8 +863,10 @@ subroutine re_eq_total_current(my_id, node_list, element_list, I_RE)
         do s = 1, re_eq_n_class
           lhat = (re_cl_alpha(s)*x_g - eq_g - re_cl_A_axis(s)) &
                  / (re_cl_A_edge(s) - re_cl_A_axis(s))
+          ! carried current: with the edge taper; lost bookkeeping: the
+          ! would-be (untapered) current fraction on open drift surfaces
           Nval = re_eq_nprof_eval(lhat)
-          I_cl(s)   = I_cl(s) - EL_CHG * re_cl_vpar(s) * re_cl_w(s) * Nval / x_g * wst
+          I_cl(s)   = I_cl(s) - EL_CHG * re_cl_vpar(s) * re_cl_w(s) * re_eq_nprof_at(lhat) / x_g * wst
           tot_cl(s) = tot_cl(s) + abs(Nval) / x_g * wst
           if (lhat .gt. 1.d0) lost_cl(s) = lost_cl(s) + abs(Nval) / x_g * wst
         enddo
@@ -858,41 +905,39 @@ end subroutine re_eq_rescale_current
 
 
 !=======================================================================
-!> The label map psihat_m(l): for the current-density-weighted effective
-!> class, the drift surface with label l crosses the midplane (Z of the
-!> effective drift axis) at R_out and R_in; the map takes the average
+!> The label map psihat_m(l) for a class with invariant slope alpha: the
+!> drift surface with label l crosses the midplane (Z of the class drift
+!> axis) at R_out and R_in; the map takes the average
 !>   psihat_m(l) = 0.5 * [psihat(R_out(l)) + psihat(R_in(l))].
 !> This is a separate, swappable modelling choice. Handles the near-axis
 !> degeneracy where both crossings sit on the same side of the magnetic
 !> axis (strong drift shift) by falling back to the outboard branch.
-subroutine re_eq_label_map(my_id, node_list, element_list, n_lmap, l_values, psihat_m)
+subroutine re_eq_label_map(my_id, node_list, element_list, alpha, n_lmap, l_values, psihat_m)
   use data_structure
   use equil_info, only: ES
   implicit none
   integer,                  intent(in)  :: my_id
   type (type_node_list),    intent(in)  :: node_list
   type (type_element_list), intent(in)  :: element_list
+  real*8,                   intent(in)  :: alpha    !< gamma m v_par/e of the class [Wb/m]
   integer,                  intent(in)  :: n_lmap
   real*8,                   intent(in)  :: l_values(n_lmap)
   real*8,                   intent(out) :: psihat_m(n_lmap)
 
   integer :: i, k, l, ifail, i_ax, np
-  real*8  :: alpha_eff, cw_sum, R_ax, Z_ax, A_ax, A_edge, dpsi
+  real*8  :: alpha_eff, R_ax, Z_ax, A_ax, A_edge, dpsi
   real*8  :: R_lo, R_hi, dR, dum1, dum2, lv, ph_out, ph_in, R_out_l, R_in_l
   real*8, allocatable :: Rg(:), psig(:), lhatg(:), phg(:)
 
   np = re_eq_n_midplane
   allocate(Rg(np), psig(np), lhatg(np), phg(np))
 
-  ! --- effective class: current-density weights w_s v_par,s
-  cw_sum    = sum(re_cl_w(1:re_eq_n_class) * re_cl_vpar(1:re_eq_n_class))
-  alpha_eff = sum(re_cl_w(1:re_eq_n_class) * re_cl_vpar(1:re_eq_n_class) &
-                  * re_cl_alpha(1:re_eq_n_class)) / cw_sum
+  alpha_eff = alpha
 
   call re_eq_find_drift_axis(node_list, element_list, alpha_eff, &
                              ES%R_axis, ES%Z_axis, R_ax, Z_ax, A_ax, ifail)
   if (ifail .ne. 0) then
-    write(*,*) 'ERROR: re_eq_label_map: effective drift axis not found'
+    write(*,*) 'ERROR: re_eq_label_map: class drift axis not found'
     stop 1
   endif
   A_edge = alpha_eff * re_eq_R_edge - re_eq_psi_bnd
@@ -1000,8 +1045,10 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   integer,                  intent(in)  :: n_inner        !< inner iterations used (for the log)
   logical,                  intent(out) :: converged
 
-  integer :: k, i
+  integer :: k, i, s
   real*8  :: phm(re_eq_n_l), phe, q_at, qt_at, ratio(re_eq_n_l), lr(re_eq_n_l)
+  real*8  :: q_acc(re_eq_n_l), qt_acc(re_eq_n_l)
+  real*8  :: cw(re_eq_n_class), cw_sum
   real*8  :: c_amp, num, den, err, I_now, ph_ctl_max
   real*8  :: C(re_eq_n_l), dl, qq
 
@@ -1009,36 +1056,47 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
 
   call re_eq_total_current(my_id, node_list, element_list, I_now)
 
-  call re_eq_label_map(my_id, node_list, element_list, re_eq_n_l, re_nprof_l, phm)
+  ! --- per-class label maps, combined as a current-weighted geometric mean.
+  !     A single effective-class map mis-models which psihat the update at
+  !     label l controls when the class drift shifts differ strongly, and
+  !     the outer iteration then oscillates near the edge (prototype
+  !     finding, multi-class case with disparate energies).
+  !     q and q_t are always evaluated at the SAME clamped argument.
+  cw = abs(re_cl_w(1:re_eq_n_class) * re_cl_vpar(1:re_eq_n_class))
+  cw_sum = sum(cw);  cw = cw / cw_sum
+  lr = 0.d0;  q_acc = 0.d0;  qt_acc = 0.d0
+  ph_ctl_max = ph_lev(1)
+  do s = 1, re_eq_n_class
+    call re_eq_label_map(my_id, node_list, element_list, re_cl_alpha(s), &
+                         re_eq_n_l, re_nprof_l, phm)
+    do k = 1, re_eq_n_l
+      phe   = min(max(phm(k), ph_lev(1)), ph_lev(n_lev))
+      q_at  = re_eq_interp_q(n_lev, ph_lev, q_lev, phe)
+      qt_at = re_eq_qt_eval(phe)
+      lr(k)     = lr(k)     + cw(s) * log(max(q_at, 1.d-30) / max(qt_at, 1.d-30))
+      q_acc(k)  = q_acc(k)  + cw(s) * q_at
+      qt_acc(k) = qt_acc(k) + cw(s) * qt_at
+      if (k .eq. re_eq_n_l) ph_ctl_max = max(ph_ctl_max, phe)
+    enddo
+  enddo
 
   ! --- amplitude factor: 1 in full_q mode; least-squares shape amplitude in
   !     q_shape mode (the current is prescribed there, so only the shape of
   !     q can be matched; the achieved amplitude is reported)
   c_amp = 1.d0
   if (trim(re_eq_match_mode) .eq. 'q_shape') then
-    num = 0.d0;  den = 0.d0
-    do k = 1, re_eq_n_l
-      phe   = min(max(phm(k), ph_lev(1)), ph_lev(n_lev))
-      q_at  = re_eq_interp_q(n_lev, ph_lev, q_lev, phe)
-      qt_at = re_eq_qt_eval(phe)
-      num = num + q_at * qt_at
-      den = den + qt_at * qt_at
-    enddo
+    num = sum(q_acc * qt_acc)
+    den = sum(qt_acc * qt_acc)
     c_amp = num / den
+    lr = lr - log(c_amp)
   endif
 
-  ! --- transplant ratio on the l grid (through the label map)
   do k = 1, re_eq_n_l
-    phe      = min(max(phm(k), ph_lev(1)), ph_lev(n_lev))
-    q_at     = re_eq_interp_q(n_lev, ph_lev, q_lev, phe)
-    qt_at    = re_eq_qt_eval(phe)
-    ratio(k) = q_at / (c_amp * qt_at)
-    ratio(k) = min(max(ratio(k), 1.d0/re_eq_ratio_clamp), re_eq_ratio_clamp)
+    ratio(k) = min(max(exp(lr(k)), 1.d0/re_eq_ratio_clamp), re_eq_ratio_clamp)
   enddo
 
   ! --- convergence metric directly in q space, restricted to the
   !     label-controllable psihat range
-  ph_ctl_max = min(max(phm(re_eq_n_l), ph_lev(1)), ph_lev(n_lev))
   err = 0.d0
   do i = 1, n_lev
     if (ph_lev(i) .le. ph_ctl_max) then
@@ -1049,19 +1107,57 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   re_eq_q_err = err
   converged   = (err .lt. re_eq_tol_q)
 
+  ! --- best-iterate tracking and stagnation detection: with one common
+  !     Nprof and strongly different class maps, exactly matching q_t can
+  !     be outside the range of the ansatz. Keep the best profile; when no
+  !     longer improving, restore it and finish (the caller runs one more
+  !     inner Picard pass on the restored profile, in which this routine
+  !     only re-evaluates the error and decides on soft acceptance).
+  if (re_eq_finishing) then
+    if (.not. converged) then
+      if (err .lt. re_eq_tol_q_soft) then
+        write(*,'(A)')        ' WARNING: re_eq: q matching stagnated above re_eq_tol_q;'
+        write(*,'(A,ES10.2)') '          accepted at the soft tolerance with max|q/q_t-1| = ', err
+        write(*,'(A)')        '          (single common Nprof with strongly different class drift'
+        write(*,'(A)')        '          shifts cannot match q_t exactly; see the module header)'
+        converged = .true.
+        re_eq_soft_accepted = .true.
+      endif
+    endif
+    write(RE_EQ_LOG_UNIT,'(I6,I8,3ES16.6)') re_eq_outer_iter, n_inner, err, I_now, maxval(re_cl_lost)
+    call flush_it(RE_EQ_LOG_UNIT)
+    return
+  endif
+  if (err .lt. 0.98d0 * re_eq_best_err) then
+    re_eq_best_err = err
+    re_eq_best_nprof(1:re_eq_n_l) = re_nprof(1:re_eq_n_l)
+    re_eq_n_stall = 0
+  else
+    re_eq_n_stall = re_eq_n_stall + 1
+  endif
+
   write(*,'(A,I4,A,ES11.3,A,ES13.5,A,ES10.2)') &
     ' re_eq outer ', re_eq_outer_iter, ':  max|q/q_t-1| = ', err, &
     '   I_RE [A] = ', I_now, '   max lost fraction = ', maxval(re_cl_lost)
   if (trim(re_eq_match_mode) .eq. 'q_shape') &
     write(*,'(A,F10.5)') '                q amplitude (achieved/target) = ', c_amp
-  if (maxval(re_cl_lost) .gt. 1.d-2) &
+  if (maxval(re_cl_lost) .gt. 5.d-2) &
     write(*,'(A,ES10.2,A)') ' WARNING: re_eq: ', maxval(re_cl_lost), &
-      ' of the current of the worst class is on drift surfaces leaving the domain'
+      ' of the (untapered) current of the worst class lies on drift surfaces'  // &
+      ' leaving the domain and is removed by the edge taper'
 
   write(RE_EQ_LOG_UNIT,'(I6,I8,3ES16.6)') re_eq_outer_iter, n_inner, err, I_now, maxval(re_cl_lost)
   call flush_it(RE_EQ_LOG_UNIT)
 
   if (converged) return
+
+  if ((re_eq_n_stall .ge. 15) .or. (re_eq_outer_iter .ge. re_eq_max_it_out)) then
+    write(*,'(A,I4,A,ES10.2)') ' re_eq: stopping the transplant after ', re_eq_outer_iter, &
+      ' outer iterations; restoring the best profile with max|q/q_t-1| = ', re_eq_best_err
+    re_nprof(1:re_eq_n_l) = re_eq_best_nprof(1:re_eq_n_l)
+    re_eq_finishing = .true.
+    return
+  endif
 
   ! --- smooth the log-ratio (Nprof is smooth; point features in the measured
   !     ratio are q-evaluation artifacts the update must not chase)
@@ -1136,6 +1232,7 @@ subroutine re_eq_write_output(my_id)
   write(iunit,'(A,ES23.15)') 'I_RE    ', re_eq_I_now
   write(iunit,'(A,ES23.15)') 'q_err   ', re_eq_q_err
   write(iunit,'(A,ES23.15)') 'psi_bnd ', re_eq_psi_bnd
+  write(iunit,'(A,ES23.15)') 'taper   ', re_eq_edge_taper
   write(iunit,'(A,ES23.15)') 'R_edge  ', re_eq_R_edge
   write(iunit,'(A)') '# classes: s  E_kin[eV]  xi  weight  gamma  v_par[m/s]  alpha[Wb/m]  A_axis[Wb]  A_edge[Wb]  R_axis[m]  Z_axis[m]  lost_fraction'
   do s = 1, re_eq_n_class
