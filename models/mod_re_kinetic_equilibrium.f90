@@ -494,35 +494,55 @@ end subroutine re_eq_update_labels
 !> Locate the drift axis of one class: the interior extremum of
 !> A(R,Z) = alpha R - psi, i.e. the solution of
 !>   dpsi/dR = alpha,  dpsi/dZ = 0.
-!> Coarse node scan (first call) followed by a damped Newton iteration with
-!> a numerical Jacobian on the interpolated psi.
+!> A coarse node scan provides a robust starting point (and fallback);
+!> a damped Newton iteration with a numerical Jacobian on the interpolated
+!> psi refines it. The extremum type of A is opposite to psi's (A ~ -psi
+!> near the axis; the alpha R term only shifts the extremum), which the
+!> node scan uses to pick the right candidate.
 subroutine re_eq_find_drift_axis(node_list, element_list, alpha, R0, Z0, &
                                  R_ax, Z_ax, A_ax, ifail)
   use data_structure
   use equil_info, only: ES
   use phys_module, only: amin
+  use mod_model_settings, only: var_psi
   implicit none
   type (type_node_list),    intent(in)  :: node_list
   type (type_element_list), intent(in)  :: element_list
   real*8,                   intent(in)  :: alpha    !< gamma m v_par/e of the class [Wb/m]
-  real*8,                   intent(in)  :: R0, Z0   !< search start point
+  real*8,                   intent(in)  :: R0, Z0   !< search start point (unused if the node scan succeeds)
   real*8,                   intent(out) :: R_ax, Z_ax
   real*8,                   intent(out) :: A_ax     !< A/e at the drift axis [Wb]
   integer,                  intent(out) :: ifail
 
   integer, parameter :: max_newton = 50
   real*8  :: R, Z, g1, g2, g1p, g2p, J11, J12, J21, J22, det, dR, dZ, h
-  real*8  :: psi, dpsi_dR, dpsi_dZ, step_limit
-  integer :: it
+  real*8  :: psi, dpsi_dR, dpsi_dZ, step_limit, A_node, A_best
+  real*8  :: R_scan, Z_scan, sgn
+  integer :: it, i, ifail_n
 
-  ifail = 0
-  R = R0;  Z = Z0
+  ! --- coarse node scan: extremum of A over the grid nodes; minimum if psi
+  !     has its maximum at the axis and vice versa
+  sgn = 1.d0
+  if (ES%psi_axis .gt. ES%psi_bnd) sgn = -1.d0    ! psi max at axis -> A min
+  A_best = -1.d99
+  R_scan = R0;  Z_scan = Z0
+  do i = 1, node_list%n_nodes
+    A_node = sgn * (alpha * node_list%node(i)%x(1,1,1) - node_list%node(i)%values(1,1,var_psi))
+    if (A_node .gt. A_best) then
+      A_best = A_node
+      R_scan = node_list%node(i)%x(1,1,1)
+      Z_scan = node_list%node(i)%x(1,1,2)
+    endif
+  enddo
+
+  R = R_scan;  Z = Z_scan
   h = 1.d-4 * amin
   step_limit = 0.2d0 * amin
+  ifail = 0
 
   do it = 1, max_newton
     call re_eq_grad_psi(node_list, element_list, R, Z, psi, dpsi_dR, dpsi_dZ, ifail)
-    if (ifail .ne. 0) return
+    if (ifail .ne. 0) exit
     g1 = dpsi_dR - alpha
     g2 = dpsi_dZ
 
@@ -530,18 +550,18 @@ subroutine re_eq_find_drift_axis(node_list, element_list, alpha, R0, Z0, &
 
     ! numerical Jacobian of (g1,g2) w.r.t. (R,Z)
     call re_eq_grad_psi(node_list, element_list, R+h, Z, psi, g1p, g2p, ifail)
-    if (ifail .ne. 0) return
+    if (ifail .ne. 0) exit
     J11 = (g1p - alpha - g1) / h
     J21 = (g2p - g2) / h
     call re_eq_grad_psi(node_list, element_list, R, Z+h, psi, g1p, g2p, ifail)
-    if (ifail .ne. 0) return
+    if (ifail .ne. 0) exit
     J12 = (g1p - alpha - g1) / h
     J22 = (g2p - g2) / h
 
     det = J11*J22 - J12*J21
     if (abs(det) .le. 1.d-30) then
       ifail = 2
-      return
+      exit
     endif
     dR = -( J22*g1 - J12*g2) / det
     dZ = -(-J21*g1 + J11*g2) / det
@@ -553,11 +573,31 @@ subroutine re_eq_find_drift_axis(node_list, element_list, alpha, R0, Z0, &
     Z = Z + dZ
   enddo
 
-  call re_eq_grad_psi(node_list, element_list, R, Z, psi, dpsi_dR, dpsi_dZ, ifail)
-  if (ifail .ne. 0) return
-  R_ax = R
-  Z_ax = Z
-  A_ax = alpha * R - psi
+  if (ifail .eq. 0) then
+    call re_eq_grad_psi(node_list, element_list, R, Z, psi, dpsi_dR, dpsi_dZ, ifail)
+  endif
+
+  if (ifail .eq. 0) then
+    R_ax = R
+    Z_ax = Z
+    A_ax = alpha * R - psi
+  else
+    ! --- fall back to the node-scan extremum (accurate to the element size;
+    !     the axis is refined again on the next Picard iteration anyway)
+    ifail_n = ifail
+    call re_eq_grad_psi(node_list, element_list, R_scan, Z_scan, psi, dpsi_dR, dpsi_dZ, ifail)
+    if (ifail .ne. 0) then
+      ! even the interpolation at the scan node failed: report the original error
+      ifail = ifail_n
+      return
+    endif
+    R_ax  = R_scan
+    Z_ax  = Z_scan
+    A_ax  = alpha * R_scan - psi
+    ifail = 0
+    write(*,'(A,ES10.2,A)') ' NOTE: re_eq: drift-axis Newton refinement failed (alpha = ', &
+      alpha, '); using the node-scan extremum'
+  endif
 
 end subroutine re_eq_find_drift_axis
 
@@ -565,10 +605,19 @@ end subroutine re_eq_find_drift_axis
 !=======================================================================
 !> psi and its (R,Z) gradient at an arbitrary point, via element search
 !> plus finite-element interpolation.
+!>
+!> Robustness: find_RZ legitimately fails (ifail=99) at degenerate points
+!> of the element mapping -- most notably the polar-grid centre node, which
+!> is exactly where the magnetic axis of a circular fixed-boundary case
+!> sits, and points exactly on the domain boundary. Those locations are
+!> measure-zero, so on failure the evaluation is retried at small spatial
+!> offsets (1e-5 a, then 1e-3 a); the interpolation error introduced is
+!> negligible for the axis search and the label map.
 subroutine re_eq_grad_psi(node_list, element_list, R, Z, psi, dpsi_dR, dpsi_dZ, ifail)
   use data_structure
   use mod_interp, only: interp_PRZ
   use mod_model_settings, only: var_psi
+  use phys_module, only: amin
   implicit none
   interface
     subroutine find_RZ(node_list,element_list,R_find,Z_find,R_out,Z_out,ielm_out,s_out,t_out,ifail)
@@ -585,12 +634,22 @@ subroutine re_eq_grad_psi(node_list, element_list, R, Z, psi, dpsi_dR, dpsi_dZ, 
   real*8,                   intent(out) :: psi, dpsi_dR, dpsi_dZ
   integer,                  intent(out) :: ifail
 
-  integer :: i_elm
-  real*8  :: R_out, Z_out, s, t, xjac
+  integer :: i_elm, i_try
+  real*8  :: R_out, Z_out, s, t, xjac, R_try, Z_try, eps
   real*8  :: P(1), P_s(1), P_t(1), P_phi(1)
   real*8  :: RR, R_s, R_t, ZZ, Z_s, Z_t
+  ! offset pattern: the point itself, then 4 diagonal neighbours at two radii
+  real*8, parameter :: off_R(9) = (/ 0.d0,  1.d0, -1.d0,  1.d0, -1.d0,  1.d0, -1.d0,  1.d0, -1.d0 /)
+  real*8, parameter :: off_Z(9) = (/ 0.d0,  1.d0,  1.d0, -1.d0, -1.d0,  1.d0,  1.d0, -1.d0, -1.d0 /)
 
-  call find_RZ(node_list, element_list, R, Z, R_out, Z_out, i_elm, s, t, ifail)
+  do i_try = 1, 9
+    eps = 1.d-5 * amin
+    if (i_try .ge. 6) eps = 1.d-3 * amin
+    R_try = R + off_R(i_try) * eps
+    Z_try = Z + off_Z(i_try) * eps
+    call find_RZ(node_list, element_list, R_try, Z_try, R_out, Z_out, i_elm, s, t, ifail)
+    if (ifail .eq. 0) exit
+  enddo
   if (ifail .ne. 0) return
 
   call interp_PRZ(node_list, element_list, i_elm, [var_psi], 1, s, t, 0.d0, &
