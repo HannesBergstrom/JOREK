@@ -19,6 +19,11 @@ use pellet_module
   use mod_catalyst_adaptor, only: catalyst_scripts
 #endif
 use mod_parameters
+use mod_re_kinetic_equilibrium, only: re_kinetic_equilibrium, re_eq_dist_file,     &
+      re_eq_dist_format, re_eq_q_file, re_eq_match_mode, re_eq_transplant,         &
+      re_eq_I_RE, re_eq_xi_min, re_eq_alpha_out, re_eq_tol_q, re_eq_ratio_clamp,   &
+      re_eq_max_it_out, re_eq_n_l, re_eq_n_q_levels, re_eq_n_midplane,             &
+      re_eq_finite_pitch
 
 implicit none
 
@@ -811,6 +816,24 @@ if (my_id .eq. 0) then
   call MPI_PACK(keep_current_prof,      1,MPI_LOGICAL,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(init_current_prof,      1,MPI_LOGICAL,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(current_prof_initialized,1,MPI_LOGICAL,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
+
+  ! --- kinetic RE drift-surface equilibrium
+  call MPI_PACK(re_kinetic_equilibrium, 1,MPI_LOGICAL,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
+  call MPI_PACK(re_eq_finite_pitch,     1,MPI_LOGICAL,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
+  call MPI_PACK(re_eq_dist_file,      256,MPI_CHARACTER,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
+  call MPI_PACK(re_eq_dist_format,     32,MPI_CHARACTER,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
+  call MPI_PACK(re_eq_q_file,         256,MPI_CHARACTER,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
+  call MPI_PACK(re_eq_match_mode,      16,MPI_CHARACTER,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
+  call MPI_PACK(re_eq_transplant,      16,MPI_CHARACTER,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
+  call MPI_PACK(re_eq_I_RE,             1,MPI_REAL8,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
+  call MPI_PACK(re_eq_xi_min,           1,MPI_REAL8,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
+  call MPI_PACK(re_eq_alpha_out,        1,MPI_REAL8,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
+  call MPI_PACK(re_eq_tol_q,            1,MPI_REAL8,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
+  call MPI_PACK(re_eq_ratio_clamp,      1,MPI_REAL8,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
+  call MPI_PACK(re_eq_max_it_out,       1,MPI_INTEGER,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
+  call MPI_PACK(re_eq_n_l,              1,MPI_INTEGER,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
+  call MPI_PACK(re_eq_n_q_levels,       1,MPI_INTEGER,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
+  call MPI_PACK(re_eq_n_midplane,       1,MPI_INTEGER,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
 
   n_tmp = 2*(n_coord_tor+1)*(l_pol_domm+1)
   call MPI_PACK(dcoef,              n_tmp,MPI_REAL8,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
@@ -1803,6 +1826,24 @@ if (my_id .ne. 0) then
   call MPI_UNPACK(buffer,bufsize,position,keep_current_prof,      1,MPI_LOGICAL,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,init_current_prof,      1,MPI_LOGICAL,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,current_prof_initialized,1,MPI_LOGICAL,MPI_COMM_WORLD,ierr)
+
+  ! --- kinetic RE drift-surface equilibrium
+  call MPI_UNPACK(buffer,bufsize,position,re_kinetic_equilibrium, 1,MPI_LOGICAL,MPI_COMM_WORLD,ierr)
+  call MPI_UNPACK(buffer,bufsize,position,re_eq_finite_pitch,     1,MPI_LOGICAL,MPI_COMM_WORLD,ierr)
+  call MPI_UNPACK(buffer,bufsize,position,re_eq_dist_file,      256,MPI_CHARACTER,MPI_COMM_WORLD,ierr)
+  call MPI_UNPACK(buffer,bufsize,position,re_eq_dist_format,     32,MPI_CHARACTER,MPI_COMM_WORLD,ierr)
+  call MPI_UNPACK(buffer,bufsize,position,re_eq_q_file,         256,MPI_CHARACTER,MPI_COMM_WORLD,ierr)
+  call MPI_UNPACK(buffer,bufsize,position,re_eq_match_mode,      16,MPI_CHARACTER,MPI_COMM_WORLD,ierr)
+  call MPI_UNPACK(buffer,bufsize,position,re_eq_transplant,      16,MPI_CHARACTER,MPI_COMM_WORLD,ierr)
+  call MPI_UNPACK(buffer,bufsize,position,re_eq_I_RE,             1,MPI_REAL8,MPI_COMM_WORLD,ierr)
+  call MPI_UNPACK(buffer,bufsize,position,re_eq_xi_min,           1,MPI_REAL8,MPI_COMM_WORLD,ierr)
+  call MPI_UNPACK(buffer,bufsize,position,re_eq_alpha_out,        1,MPI_REAL8,MPI_COMM_WORLD,ierr)
+  call MPI_UNPACK(buffer,bufsize,position,re_eq_tol_q,            1,MPI_REAL8,MPI_COMM_WORLD,ierr)
+  call MPI_UNPACK(buffer,bufsize,position,re_eq_ratio_clamp,      1,MPI_REAL8,MPI_COMM_WORLD,ierr)
+  call MPI_UNPACK(buffer,bufsize,position,re_eq_max_it_out,       1,MPI_INTEGER,MPI_COMM_WORLD,ierr)
+  call MPI_UNPACK(buffer,bufsize,position,re_eq_n_l,              1,MPI_INTEGER,MPI_COMM_WORLD,ierr)
+  call MPI_UNPACK(buffer,bufsize,position,re_eq_n_q_levels,       1,MPI_INTEGER,MPI_COMM_WORLD,ierr)
+  call MPI_UNPACK(buffer,bufsize,position,re_eq_n_midplane,       1,MPI_INTEGER,MPI_COMM_WORLD,ierr)
 
   n_tmp = 2*(n_coord_tor+1)*(l_pol_domm+1)
   call MPI_UNPACK(buffer,bufsize,position,dcoef,              n_tmp,MPI_REAL8,MPI_COMM_WORLD,ierr)

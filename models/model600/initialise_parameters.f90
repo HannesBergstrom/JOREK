@@ -7,6 +7,11 @@ use mod_plasma_functions, only: initialise_reference_parameters
 use vacuum
 use pellet_module
 use live_data
+use mod_re_kinetic_equilibrium, only: re_kinetic_equilibrium, re_eq_dist_file,     &
+                re_eq_dist_format, re_eq_q_file, re_eq_match_mode,                 &
+                re_eq_transplant, re_eq_I_RE, re_eq_xi_min, re_eq_alpha_out,       &
+                re_eq_tol_q, re_eq_ratio_clamp, re_eq_max_it_out, re_eq_n_l,       &
+                re_eq_n_q_levels, re_eq_n_midplane, re_eq_finite_pitch
 
 implicit none
 
@@ -205,6 +210,12 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 apply_dirichlet_proj, restart_particles,            &
                 proj_collection_period,                             &
                 part_group_configs, part_groups_in_use, valves,     &
+                re_kinetic_equilibrium, re_eq_dist_file,            &
+                re_eq_dist_format, re_eq_q_file, re_eq_match_mode,  &
+                re_eq_transplant, re_eq_I_RE, re_eq_xi_min,         &
+                re_eq_alpha_out, re_eq_tol_q, re_eq_ratio_clamp,    &
+                re_eq_max_it_out, re_eq_n_l, re_eq_n_q_levels,      &
+                re_eq_n_midplane, re_eq_finite_pitch,               &
                 fluid_configs, init_particles_only,                 &
                 find_RZ_nearby_iter, find_RZ_nearby_tol,            &
                 min_sheath_angle, bcs, part_kill_ratio,             &

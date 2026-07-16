@@ -13,6 +13,31 @@ module initialisers_RE
   use equil_info
   implicit none
 
+  !> ---------------------------------------------------------------------
+  !> State of the kinetic RE drift-surface equilibrium initialization
+  !> ('equilibrium' init_function): per-class data and the common profile
+  !> function Nprof, read from the file written by the equilibrium solver
+  !> (mod_re_kinetic_equilibrium / re_eq_write_output, format version 1).
+  !> The marker spatial density of class s is the stationary guiding-centre
+  !> density n_s(R,Z) ~ w_s * Nprof(Ahat_s)/R with the per-class invariant
+  !> label Ahat_s = (alpha_s R - psi - A_axis)/(A_edge - A_axis); no further
+  !> relaxation correction is needed (Bandaru & Hoelzl, PoP 30, 092508
+  !> (2023); Bergstroem et al., PPCF (2025) for the full-f PIC model).
+  !> ---------------------------------------------------------------------
+  character(len=*), parameter :: req_file_name = 're_equilibrium.dat'
+  integer                     :: req_n_class = 0    !< number of RE classes
+  integer                     :: req_n_l     = 0    !< Nprof table size
+  real*8, allocatable         :: req_cl_ekin(:)     !< class kinetic energy [eV]
+  real*8, allocatable         :: req_cl_xi(:)       !< class pitch p_par/p
+  real*8, allocatable         :: req_cl_w(:)        !< class weights (sum = 1)
+  real*8, allocatable         :: req_cl_alpha(:)    !< gamma m_e v_par/e [Wb/m]
+  real*8, allocatable         :: req_cl_A_axis(:)   !< label normalization [Wb]
+  real*8, allocatable         :: req_cl_A_edge(:)   !< label normalization [Wb]
+  real*8, allocatable         :: req_nprof_l(:)     !< Nprof l grid
+  real*8, allocatable         :: req_nprof(:)       !< Nprof values [m^-2]
+  integer                     :: req_active_class = 0  !< class sampled by re_eq_marker_pdf
+  real*8                      :: req_sup_pdf = 1.d0    !< sup of Nprof/R for rejection normalization
+
   contains
 
 ! Quick and rough function to sample markers based on RZ-coordinates
@@ -157,5 +182,255 @@ subroutine basic_initialization(sim, group_num, rng, init_pdf, energy, pitch, st
   deallocate(p_perp)
 
 end subroutine basic_initialization
+
+
+!> Read the per-class equilibrium data written by the kinetic RE
+!> drift-surface equilibrium solver (re_equilibrium.dat, format version 1).
+!> Called by every MPI task (the file is small). Keep in sync with
+!> re_eq_write_output in models/mod_re_kinetic_equilibrium.f90.
+subroutine read_re_equilibrium_file(my_id)
+  implicit none
+  integer, intent(in) :: my_id
+  integer, parameter  :: iunit = 441
+  integer             :: ierr, s, k, idum
+  real*8              :: rdum, cols(11)
+  character(len=512)  :: line
+  character(len=32)   :: key
+
+  if (req_n_class .gt. 0) return   ! already read
+
+  open(iunit, file=req_file_name, status='old', action='read', iostat=ierr)
+  if (ierr .ne. 0) then
+    write(*,*) "ERROR: cannot open '", req_file_name, "' needed by the"
+    write(*,*) "       'equilibrium' RE initialization. Run the equilibrium"
+    write(*,*) "       phase with re_kinetic_equilibrium=.true. first."
+    stop 1
+  endif
+
+  ! --- header: keyword lines, '#' comments
+  do
+    read(iunit,'(A)',iostat=ierr) line
+    if (ierr .ne. 0) then
+      write(*,*) "ERROR: unexpected end of ", req_file_name
+      stop 1
+    endif
+    if (index(adjustl(line), '#') .eq. 1) cycle
+    read(line,*) key
+    select case (trim(key))
+    case ('n_class'); read(line,*) key, req_n_class
+    case ('n_l');     read(line,*) key, req_n_l
+    case ('I_RE', 'q_err', 'psi_bnd'); read(line,*) key, rdum
+    case ('R_edge')
+      read(line,*) key, rdum
+      exit                          ! last header entry
+    case default
+      write(*,*) "ERROR: unexpected entry '", trim(key), "' in ", req_file_name
+      stop 1
+    end select
+  enddo
+
+  if ((req_n_class .le. 0) .or. (req_n_l .le. 1)) then
+    write(*,*) "ERROR: invalid n_class / n_l in ", req_file_name
+    stop 1
+  endif
+
+  allocate(req_cl_ekin(req_n_class), req_cl_xi(req_n_class), req_cl_w(req_n_class), &
+           req_cl_alpha(req_n_class), req_cl_A_axis(req_n_class), req_cl_A_edge(req_n_class))
+  allocate(req_nprof_l(req_n_l), req_nprof(req_n_l))
+
+  ! --- class table (skip the comment line preceding it)
+  s = 0
+  do while (s .lt. req_n_class)
+    read(iunit,'(A)',iostat=ierr) line
+    if (ierr .ne. 0) then
+      write(*,*) "ERROR: unexpected end of class table in ", req_file_name
+      stop 1
+    endif
+    if (index(adjustl(line), '#') .eq. 1) cycle
+    s = s + 1
+    read(line,*) idum, cols
+    req_cl_ekin(s)   = cols(1)
+    req_cl_xi(s)     = cols(2)
+    req_cl_w(s)      = cols(3)
+    req_cl_alpha(s)  = cols(6)
+    req_cl_A_axis(s) = cols(7)
+    req_cl_A_edge(s) = cols(8)
+  enddo
+
+  ! --- Nprof table
+  k = 0
+  do while (k .lt. req_n_l)
+    read(iunit,'(A)',iostat=ierr) line
+    if (ierr .ne. 0) then
+      write(*,*) "ERROR: unexpected end of Nprof table in ", req_file_name
+      stop 1
+    endif
+    if (index(adjustl(line), '#') .eq. 1) cycle
+    k = k + 1
+    read(line,*) req_nprof_l(k), req_nprof(k)
+  enddo
+  close(iunit)
+
+  if (my_id .eq. 0) then
+    write(*,'(A,I4,A,I5,A)') "  read '"//req_file_name//"': ", req_n_class, &
+      ' RE classes, Nprof table with ', req_n_l, ' points'
+  endif
+
+end subroutine read_re_equilibrium_file
+
+
+!> Piecewise-linear evaluation of the common profile function Nprof at the
+!> label l, clipped to [0,1] (same convention as the equilibrium solver).
+pure function req_nprof_eval(l) result(nval)
+  implicit none
+  real*8, intent(in) :: l
+  real*8             :: nval, x, dl
+  integer            :: k
+  x  = min(max(l, 0.d0), 1.d0)
+  dl = req_nprof_l(2) - req_nprof_l(1)
+  k  = min(int(x/dl) + 1, req_n_l - 1)
+  nval = req_nprof(k) + (req_nprof(k+1) - req_nprof(k)) * (x - req_nprof_l(k)) / dl
+end function req_nprof_eval
+
+
+!> Rejection-sampling density of the active RE class (req_active_class):
+!> the stationary drift-surface density n_s ~ Nprof(Ahat_s)/R, normalized
+!> to [0,1] with req_sup_pdf. Expects var(1) = R, var(2) = psi (from
+!> initialise_particles with variables=[-1, var_psi]).
+pure function re_eq_marker_pdf(var) result(p)
+  implicit none
+  real*8, intent(in) :: var(2)
+  real*8             :: p, lhat
+  integer            :: s
+  s    = req_active_class
+  lhat = (req_cl_alpha(s)*var(1) - var(2) - req_cl_A_axis(s)) &
+         / (req_cl_A_edge(s) - req_cl_A_axis(s))
+  p = req_nprof_eval(lhat) / var(1) / req_sup_pdf
+end function re_eq_marker_pdf
+
+
+!> Initialize the RE markers of one group from the kinetic RE drift-surface
+!> equilibrium: positions sampled per class from the stationary density
+!> n_s ~ w_s Nprof(Ahat_s)/R (this IS the stationary density -- no further
+!> relaxation correction is needed), momentum magnitude and pitch from the
+!> class values, gyro-angle uniform. Classes are assigned deterministically
+!> in the GLOBAL marker index space so that the sum of all weights equals
+!> num_re exactly and every MPI task computes consistent weights without
+!> communication.
+subroutine equilibrium_initialization(sim, group_num, rng)
+  use phys_module,             only: part_group_configs, type_part_group_config
+  use mod_particle_group_id,   only: matching_part_config_indices
+  use mod_particle_allocation, only: calc_n_particles_per_mpi_array
+  implicit none
+  type(particle_sim), intent(inout) :: sim
+  integer,            intent(in)    :: group_num
+  class(type_rng),    intent(in)    :: rng
+
+  type(type_part_group_config)      :: config
+  integer, dimension(:), allocatable :: n_per_mpi
+  integer :: n_global, n_local, i_glob_lo, s, j, i_lo, i_hi, ir
+  integer :: cls_glob_lo(0:1000), n_in_class
+  real*8  :: cum_w, R_min, p_tot, p_par, p_perp, gyro_angle
+  real*8  :: psi, U, e1(3), e2(3)
+  real*8, dimension(3) :: E_fld, B_fld, B_cart, B_norm
+  real*8  :: weight_s
+
+  config = part_group_configs(matching_part_config_indices(group_num))
+
+  call read_re_equilibrium_file(sim%my_id)
+
+  if (req_n_class .gt. 1000) then
+    write(*,*) 'ERROR: equilibrium_initialization supports at most 1000 classes'
+    stop 1
+  endif
+
+  ! --- global index layout: this task holds global indices
+  !     i_glob_lo+1 .. i_glob_lo+n_local of n_global markers
+  !     (same splitting as allocate_particles_for_sim)
+  n_global  = int(sim%groups(group_num)%n_particles)
+  n_per_mpi = calc_n_particles_per_mpi_array(n_global, sim%n_mpi)
+  n_local   = n_per_mpi(sim%my_id+1)
+  i_glob_lo = sum(n_per_mpi(1:sim%my_id))
+  if (n_local .ne. size(sim%groups(group_num)%particles,1)) then
+    write(*,*) 'ERROR: equilibrium_initialization: inconsistent local marker count'
+    stop 1
+  endif
+
+  ! --- class boundaries in global index space: class s covers global
+  !     indices cls_glob_lo(s-1)+1 .. cls_glob_lo(s), proportional to w_s
+  cls_glob_lo(0) = 0
+  cum_w = 0.d0
+  do s = 1, req_n_class
+    cum_w = cum_w + req_cl_w(s)
+    cls_glob_lo(s) = nint(cum_w * dble(n_global))
+  enddo
+  cls_glob_lo(req_n_class) = n_global
+
+  ! --- rejection-sampling normalization: sup of Nprof/R over the domain
+  R_min = minval(sim%fields%node_list%node(1:sim%fields%node_list%n_nodes)%x(1,1,1))
+
+  do s = 1, req_n_class
+
+    n_in_class = cls_glob_lo(s) - cls_glob_lo(s-1)
+    if (n_in_class .le. 0) then
+      if (sim%my_id .eq. 0) write(*,'(A,I4,A,ES10.2,A)') &
+        '  WARNING: RE class ', s, ' (weight ', req_cl_w(s), &
+        ') received no markers; its current is not represented'
+      cycle
+    endif
+    weight_s = config%num_re * req_cl_w(s) / dble(n_in_class)
+
+    ! local slice of this class
+    i_lo = max(cls_glob_lo(s-1) + 1, i_glob_lo + 1)          - i_glob_lo
+    i_hi = min(cls_glob_lo(s),       i_glob_lo + n_local)    - i_glob_lo
+    if (i_lo .gt. i_hi) cycle
+
+    ! --- positions: rejection sampling from Nprof(Ahat_s)/R
+    req_active_class = s
+    req_sup_pdf      = maxval(req_nprof) / R_min
+    call initialise_particles(sim%groups(group_num)%particles(i_lo:i_hi),  &
+         sim%fields%node_list, sim%fields%element_list, rng,               &
+         variables=[-1, var_psi], transform=re_eq_marker_pdf)
+
+    ! --- momentum: class magnitude and pitch, uniform gyro-angle
+    p_tot = sqrt((req_cl_ekin(s)*EL_CHG/SPEED_OF_LIGHT &
+                  + MASS_ELECTRON*SPEED_OF_LIGHT)**2   &
+                 - (MASS_ELECTRON*SPEED_OF_LIGHT)**2) / ATOMIC_MASS_UNIT  ! [AMU*m/s]
+    p_par  = req_cl_xi(s) * p_tot
+    p_perp = sqrt(max(p_tot**2 - p_par**2, 0.d0))
+
+    select type (particles => sim%groups(group_num)%particles)
+    type is (particle_kinetic_relativistic)
+      !$omp parallel do default(none) &
+      !$omp private(E_fld, B_fld, psi, U, B_cart, B_norm, e1, e2, gyro_angle, j) &
+      !$omp shared (sim, i_lo, i_hi, p_par, p_perp, weight_s)
+      do j = i_lo, i_hi
+        call sim%fields%calc_EBpsiU(sim%time, particles(j)%i_elm, particles(j)%st, &
+                                    particles(j)%x(3), E_fld, B_fld, psi, U)
+        B_cart = vector_cylindrical_to_cartesian(particles(j)%x(3), B_fld)
+        B_norm = B_cart / norm2(B_cart)
+        call get_orthonormals(B_norm, e1, e2)
+        call random_number(gyro_angle)
+        gyro_angle = gyro_angle * TWOPI
+        particles(j)%p = p_par * B_norm + p_perp*(e1*cos(gyro_angle) + e2*sin(gyro_angle))
+        particles(j)%q      = -1
+        particles(j)%weight = weight_s
+      end do
+      !$omp end parallel do
+    class default
+      write(*,*) "ERROR: the 'equilibrium' RE initialization requires"
+      write(*,*) "       type = 'particle_kinetic_relativistic'"
+      stop 1
+    end select
+
+    if (sim%my_id .eq. 0) then
+      write(*,'(A,I4,A,I10,A,ES12.4,A,ES12.4)') '  RE class ', s,          &
+        ': global markers ', n_in_class, ', weight/marker ', weight_s,     &
+        ', E_kin[eV] ', req_cl_ekin(s)
+    endif
+
+  enddo ! classes
+
+end subroutine equilibrium_initialization
 
 end module initialisers_RE

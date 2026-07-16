@@ -69,7 +69,20 @@ module mod_initialise_particles
           particles(:)%weight = config%num_re / config%n_particles
         end select
 
-        if (sim%my_id == 0) then 
+        if (sim%my_id == 0) then
+          write(*,*) "----- Finished initialisation for group '", config%id, "' with coupling scheme '", config%coupling_scheme, "' -----"
+          write(*,*) ""
+        endif
+      case ("equilibrium")
+        !> Kinetic RE drift-surface equilibrium: positions from the stationary
+        !> per-class density w_s Nprof(Ahat_s)/R and momenta from the class
+        !> table, both read from re_equilibrium.dat as written by the
+        !> equilibrium solver (re_kinetic_equilibrium=.true. in the fluid
+        !> equilibrium phase). Charge and per-class weights are set inside.
+        if (sim%my_id == 0) write(*,*) "  Using the 'equilibrium_initialization' function (re_equilibrium.dat)"
+        call equilibrium_initialization(sim, group_num, pcg32_rng())
+
+        if (sim%my_id == 0) then
           write(*,*) "----- Finished initialisation for group '", config%id, "' with coupling scheme '", config%coupling_scheme, "' -----"
           write(*,*) ""
         endif

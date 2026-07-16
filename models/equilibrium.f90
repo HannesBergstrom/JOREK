@@ -15,6 +15,7 @@ use vacuum
 use mpi_mod
 use mod_interp, only: interp
 use mod_F_profile
+use mod_re_kinetic_equilibrium
 implicit none
 
           
@@ -57,6 +58,13 @@ real*8, allocatable     :: density_profile(:)
 integer    :: nj
 real*8     :: rr,ww, drr_dR, drr_dZ, drr_dR2, drr_dZ2, drr_dRdZ
 
+! --- Kinetic RE drift-surface equilibrium (re_kinetic_equilibrium)
+integer    :: iter_outer, n_outer_eq, i_lev, n_lev_q
+logical    :: re_eq_converged
+real*8     :: S_re, dS_re_dpsi, dS_re_dR
+type (type_surface_list) :: surface_list_q
+real*8, allocatable      :: q_lev(:), rad_lev(:), ph_lev(:)
+
 if (my_id .eq. 0) then
   write(*,*) '***************************************'
   write(*,*) '*           equilibrium               *'
@@ -97,16 +105,48 @@ Z_xpoint(1)  = -99.d0
 Z_xpoint(2)  = +99.d0
 R_xpoint(:)  = R_geo
 vertical_FB  = 0.d0
-i_elm_xpoint = 0 
+i_elm_xpoint = 0
 current_tot  = 0.
+
+! --- Kinetic RE drift-surface equilibrium: nested iteration. The inner
+! --- (Picard) loop below solves GS with the per-class invariant labels
+! --- refreshed every iteration; the outer loop matches the target q profile
+! --- by a transplant update of the common profile function Nprof.
+! --- See mod_re_kinetic_equilibrium for the physics and references.
+n_outer_eq      = 1
+re_eq_converged = .true.
+if (re_kinetic_equilibrium) then
+  if (freeboundary_equil .or. xpoint2 .or. newton_GS_fixbnd) then
+    if (my_id == 0) then
+      write(*,*) 'ERROR: re_kinetic_equilibrium currently requires a fixed-boundary,'
+      write(*,*) '       non-X-point equilibrium with Picard iterations'
+      write(*,*) '       (freeboundary_equil=.f., xpoint=.f., newton_GS_fixbnd=.f.)'
+    endif
+    stop 1
+  endif
+  n_outer_eq      = re_eq_max_it_out
+  re_eq_converged = .false.
+  if (my_id == 0) call re_eq_init(my_id)
+endif
 
 if (my_id == 0) then
 
+  do iter_outer = 1, n_outer_eq
+
   do iter = 1, n_iter
-  
-  
+
+
     call update_equil_state(my_id,node_list, element_list, bnd_elm_list, xpoint, xcase)
     call print_equil_state(.true.)
+
+    ! --- refresh the per-class drift-surface labels for the present psi
+    ! --- (the per-class drift axes move while psi converges), and hold the
+    ! --- prescribed RE current in q_shape mode
+    if (re_kinetic_equilibrium) then
+      call re_eq_update_labels(my_id, node_list, element_list)
+      if (trim(re_eq_match_mode) .eq. 'q_shape') &
+        call re_eq_rescale_current(my_id, node_list, element_list)
+    endif
 
     if ((ES%ifail_axis .ne. 0) .and. (iter .le. 5)) then
       call find_RZ(node_list,element_list,R_geo,Z_geo,R_out,Z_out,i_elm,s_out,t_out,ifail)
@@ -190,8 +230,59 @@ if (my_id == 0) then
       write(*,'(A,ES10.3)') ' WARNING: Fixed boundary equilibrium not fully converged: diff=', diff
       exit
     end if
-  
+
   enddo
+
+  ! --- Kinetic RE drift-surface equilibrium: outer q-matching update.
+  ! --- Compute q(psihat_n) from the converged psi by flux-surface
+  ! --- integration (the standard machinery), then transplant-update Nprof.
+  if (re_kinetic_equilibrium) then
+
+    call update_equil_state(my_id,node_list, element_list, bnd_elm_list, xpoint, xcase)
+    call re_eq_update_labels(my_id, node_list, element_list)
+
+    n_lev_q = re_eq_n_q_levels
+    surface_list_q%n_psi = n_lev_q + 1     ! entry 1 (magnetic axis) is skipped by determine_q_profile
+    if (allocated(surface_list_q%psi_values)) call tr_deallocate(surface_list_q%psi_values,"surface_list_q%psi_values",CAT_GRID)
+    call tr_allocate(surface_list_q%psi_values,1,surface_list_q%n_psi,"surface_list_q%psi_values",CAT_GRID)
+    if (.not. allocated(ph_lev)) then
+      call tr_allocate(ph_lev, 1,n_lev_q,               "ph_lev", CAT_GRID)
+      call tr_allocate(q_lev,  1,surface_list_q%n_psi,  "q_lev",  CAT_GRID)
+      call tr_allocate(rad_lev,1,surface_list_q%n_psi,  "rad_lev",CAT_GRID)
+    endif
+    do i_lev = 1, n_lev_q
+      ph_lev(i_lev) = 0.02d0 + (0.985d0 - 0.02d0) * dble(i_lev-1) / dble(n_lev_q-1)
+      surface_list_q%psi_values(i_lev+1) = ES%psi_axis + ph_lev(i_lev) * (ES%psi_bnd - ES%psi_axis)
+    enddo
+    surface_list_q%psi_values(1) = ES%psi_axis + 0.01d0 * (ES%psi_bnd - ES%psi_axis)
+
+    call find_flux_surfaces(my_id,xpoint2,xcase2,node_list,element_list,surface_list_q)
+    call determine_q_profile(node_list,element_list,surface_list_q,ES%psi_axis,ES%psi_xpoint,ES%Z_xpoint, &
+                             q_lev,rad_lev)
+    if (allocated(surface_list_q%flux_surfaces)) deallocate(surface_list_q%flux_surfaces)
+
+    call re_eq_outer_update(my_id, node_list, element_list, n_lev_q, ph_lev, q_lev(2:n_lev_q+1), &
+                            iter, re_eq_converged)
+    if (re_eq_converged) then
+      write(*,'(A,I4,A)') ' re_eq: q-profile matching converged after ', iter_outer, ' outer iterations'
+    endif
+  endif
+
+  if (re_eq_converged) exit
+
+  enddo ! iter_outer
+
+  if (re_kinetic_equilibrium) then
+    call re_eq_write_output(my_id)
+    if (allocated(surface_list_q%psi_values)) &
+      call tr_deallocate(surface_list_q%psi_values,"surface_list_q%psi_values",CAT_GRID)
+    if (allocated(ph_lev)) then
+      call tr_deallocate(ph_lev, "ph_lev", CAT_GRID)
+      call tr_deallocate(q_lev,  "q_lev",  CAT_GRID)
+      call tr_deallocate(rad_lev,"rad_lev",CAT_GRID)
+    endif
+    call re_eq_finalize(re_eq_converged)
+  endif
 
 end if ! my_id == 0
 
@@ -471,12 +562,23 @@ if (my_id == 0) then
 
   
     zjz     = zFFprime      - R*R *      (dn_dpsi    * zT + zn * dT_dpsi)
-  
+
     dj_dpsi = dFFprime_dpsi - R*R *      (dn_dpsi2   * zT + zn * dT_dpsi2  + 2.d0 * dn_dpsi * dT_dpsi)
-  
+
     dj_dR   =               - 2.d0 * R * (dn_dpsi    * zT + zn * dT_dpsi)
-  
+
     dj_dZ   = dFFprime_dz   - R*R *      (dn_dpsi_dz * zT + dn_dpsi * dT_dz + zn * dT_dpsi_dz + dn_dz * dT_dpsi)
+
+    ! --- Kinetic RE drift-surface equilibrium: the RE current is part of the
+    ! --- GS source and must appear in the current variable zj = Delta*psi as
+    ! --- well (second derivatives of the piecewise-linear Nprof vanish a.e.
+    ! --- and are left out of the 4th degree of freedom)
+    if (re_kinetic_equilibrium) then
+      call re_eq_source_derivs(psi, R, S_re, dS_re_dpsi, dS_re_dR)
+      zjz     = zjz     + S_re
+      dj_dpsi = dj_dpsi + dS_re_dpsi
+      dj_dR   = dj_dR   + dS_re_dR
+    endif
   
     dj_dR_dR = - 2.d0     * (dn_dpsi     * zT + zn * dT_dpsi)
   

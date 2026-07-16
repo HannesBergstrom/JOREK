@@ -8,6 +8,7 @@ use data_structure
 use gauss
 use basis_at_gaussian
 use phys_module
+use mod_re_kinetic_equilibrium, only: re_kinetic_equilibrium, re_eq_source
 
 implicit none
 
@@ -36,7 +37,7 @@ real*8     :: zT, dT_dpsi, dT_dz,  ddT_dpsi,  ddT_dz,  ddT_dpsi_dz,  dT_dpsi3,  
 real*8     :: zTi,dTi_dpsi,dTi_dz, ddTi_dpsi, ddTi_dz, ddTi_dpsi_dz, dTi_dpsi3, dTi_dpsi_dz2, dTi_dpsi2_dz
 real*8     :: zTe,dTe_dpsi,dTe_dz, ddTe_dpsi, ddTe_dz, ddTe_dpsi_dz, dTe_dpsi3, dTe_dpsi_dz2, dTe_dpsi2_dz
 real*8     :: ddFFprime_dpsi_dz, zFFprime, dFFprime_dpsi,dFFprime_dz, dFFprime_dpsi2,dFFprime_dz2
-real*8     :: radius_rope
+real*8     :: radius_rope, rhs_re
 
 
 ELM=0.d0
@@ -119,7 +120,14 @@ do ms=1, n_gauss
 
     call FFprime(xpoint, xcase, y_g(ms,mt), Z_xpoint, eq2_g(ms,mt),psi_axis,psi_bnd, &
                 zFFprime, dFFprime_dpsi,dFFprime_dz,dFFprime_dpsi2,dFFprime_dz2,ddFFprime_dpsi_dz, .true.)
-		
+
+    ! --- Kinetic RE drift-surface equilibrium: current on drift (constant
+    ! --- canonical toroidal momentum) surfaces instead of flux surfaces.
+    ! --- The source has no explicit R factor (the 1/R of the class density
+    ! --- cancels the R of the GS right-hand side); rhs below carries 1/R.
+    rhs_re = 0.d0
+    if (re_kinetic_equilibrium) rhs_re = re_eq_source(eq2_g(ms,mt), x_g(ms,mt)) / x_g(ms,mt)
+
     wst = wgauss(ms)*wgauss(mt)
 
     xjac =  x_s(ms,mt)*y_t(ms,mt) - x_t(ms,mt)*y_s(ms,mt)
@@ -151,7 +159,8 @@ do ms=1, n_gauss
         v_x = (  y_t(ms,mt) * h_s(i,j,ms,mt) - y_s(ms,mt) * h_t(i,j,ms,mt) ) * element%size(i,j) / xjac
         v_y = (- x_t(ms,mt) * h_s(i,j,ms,mt) + x_s(ms,mt) * h_t(i,j,ms,mt) ) * element%size(i,j) / xjac
 
-        rhs_ij =  zFFprime / x_g(ms,mt) - (zn * dT_dpsi + dn_dpsi * zT) * x_g(ms,mt) * pprime_fact
+        rhs_ij =  zFFprime / x_g(ms,mt) - (zn * dT_dpsi + dn_dpsi * zT) * x_g(ms,mt) * pprime_fact &
+                  + rhs_re
 
         ! --- Add the contribution of extra PF coil currents inside the JOREK domain
         ! --- This is not the same as free-boundary, but when doing GS inside a RZpsi-contour
