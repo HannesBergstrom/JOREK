@@ -423,8 +423,11 @@ subroutine re_eq_init_nprof(my_id)
   do k = 1, re_eq_n_l
     l = re_nprof_l(k)
     ! invert ph(r): find first i with ph(i) >= l
+    ! (no compound condition: Fortran .and. does not short-circuit, and
+    !  ph(i-1) must not be evaluated for i = 1)
     i = nr
-    do while ((i .gt. 1) .and. (ph(i-1) .ge. l))
+    do while (i .gt. 1)
+      if (ph(i-1) .lt. l) exit
       i = i - 1
     enddo
     if (i .eq. 1) then
