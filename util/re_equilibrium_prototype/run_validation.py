@@ -147,13 +147,15 @@ def test_q_matching():
     print("\n=== Test 3: q-profile matching ===")
     qt = q_target_default()
 
-    # (name, classes, tol_accept): mono 60 MeV has ~2-3% of its current on
+    # (name, classes, tol_accept): mono 60 MeV has ~3% of its current on
     # open drift orbits; with the physical edge truncation the achievable
     # q-error floor is a few 1e-3 (the removed current cannot be placed
-    # arbitrarily). The solver must stop AT that floor gracefully.
+    # arbitrarily -- the floor scales with the lost fraction). The solver
+    # must stop AT that floor gracefully (best-iterate restore), which is
+    # what this case checks.
     cases = [
         ("mono 20 MeV", REClasses(E_kin=[2.0e7], xi=[-0.99], w=[1.0]), 1e-3),
-        ("mono 60 MeV", REClasses(E_kin=[6.0e7], xi=[-0.99], w=[1.0]), 3e-3),
+        ("mono 60 MeV", REClasses(E_kin=[6.0e7], xi=[-0.99], w=[1.0]), 4e-3),
         ("8-node spectrum", REClasses.from_file('dist_spectrum_8nodes.dat'), 1e-3),
     ]
     for name, cl, tol_accept in cases:

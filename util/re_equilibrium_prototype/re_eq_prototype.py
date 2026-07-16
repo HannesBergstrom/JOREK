@@ -141,13 +141,21 @@ def read_q_target(fname):
 
 
 class QTarget:
+    """Target q profile. Evaluated with MONOTONE-CUBIC interpolation: a
+    piecewise-linear target has kinks that no smooth equilibrium q can
+    match, which floors the achievable q error at
+    ~ curvature * table-spacing^2 (observed: exactly 1e-3 with an 11-point
+    table -- right at the default tolerance)."""
+
     def __init__(self, psihat, q):
+        from scipy.interpolate import PchipInterpolator
         idx = np.argsort(psihat)
         self.psihat = np.asarray(psihat, dtype=float)[idx]
         self.q = np.asarray(q, dtype=float)[idx]
+        self._interp = PchipInterpolator(self.psihat, self.q)
 
     def __call__(self, psihat):
-        return np.interp(np.clip(psihat, 0.0, 1.0), self.psihat, self.q)
+        return self._interp(np.clip(psihat, self.psihat[0], self.psihat[-1]))
 
 
 # ===========================================================================

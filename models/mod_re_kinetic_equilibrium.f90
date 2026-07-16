@@ -109,9 +109,11 @@ real*8, allocatable :: re_cl_lost(:)    !< current fraction on drift surfaces le
 !> common normalized profile function Nprof(l) [m^-2], uniform l grid in [0,1]
 real*8, allocatable :: re_nprof_l(:), re_nprof(:)
 
-!> target q profile table
+!> target q profile table (with monotone-cubic slopes: a piecewise-LINEAR
+!> target has kinks no smooth equilibrium q can match, which floors the
+!> achievable q error at ~ curvature * spacing^2 of the table)
 integer             :: re_eq_n_qt = 0
-real*8, allocatable :: re_qt_psihat(:), re_qt_q(:)
+real*8, allocatable :: re_qt_psihat(:), re_qt_q(:), re_qt_slope(:)
 
 !> outer iteration state
 integer :: re_eq_outer_iter  = 0        !< current outer iteration (for logging)
@@ -359,27 +361,48 @@ subroutine re_eq_read_q_target(my_id)
   re_eq_n_qt = n
   call tr_allocate(re_qt_psihat, 1, n, "re_qt_psihat", CAT_GRID)
   call tr_allocate(re_qt_q,      1, n, "re_qt_q",      CAT_GRID)
+  call tr_allocate(re_qt_slope,  1, n, "re_qt_slope",  CAT_GRID)
   re_qt_psihat(1:n) = tmp_p(1:n)
   re_qt_q(1:n)      = tmp_q(1:n)
+
+  ! --- monotone-cubic slopes (Fritsch-Butland): harmonic mean of adjacent
+  !     secants of the same sign, zero otherwise
+  do ipos = 2, n-1
+    cols(1) = (re_qt_q(ipos)   - re_qt_q(ipos-1)) / (re_qt_psihat(ipos)   - re_qt_psihat(ipos-1))
+    cols(2) = (re_qt_q(ipos+1) - re_qt_q(ipos))   / (re_qt_psihat(ipos+1) - re_qt_psihat(ipos))
+    if (cols(1)*cols(2) .gt. 0.d0) then
+      re_qt_slope(ipos) = 2.d0*cols(1)*cols(2) / (cols(1) + cols(2))
+    else
+      re_qt_slope(ipos) = 0.d0
+    endif
+  enddo
+  re_qt_slope(1) = (re_qt_q(2) - re_qt_q(1)) / (re_qt_psihat(2) - re_qt_psihat(1))
+  re_qt_slope(n) = (re_qt_q(n) - re_qt_q(n-1)) / (re_qt_psihat(n) - re_qt_psihat(n-1))
 
 end subroutine re_eq_read_q_target
 
 
 !=======================================================================
-!> Piecewise-linear evaluation of the target q at psihat (clipped to the
-!> table range).
+!> Monotone-cubic (Hermite) evaluation of the target q at psihat, clipped
+!> to the table range.
 function re_eq_qt_eval(psihat) result(qval)
   implicit none
   real*8, intent(in) :: psihat
-  real*8             :: qval, x
+  real*8             :: qval, x, h, t, h00, h10, h01, h11
   integer            :: k
   x = min(max(psihat, re_qt_psihat(1)), re_qt_psihat(re_eq_n_qt))
   do k = 2, re_eq_n_qt
     if (x .le. re_qt_psihat(k)) exit
   enddo
   k = min(k, re_eq_n_qt)
-  qval = re_qt_q(k-1) + (re_qt_q(k) - re_qt_q(k-1)) &
-         * (x - re_qt_psihat(k-1)) / (re_qt_psihat(k) - re_qt_psihat(k-1))
+  h = re_qt_psihat(k) - re_qt_psihat(k-1)
+  t = (x - re_qt_psihat(k-1)) / h
+  h00 = (1.d0 + 2.d0*t) * (1.d0 - t)**2
+  h10 = t * (1.d0 - t)**2
+  h01 = t*t * (3.d0 - 2.d0*t)
+  h11 = t*t * (t - 1.d0)
+  qval = h00*re_qt_q(k-1) + h10*h*re_qt_slope(k-1) &
+       + h01*re_qt_q(k)   + h11*h*re_qt_slope(k)
 end function re_eq_qt_eval
 
 
