@@ -466,7 +466,11 @@ subroutine equilibrium_initialization(sim, group_num, rng)
   type is (particle_kinetic_relativistic)
     do j = 1, n_local
       phi_p   = particles(j)%x(3)
-      p_phi_c = -particles(j)%p(1)*sin(phi_p) + particles(j)%p(2)*cos(phi_p)  ! [AMU m/s]
+      ! toroidal momentum component in JOREK's cylindrical convention:
+      ! the cartesian mapping is x = R cos(phi), y = -R sin(phi) (clockwise
+      ! phi, left-handed (R,Z,phi) ordering, cf. mod_coordinate_transforms),
+      ! so e_phi = (-sin(phi), -cos(phi), 0)
+      p_phi_c = -particles(j)%p(1)*sin(phi_p) - particles(j)%p(2)*cos(phi_p)  ! [AMU m/s]
       gam     = sqrt(1.d0 + (norm2(particles(j)%p)*ATOMIC_MASS_UNIT &
                              / (me_kg*SPEED_OF_LIGHT))**2)
       I_loc   = I_loc + particles(j)%weight * dble(particles(j)%q) * EL_CHG   &
