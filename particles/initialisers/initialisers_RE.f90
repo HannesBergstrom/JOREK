@@ -37,6 +37,9 @@ module initialisers_RE
   real*8, allocatable         :: req_nprof(:)       !< Nprof values [m^-2]
   real*8                      :: req_edge_taper = 0.2d0 !< edge truncation width (read from the file;
                                                         !< MUST match the equilibrium solver)
+  real*8                      :: req_I_RE = 0.d0    !< RE current of the equilibrium [A]; the marker
+                                                    !< weights are normalized to carry exactly this
+                                                    !< current (num_re is ignored for this init)
   integer                     :: req_active_class = 0  !< class sampled by re_eq_marker_pdf
   real*8                      :: req_sup_pdf = 1.d0    !< sup of Nprof/R for rejection normalization
 
@@ -222,7 +225,8 @@ subroutine read_re_equilibrium_file(my_id)
     case ('n_class'); read(line,*) key, req_n_class
     case ('n_l');     read(line,*) key, req_n_l
     case ('taper');   read(line,*) key, req_edge_taper
-    case ('I_RE', 'q_err', 'psi_bnd'); read(line,*) key, rdum
+    case ('I_RE');    read(line,*) key, req_I_RE
+    case ('q_err', 'psi_bnd'); read(line,*) key, rdum
     case ('R_edge')
       read(line,*) key, rdum
       exit                          ! last header entry
@@ -323,10 +327,20 @@ end function re_eq_marker_pdf
 !> n_s ~ w_s Nprof(Ahat_s)/R (this IS the stationary density -- no further
 !> relaxation correction is needed), momentum magnitude and pitch from the
 !> class values, gyro-angle uniform. Classes are assigned deterministically
-!> in the GLOBAL marker index space so that the sum of all weights equals
-!> num_re exactly and every MPI task computes consistent weights without
-!> communication.
+!> in the GLOBAL marker index space, so per-class marker counts and weight
+!> ratios are consistent across MPI tasks without communication.
+!>
+!> WEIGHTS: the marker weights are normalized such that the toroidal current
+!> carried by the markers, I = sum_p w_p q e v_phi,p / (2 pi R_p), equals
+!> EXACTLY the RE current I_RE of the equilibrium (read from
+!> re_equilibrium.dat). The namelist num_re is IGNORED for this
+!> initialization: any mismatch between the marker current and the fluid
+!> equilibrium current makes the resistive term eta*(j - j_RE) nonzero and
+!> the coupled state decays away from the constructed equilibrium (observed
+!> as an inboard drift of the current channel on the resistive time). The
+!> implied physical RE count is reported in the log.
 subroutine equilibrium_initialization(sim, group_num, rng)
+  use mpi
   use phys_module,             only: part_group_configs, type_part_group_config
   use mod_particle_group_id,   only: matching_part_config_indices
   use mod_particle_allocation, only: calc_n_particles_per_mpi_array
@@ -337,12 +351,13 @@ subroutine equilibrium_initialization(sim, group_num, rng)
 
   type(type_part_group_config)      :: config
   integer, dimension(:), allocatable :: n_per_mpi
-  integer :: n_global, n_local, i_glob_lo, s, j, i_lo, i_hi, ir
+  integer :: n_global, n_local, i_glob_lo, s, j, i_lo, i_hi, ierr
   integer :: cls_glob_lo(0:1000), n_in_class
   real*8  :: cum_w, R_min, p_tot, p_par, p_perp, gyro_angle
   real*8  :: psi, U, e1(3), e2(3)
   real*8, dimension(3) :: E_fld, B_fld, B_cart, B_norm
   real*8  :: weight_s
+  real*8  :: I_loc, I_unit, w_factor, p_phi_c, gam, me_kg, phi_p
 
   config = part_group_configs(matching_part_config_indices(group_num))
 
@@ -387,7 +402,9 @@ subroutine equilibrium_initialization(sim, group_num, rng)
         ') received no markers; its current is not represented'
       cycle
     endif
-    weight_s = config%num_re * req_cl_w(s) / dble(n_in_class)
+    ! provisional weight = class fraction per marker (sum over all markers
+    ! = 1); the global current-matching rescale follows below
+    weight_s = req_cl_w(s) / dble(n_in_class)
 
     ! local slice of this class
     i_lo = max(cls_glob_lo(s-1) + 1, i_glob_lo + 1)          - i_glob_lo
@@ -433,12 +450,61 @@ subroutine equilibrium_initialization(sim, group_num, rng)
     end select
 
     if (sim%my_id .eq. 0) then
-      write(*,'(A,I4,A,I10,A,ES12.4,A,ES12.4)') '  RE class ', s,          &
-        ': global markers ', n_in_class, ', weight/marker ', weight_s,     &
-        ', E_kin[eV] ', req_cl_ekin(s)
+      write(*,'(A,I4,A,I10,A,ES12.4)') '  RE class ', s,                   &
+        ': global markers ', n_in_class, ', E_kin[eV] ', req_cl_ekin(s)
     endif
 
   enddo ! classes
+
+  ! --- normalize the weights to the equilibrium RE current: compute the
+  !     toroidal current carried by the markers at unit total weight,
+  !     I_unit = sum_p w_p q e v_phi,p / (2 pi R_p), and rescale all weights
+  !     by I_RE / I_unit
+  I_loc = 0.d0
+  me_kg = sim%groups(group_num)%mass * ATOMIC_MASS_UNIT
+  select type (particles => sim%groups(group_num)%particles)
+  type is (particle_kinetic_relativistic)
+    do j = 1, n_local
+      phi_p   = particles(j)%x(3)
+      p_phi_c = -particles(j)%p(1)*sin(phi_p) + particles(j)%p(2)*cos(phi_p)  ! [AMU m/s]
+      gam     = sqrt(1.d0 + (norm2(particles(j)%p)*ATOMIC_MASS_UNIT &
+                             / (me_kg*SPEED_OF_LIGHT))**2)
+      I_loc   = I_loc + particles(j)%weight * dble(particles(j)%q) * EL_CHG   &
+                * (p_phi_c*ATOMIC_MASS_UNIT / (gam*me_kg))                    &
+                / (TWOPI * particles(j)%x(1))
+    enddo
+  end select
+
+  call MPI_Allreduce(I_loc, I_unit, 1, MPI_REAL8, MPI_SUM, MPI_COMM_WORLD, ierr)
+
+  if (abs(I_unit) .le. 0.d0) then
+    write(*,*) 'ERROR: equilibrium_initialization: zero marker current at unit weight'
+    stop 1
+  endif
+  w_factor = req_I_RE / I_unit
+  if (w_factor .le. 0.d0) then
+    write(*,*) 'ERROR: equilibrium_initialization: marker current has the opposite'
+    write(*,*) '       sign to the equilibrium I_RE -- the pitch signs of the'
+    write(*,*) '       distribution table are inconsistent with the equilibrium.'
+    stop 1
+  endif
+
+  select type (particles => sim%groups(group_num)%particles)
+  type is (particle_kinetic_relativistic)
+    do j = 1, n_local
+      particles(j)%weight = particles(j)%weight * w_factor
+    enddo
+  end select
+
+  if (sim%my_id .eq. 0) then
+    write(*,'(A,ES13.5,A)') '  weights normalized to the equilibrium RE current I_RE = ', &
+      req_I_RE, ' A'
+    write(*,'(A,ES13.5)')   '  implied physical RE count sum(weights)         = ', w_factor
+    if (config%num_re .gt. 0.d0) then
+      write(*,'(A,ES10.2,A)') '  NOTE: part_group_configs%num_re (= ', config%num_re, &
+        ') is IGNORED by the equilibrium initialization'
+    endif
+  endif
 
 end subroutine equilibrium_initialization
 

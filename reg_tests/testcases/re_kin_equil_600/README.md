@@ -14,6 +14,10 @@ Tests the `re_kinetic_equilibrium` feature end to end with model 600 and the
    full-orbit RE markers from the stationary per-class density
    `n_s ~ w_s Nprof(Ahat_s)/R` (init_function='equilibrium') and runs a few
    coupled steps; the regression run restarts from `part_restart.h5`.
+   The marker weights are normalized so the marker-carried toroidal current
+   equals the equilibrium I_RE exactly (`num_re` is ignored): a mismatch
+   leaves eta*(j - j_RE) finite and the current channel decays resistively,
+   drifting inboard.
 
 Physics checks when preparing/updating the reference data:
 

@@ -127,7 +127,10 @@
  part_group_configs(1)%n_particles     = 1e4
  part_group_configs(1)%mass            = 0.000548579870184805
  part_group_configs(1)%init_function   = 'equilibrium'
- part_group_configs(1)%num_re          = 1.0e15
+ ! num_re is IGNORED by init_function='equilibrium': the marker weights are
+ ! normalized such that the marker current equals the I_RE of the
+ ! drift-surface equilibrium (re_equilibrium.dat) exactly -- any mismatch
+ ! makes eta*(j - j_RE) nonzero and the coupled state decays resistively.
 
  tstep_particles  = 5.d-12
 
