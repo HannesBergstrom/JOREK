@@ -226,7 +226,9 @@ subroutine read_re_equilibrium_file(my_id)
     case ('n_l');     read(line,*) key, req_n_l
     case ('taper');   read(line,*) key, req_edge_taper
     case ('I_RE');    read(line,*) key, req_I_RE
-    case ('q_err', 'psi_bnd'); read(line,*) key, rdum
+    ! l_beam is informational: the beam-edge envelope is already contained
+    ! in the Nprof table written by the solver
+    case ('q_err', 'psi_bnd', 'l_beam'); read(line,*) key, rdum
     case ('R_edge')
       read(line,*) key, rdum
       exit                          ! last header entry

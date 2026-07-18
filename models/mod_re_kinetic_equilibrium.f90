@@ -48,7 +48,8 @@ private
 public :: re_kinetic_equilibrium, re_eq_dist_file, re_eq_dist_format,          &
           re_eq_q_file, re_eq_match_mode, re_eq_transplant, re_eq_I_RE,        &
           re_eq_xi_min, re_eq_alpha_out, re_eq_tol_q, re_eq_tol_q_soft,        &
-          re_eq_edge_taper, re_eq_ratio_clamp,                                 &
+          re_eq_edge_taper, re_eq_l_beam, re_eq_l_beam_width,                  &
+          re_eq_ratio_clamp,                                                   &
           re_eq_max_it_out, re_eq_n_l, re_eq_n_q_levels, re_eq_n_midplane,     &
           re_eq_finite_pitch
 ! --- driver interface (used by equilibrium.f90 and the GS element assembly)
@@ -81,6 +82,17 @@ real*8             :: re_eq_edge_taper  = 0.2d0       !< label width of the line
                                                       !< halo current that destabilizes the outer iteration; a
                                                       !< too-narrow taper (< ~0.1) makes the transplant gain
                                                       !< vanish abruptly at the edge and the iteration treadmills.
+real*8             :: re_eq_l_beam      = 1.d0        !< beam-edge label: the RE current occupies drift surfaces
+                                                      !< with Ahat < re_eq_l_beam only, leaving a current-free
+                                                      !< (vacuum) annulus between the beam edge and the wall.
+                                                      !< For < 1, ALL current-carrying drift orbits are closed
+                                                      !< (no scrape-off; the edge taper never activates). In the
+                                                      !< zero-drift-orbit limit this label equals the normalized
+                                                      !< poloidal flux of the beam edge. Default 1 = wall-limited
+                                                      !< beam (previous behaviour). q_t is matched only inside
+                                                      !< the beam; q in the vacuum annulus is an output.
+real*8             :: re_eq_l_beam_width = 0.1d0      !< label width of the smoothstep roll-off of the beam
+                                                      !< current inside [l_beam - width, l_beam]
 real*8             :: re_eq_ratio_clamp = 2.d0        !< per-iteration clamp of the transplant ratio
 integer            :: re_eq_max_it_out  = 50          !< maximum outer iterations
 integer            :: re_eq_n_l         = 101         !< number of points of the Nprof(l) table
@@ -522,6 +534,8 @@ subroutine re_eq_init_nprof(my_id)
     endif
     re_nprof(k) = re_nprof(k) * R_geo / (EL_CHG * vbar)
   enddo
+
+  call re_eq_apply_beam_envelope()
 
 end subroutine re_eq_init_nprof
 
@@ -1077,8 +1091,8 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   integer :: k, i, s
   real*8  :: phm(re_eq_n_l), phe, q_at, qt_at, ratio(re_eq_n_l), lr(re_eq_n_l)
   real*8  :: q_acc(re_eq_n_l), qt_acc(re_eq_n_l)
-  real*8  :: cw(re_eq_n_class), cw_sum
-  real*8  :: c_amp, num, den, err, I_now, ph_ctl_max
+  real*8  :: cw(re_eq_n_class), cw_sum, ph_beam_cl(re_eq_n_class)
+  real*8  :: c_amp, num, den, err, I_now, ph_ctl_max, ph_beam, l_eff
   real*8  :: C(re_eq_n_l), dl, qq
 
   re_eq_outer_iter = re_eq_outer_iter + 1
@@ -1098,16 +1112,47 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   do s = 1, re_eq_n_class
     call re_eq_label_map(my_id, node_list, element_list, re_cl_alpha(s), &
                          re_eq_n_l, re_nprof_l, phm)
+
+    ! psihat of the controllable beam interior for this class: labels
+    ! beyond re_eq_l_beam carry no current (vacuum annulus), and labels
+    ! inside the envelope roll-off are equally uncontrollable (the envelope
+    ! forces j -> 0 there). Ratio evaluations are clamped to the
+    ! full-current region.
+    if (re_eq_l_beam .ge. 1.d0) then
+      l_eff = 1.d0
+    else
+      l_eff = max(re_eq_l_beam - re_eq_l_beam_width, 0.d0)
+    endif
+    ph_beam = phm(re_eq_n_l)
+    do k = 2, re_eq_n_l
+      if (re_nprof_l(k) .ge. l_eff) then
+        ph_beam = phm(k-1) + (phm(k) - phm(k-1)) &
+                  * (l_eff - re_nprof_l(k-1)) / (re_nprof_l(k) - re_nprof_l(k-1))
+        exit
+      endif
+    enddo
+    ph_beam_cl(s) = ph_beam
+
     do k = 1, re_eq_n_l
-      phe   = min(max(phm(k), ph_lev(1)), ph_lev(n_lev))
+      phe   = min(max(phm(k), ph_lev(1)), min(ph_lev(n_lev), ph_beam))
       q_at  = re_eq_interp_q(n_lev, ph_lev, q_lev, phe)
       qt_at = re_eq_qt_eval(phe)
       lr(k)     = lr(k)     + cw(s) * log(max(q_at, 1.d-30) / max(qt_at, 1.d-30))
       q_acc(k)  = q_acc(k)  + cw(s) * q_at
       qt_acc(k) = qt_acc(k) + cw(s) * qt_at
-      if (k .eq. re_eq_n_l) ph_ctl_max = max(ph_ctl_max, phe)
     enddo
+    ph_ctl_max = max(ph_ctl_max, min(ph_beam, ph_lev(n_lev)))
   enddo
+
+  if ((re_eq_l_beam .lt. 1.d0) .and. (re_eq_outer_iter .eq. 1)) then
+    write(*,'(A,F7.4,A)') ' re_eq: beam-edge label l_beam = ', re_eq_l_beam, &
+      '; per-class beam edge in normalized flux:'
+    do s = 1, re_eq_n_class
+      write(*,'(A,I4,A,F8.4)') '        class ', s, ':  psihat_n = ', ph_beam_cl(s)
+      if (ph_beam_cl(s) .gt. 0.98d0) &
+        write(*,'(A)') '        WARNING: beam edge of this class is very close to the wall'
+    enddo
+  endif
 
   ! --- amplitude factor: 1 in full_q mode; least-squares shape amplitude in
   !     q_shape mode (the current is prescribed there, so only the shape of
@@ -1186,6 +1231,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
     !     the final verdict on that state
     if (re_eq_best_err .lt. err) re_nprof(1:re_eq_n_l) = re_eq_best_nprof(1:re_eq_n_l)
     call re_eq_smooth_nprof()
+    call re_eq_apply_beam_envelope()   ! smoothing smears across the beam edge
     write(*,'(A,I4,A,ES10.2)') ' re_eq: finishing after ', re_eq_outer_iter, &
       ' outer iterations (best max|q/q_t-1| = ', min(re_eq_best_err, err)
     write(*,'(A)') '        ): applied the edge null-space polish to Nprof;'
@@ -1227,7 +1273,35 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
     stop 1
   end select
 
+  ! confine the updated profile to the beam (the cumulative update can
+  ! regenerate small current beyond the beam edge when differentiating C)
+  call re_eq_apply_beam_envelope()
+
 end subroutine re_eq_outer_update
+
+
+!=======================================================================
+!> Apply the beam-edge envelope to the stored Nprof table: the current is
+!> confined to labels below re_eq_l_beam with a C1 smoothstep roll-off of
+!> width re_eq_l_beam_width, leaving a current-free (vacuum) annulus
+!> between the beam edge and the wall. Applied to the TABLE itself so that
+!> the GS source, the current integral, the output file and the marker
+!> loader all inherit it consistently. Must be re-applied after every
+!> operation that modifies Nprof (transplant update, smoothing): the
+!> cumulative transplant and the polish would otherwise regenerate
+!> current beyond the beam edge.
+subroutine re_eq_apply_beam_envelope()
+  implicit none
+  integer :: k
+  real*8  :: t, w
+  if (re_eq_l_beam .ge. 1.d0) return
+  w = max(re_eq_l_beam_width, 1.d-12)
+  do k = 1, re_eq_n_l
+    t = (re_nprof_l(k) - (re_eq_l_beam - w)) / w
+    t = min(max(t, 0.d0), 1.d0)
+    re_nprof(k) = re_nprof(k) * (1.d0 - t*t*(3.d0 - 2.d0*t))
+  enddo
+end subroutine re_eq_apply_beam_envelope
 
 
 !=======================================================================
@@ -1293,6 +1367,7 @@ subroutine re_eq_write_output(my_id)
   write(iunit,'(A,ES23.15)') 'q_err   ', re_eq_q_err
   write(iunit,'(A,ES23.15)') 'psi_bnd ', re_eq_psi_bnd
   write(iunit,'(A,ES23.15)') 'taper   ', re_eq_edge_taper
+  write(iunit,'(A,ES23.15)') 'l_beam  ', re_eq_l_beam
   write(iunit,'(A,ES23.15)') 'R_edge  ', re_eq_R_edge
   write(iunit,'(A)') '# classes: s  E_kin[eV]  xi  weight  gamma  v_par[m/s]  alpha[Wb/m]  A_axis[Wb]  A_edge[Wb]  R_axis[m]  Z_axis[m]  lost_fraction'
   do s = 1, re_eq_n_class

@@ -11,6 +11,7 @@ use mod_re_kinetic_equilibrium, only: re_kinetic_equilibrium, re_eq_dist_file,  
                 re_eq_dist_format, re_eq_q_file, re_eq_match_mode,                 &
                 re_eq_transplant, re_eq_I_RE, re_eq_xi_min, re_eq_alpha_out,       &
                 re_eq_tol_q, re_eq_tol_q_soft, re_eq_edge_taper,                   &
+                re_eq_l_beam, re_eq_l_beam_width,                                  &
                 re_eq_ratio_clamp, re_eq_max_it_out, re_eq_n_l,                    &
                 re_eq_n_q_levels, re_eq_n_midplane, re_eq_finite_pitch
 
@@ -215,7 +216,8 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 re_eq_dist_format, re_eq_q_file, re_eq_match_mode,  &
                 re_eq_transplant, re_eq_I_RE, re_eq_xi_min,         &
                 re_eq_alpha_out, re_eq_tol_q, re_eq_tol_q_soft,     &
-                re_eq_edge_taper, re_eq_ratio_clamp,                &
+                re_eq_edge_taper, re_eq_l_beam, re_eq_l_beam_width, &
+                re_eq_ratio_clamp,                                  &
                 re_eq_max_it_out, re_eq_n_l, re_eq_n_q_levels,      &
                 re_eq_n_midplane, re_eq_finite_pitch,               &
                 fluid_configs, init_particles_only,                 &

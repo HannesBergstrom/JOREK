@@ -344,6 +344,7 @@ class REEquilibrium:
                  alpha_in=0.5, tol_in=1e-10, max_it_in=200,
                  alpha_out=0.3, tol_q=1e-3, max_it_out=50,
                  transplant='cumulative', edge_taper=0.2,
+                 l_beam=1.0, l_beam_width=0.1,
                  n_l=101, n_theta_q=256, verbose=True):
         self.cl = classes
         self.gs = solver
@@ -366,6 +367,13 @@ class REEquilibrium:
         # the outer iteration once the lost fraction is more than a few
         # percent (observed as stall at ~3e-3 followed by slow divergence).
         self.edge_taper = edge_taper
+        # Beam-edge label: current confined to Ahat < l_beam with a
+        # smoothstep roll-off of width l_beam_width, leaving a current-free
+        # (vacuum) annulus to the wall. For < 1 all current-carrying drift
+        # orbits are closed (no scrape-off). In the zero-drift-orbit limit
+        # l_beam equals the normalized poloidal flux of the beam edge.
+        self.l_beam = l_beam
+        self.l_beam_width = l_beam_width
         self.n_theta_q = n_theta_q
         self.verbose = verbose
 
@@ -644,11 +652,18 @@ class REEquilibrium:
             for s in range(self.cl.n_s):
                 phm_s = self.label_to_psihat(self.nprof.l,
                                              alpha=self.cl.alpha[s])
-                pe = np.clip(phm_s, ph[0], ph[-1])
+                # q outside the beam edge is the vacuum annulus, and q
+                # INSIDE the envelope roll-off is equally uncontrollable
+                # (the envelope forces j -> 0 there): clamp evaluations to
+                # the full-current beam interior
+                l_ctl = 1.0 if self.l_beam >= 1.0 else \
+                        max(self.l_beam - self.l_beam_width, 0.0)
+                ph_beam = np.interp(l_ctl, self.nprof.l, phm_s)
+                pe = np.clip(phm_s, ph[0], min(ph[-1], ph_beam))
                 log_ratio += cw[s] * np.log(q_i(pe) / self.qt(pe))
                 q_at += cw[s] * q_i(pe)
                 qt_at += cw[s] * self.qt(pe)
-                ph_ctl = max(ph_ctl, pe[-1])
+                ph_ctl = max(ph_ctl, min(ph_beam, ph[-1]))
 
             if self.match_mode == 'q_shape':
                 # compare shapes only; report the achieved amplitude
@@ -720,6 +735,7 @@ class REEquilibrium:
                 C *= factor
                 N_new = np.gradient(C, l, edge_order=2)
                 self.nprof.N = np.clip(N_new, 0.0, None)
+            self._apply_beam_envelope()
         if best_N is not None and best_err < np.inf:
             self.nprof.N = best_N
             self._smooth_nprof()
@@ -736,6 +752,17 @@ class REEquilibrium:
             Ns[1:-1] = 0.25*N[:-2] + 0.5*N[1:-1] + 0.25*N[2:]
             N = (1.0 - w)*N + w*Ns
         self.nprof.N = N
+        self._apply_beam_envelope()
+
+    def _apply_beam_envelope(self):
+        """Confine the current to labels below l_beam (smoothstep roll-off
+        over l_beam_width), leaving a vacuum annulus to the wall. Applied
+        to the stored table so all consumers inherit it."""
+        if self.l_beam >= 1.0:
+            return
+        t = np.clip((self.nprof.l - (self.l_beam - self.l_beam_width))
+                    / self.l_beam_width, 0.0, 1.0)
+        self.nprof.N = self.nprof.N * (1.0 - t*t*(3.0 - 2.0*t))
 
     def solve_fixed_nprof(self, nprof):
         """Inner solve only, for a prescribed Nprof (no q matching)."""
@@ -802,6 +829,7 @@ class REEquilibrium:
         vbar = np.abs(np.sum(self.cl.w * self.cl.v_par))
         N0 = N0 * R0 / (EL_CHG * vbar)
         self.nprof = Nprof(N0, l_grid)
+        self._apply_beam_envelope()
         if not np.any(self.psi):
             # cylindrical q_t implies the current magnitude; the sign follows
             # from j_phi = -e sum_s v_par,s w_s Nprof/R with Nprof >= 0
