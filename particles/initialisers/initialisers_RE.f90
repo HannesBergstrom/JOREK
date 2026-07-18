@@ -40,6 +40,9 @@ module initialisers_RE
   real*8                      :: req_I_RE = 0.d0    !< RE current of the equilibrium [A]; the marker
                                                     !< weights are normalized to carry exactly this
                                                     !< current (num_re is ignored for this init)
+  real*8                      :: req_l_beam = 1.d0  !< beam-edge label (from the file; MUST match
+                                                    !< the equilibrium solver)
+  real*8                      :: req_l_beam_width = 0.1d0 !< beam-edge roll-off width (from the file)
   integer                     :: req_active_class = 0  !< class sampled by re_eq_marker_pdf
   real*8                      :: req_sup_pdf = 1.d0    !< sup of Nprof/R for rejection normalization
 
@@ -226,9 +229,9 @@ subroutine read_re_equilibrium_file(my_id)
     case ('n_l');     read(line,*) key, req_n_l
     case ('taper');   read(line,*) key, req_edge_taper
     case ('I_RE');    read(line,*) key, req_I_RE
-    ! l_beam is informational: the beam-edge envelope is already contained
-    ! in the Nprof table written by the solver
-    case ('q_err', 'psi_bnd', 'l_beam'); read(line,*) key, rdum
+    case ('l_beam');  read(line,*) key, req_l_beam
+    case ('l_beam_w'); read(line,*) key, req_l_beam_width
+    case ('q_err', 'psi_bnd'); read(line,*) key, rdum
     case ('R_edge')
       read(line,*) key, rdum
       exit                          ! last header entry
@@ -289,10 +292,12 @@ end subroutine read_re_equilibrium_file
 
 
 !> Piecewise-linear evaluation of the common profile function Nprof at the
-!> RAW label l with the SAME edge truncation policy as the equilibrium
-!> solver (mod_re_kinetic_equilibrium / re_eq_nprof_at): drift surfaces
-!> leaving the domain carry no current, with a linear taper of width
-!> req_edge_taper (read from re_equilibrium.dat) beyond l = 1.
+!> RAW label l with the SAME edge factor as the equilibrium solver
+!> (mod_re_kinetic_equilibrium / re_eq_nprof_at): the C1 smoothstep
+!> beam-edge envelope (current confined below req_l_beam, roll-off width
+!> req_l_beam_width) times the C1 smoothstep wall taper beyond l = 1
+!> (width req_edge_taper). All three widths are read from
+!> re_equilibrium.dat; the table itself is raw.
 pure function req_nprof_eval(l) result(nval)
   implicit none
   real*8, intent(in) :: l
@@ -302,8 +307,12 @@ pure function req_nprof_eval(l) result(nval)
   dl = req_nprof_l(2) - req_nprof_l(1)
   k  = min(int(x/dl) + 1, req_n_l - 1)
   nval = req_nprof(k) + (req_nprof(k+1) - req_nprof(k)) * (x - req_nprof_l(k)) / dl
+  if (req_l_beam .lt. 1.d0) then
+    t = (l - (req_l_beam - req_l_beam_width)) / max(req_l_beam_width, 1.d-12)
+    t = min(max(t, 0.d0), 1.d0)
+    nval = nval * (1.d0 - t*t*(3.d0 - 2.d0*t))
+  endif
   if (l .gt. 1.d0) then
-    ! C1 smoothstep taper -- identical to re_eq_nprof_at in the solver
     t = min((l - 1.d0) / max(req_edge_taper, 1.d-12), 1.d0)
     nval = nval * (1.d0 - t*t*(3.d0 - 2.d0*t))
   endif

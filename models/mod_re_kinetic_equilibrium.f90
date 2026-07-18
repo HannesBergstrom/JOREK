@@ -434,24 +434,74 @@ end function re_eq_nprof_eval
 
 
 !=======================================================================
-!> Nprof at the RAW (unclipped) label, with the edge truncation policy:
-!> drift surfaces leaving the domain (lraw > 1) carry no current (RE orbits
-!> crossing the wall are lost); a linear taper of width re_eq_edge_taper in
-!> the label keeps the source numerically smooth. This function MUST be
-!> used wherever the source density is evaluated (and its counterpart in
+!> The multiplicative edge factor of the effective profile: the C1
+!> smoothstep beam-edge envelope (current confined below re_eq_l_beam,
+!> roll-off of width re_eq_l_beam_width) times the C1 smoothstep wall
+!> taper (open drift orbits beyond lraw = 1 carry no current). Applied at
+!> EVALUATION time, exactly once -- the stored Nprof table stays raw.
+!> (Baking the envelope into the table is NOT idempotent: re-applying it
+!> after every transplant update compounds to envelope^n and sharpens the
+!> roll-off towards a step, which the transplant then fights.)
+function re_eq_edge_factor(lraw) result(f)
+  implicit none
+  real*8, intent(in) :: lraw
+  real*8             :: f, t
+  f = 1.d0
+  if (re_eq_l_beam .lt. 1.d0) then
+    t = (lraw - (re_eq_l_beam - re_eq_l_beam_width)) &
+        / max(re_eq_l_beam_width, 1.d-12)
+    t = min(max(t, 0.d0), 1.d0)
+    f = 1.d0 - t*t*(3.d0 - 2.d0*t)
+  endif
+  if (lraw .gt. 1.d0) then
+    t = min((lraw - 1.d0) / max(re_eq_edge_taper, 1.d-12), 1.d0)
+    f = f * (1.d0 - t*t*(3.d0 - 2.d0*t))
+  endif
+end function re_eq_edge_factor
+
+
+!=======================================================================
+!> d/dl of the edge factor (for the source derivatives).
+function re_eq_edge_factor_deriv(lraw) result(df)
+  implicit none
+  real*8, intent(in) :: lraw
+  real*8             :: df, t, w, f_env, f_tap, d_env, d_tap
+  f_env = 1.d0;  d_env = 0.d0
+  if (re_eq_l_beam .lt. 1.d0) then
+    w = max(re_eq_l_beam_width, 1.d-12)
+    t = (lraw - (re_eq_l_beam - w)) / w
+    if ((t .gt. 0.d0) .and. (t .lt. 1.d0)) then
+      f_env = 1.d0 - t*t*(3.d0 - 2.d0*t)
+      d_env = -6.d0*t*(1.d0 - t) / w
+    else if (t .ge. 1.d0) then
+      f_env = 0.d0
+    endif
+  endif
+  f_tap = 1.d0;  d_tap = 0.d0
+  if (lraw .gt. 1.d0) then
+    w = max(re_eq_edge_taper, 1.d-12)
+    t = (lraw - 1.d0) / w
+    if (t .lt. 1.d0) then
+      f_tap = 1.d0 - t*t*(3.d0 - 2.d0*t)
+      d_tap = -6.d0*t*(1.d0 - t) / w
+    else
+      f_tap = 0.d0
+    endif
+  endif
+  df = d_env*f_tap + f_env*d_tap
+end function re_eq_edge_factor_deriv
+
+
+!=======================================================================
+!> Nprof at the RAW (unclipped) label: the raw table times the edge factor
+!> (beam envelope and wall taper). This function MUST be used wherever the
+!> source density is evaluated (and its counterpart in
 !> particles/initialisers/initialisers_RE.f90 kept in sync).
 function re_eq_nprof_at(lraw) result(nval)
   implicit none
   real*8, intent(in) :: lraw
-  real*8             :: nval, t
-  nval = re_eq_nprof_eval(lraw)
-  if (lraw .gt. 1.d0) then
-    ! C1 smoothstep taper (zero slope at both ends of the band): a linear
-    ! taper has slope kinks at l=1 and l=1+w that both the FE projection
-    ! and the transplant iteration ring against
-    t = min((lraw - 1.d0) / max(re_eq_edge_taper, 1.d-12), 1.d0)
-    nval = nval * (1.d0 - t*t*(3.d0 - 2.d0*t))
-  endif
+  real*8             :: nval
+  nval = re_eq_nprof_eval(lraw) * re_eq_edge_factor(lraw)
 end function re_eq_nprof_at
 
 
@@ -838,17 +888,14 @@ subroutine re_eq_source_derivs(psi, R, S, dS_dpsi, dS_dR)
     cw    = re_cl_vpar(is) * re_cl_w(is)
     Nval  = re_eq_nprof_at(lhat)
     S     = S + cw * Nval
+    ! d/dl of (raw table) * (edge factor): product rule
     if ((lhat .gt. 0.d0) .and. (lhat .lt. 1.d0)) then
       k     = min(int(lhat/dl) + 1, re_eq_n_l - 1)
-      slope = (re_nprof(k+1) - re_nprof(k)) / dl
-    else if ((lhat .gt. 1.d0) .and. (lhat .lt. 1.d0 + re_eq_edge_taper)) then
-      ! inside the edge taper: d/dl of Nprof(1) * smoothstep(1 -> 0)
-      slope = re_nprof(re_eq_n_l) * 6.d0 &
-              * ((lhat-1.d0)/re_eq_edge_taper) * ((lhat-1.d0)/re_eq_edge_taper - 1.d0) &
-              / max(re_eq_edge_taper, 1.d-12)
+      slope = (re_nprof(k+1) - re_nprof(k)) / dl * re_eq_edge_factor(lhat)
     else
       slope = 0.d0
     endif
+    slope = slope + re_eq_nprof_eval(lhat) * re_eq_edge_factor_deriv(lhat)
     dS_dpsi = dS_dpsi + cw * slope * (-1.d0/denom)
     dS_dR   = dS_dR   + cw * slope * (re_cl_alpha(is)/denom)
   enddo
@@ -1165,6 +1212,23 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
     lr = lr - log(c_amp)
   endif
 
+  ! Freeze the update factor beyond the control clamp to its value AT the
+  ! clamp: labels in the beam-edge roll-off all map to (nearly) the same
+  ! frozen psihat, and a kink in the update factor there differentiates
+  ! (through the cumulative transplant) into a bump-dip pair in Nprof that
+  ! the q-feedback cannot see and that accumulates over the outer
+  ! iterations (observed as an overshoot/dip of the current density pinned
+  ! at the beam edge, growing with FE resolution).
+  if (re_eq_l_beam .lt. 1.d0) then
+    l_eff = max(re_eq_l_beam - re_eq_l_beam_width, 0.d0)
+    do k = 2, re_eq_n_l
+      if (re_nprof_l(k) .gt. l_eff) then
+        lr(k:re_eq_n_l) = lr(k-1)
+        exit
+      endif
+    enddo
+  endif
+
   do k = 1, re_eq_n_l
     ratio(k) = min(max(exp(lr(k)), 1.d0/re_eq_ratio_clamp), re_eq_ratio_clamp)
   enddo
@@ -1230,8 +1294,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
     !     on the edge current density), re-converge psi once more, and give
     !     the final verdict on that state
     if (re_eq_best_err .lt. err) re_nprof(1:re_eq_n_l) = re_eq_best_nprof(1:re_eq_n_l)
-    call re_eq_smooth_nprof()
-    call re_eq_apply_beam_envelope()   ! smoothing smears across the beam edge
+    call re_eq_smooth_nprof()          ! includes the beam-edge table hygiene
     write(*,'(A,I4,A,ES10.2)') ' re_eq: finishing after ', re_eq_outer_iter, &
       ' outer iterations (best max|q/q_t-1| = ', min(re_eq_best_err, err)
     write(*,'(A)') '        ): applied the edge null-space polish to Nprof;'
@@ -1291,15 +1354,16 @@ end subroutine re_eq_outer_update
 !> cumulative transplant and the polish would otherwise regenerate
 !> current beyond the beam edge.
 subroutine re_eq_apply_beam_envelope()
+  ! table hygiene only: zero the RAW table strictly beyond the beam edge
+  ! (where the edge factor vanishes anyway) so that the cumulative
+  ! transplant carries no phantom current there. Idempotent by
+  ! construction -- the smoothstep envelope itself is applied at
+  ! EVALUATION time (re_eq_edge_factor), never to the table.
   implicit none
   integer :: k
-  real*8  :: t, w
   if (re_eq_l_beam .ge. 1.d0) return
-  w = max(re_eq_l_beam_width, 1.d-12)
   do k = 1, re_eq_n_l
-    t = (re_nprof_l(k) - (re_eq_l_beam - w)) / w
-    t = min(max(t, 0.d0), 1.d0)
-    re_nprof(k) = re_nprof(k) * (1.d0 - t*t*(3.d0 - 2.d0*t))
+    if (re_nprof_l(k) .gt. re_eq_l_beam) re_nprof(k) = 0.d0
   enddo
 end subroutine re_eq_apply_beam_envelope
 
@@ -1313,18 +1377,30 @@ end subroutine re_eq_apply_beam_envelope
 !> imprints oscillations on the edge current density.
 subroutine re_eq_smooth_nprof()
   implicit none
-  integer :: k, ipass
-  real*8  :: Ns(re_eq_n_l), wb
-  do ipass = 1, 6
+  integer :: k, ipass, n_pass
+  real*8  :: Ns(re_eq_n_l), wb, w_lo, w_wd
+  ! In vacuum-annulus mode (l_beam < 1) the polish is much stronger: the
+  ! accumulated null-space structure at the beam edge has wavelengths of
+  ! order 0.1 in the label (a bump-dip pair pinned at the control clamp),
+  ! and the envelope re-imposes the physical edge shape after smoothing
+  ! anyway. In wall-limited mode the milder validated setting is kept,
+  ! since Nprof near l = 1 carries real edge current.
+  if (re_eq_l_beam .ge. 1.d0) then
+    n_pass = 6;   w_lo = 0.5d0;  w_wd = 0.3d0
+  else
+    n_pass = 20;  w_lo = 0.45d0; w_wd = 0.25d0
+  endif
+  do ipass = 1, n_pass
     Ns = re_nprof(1:re_eq_n_l)
     do k = 2, re_eq_n_l - 1
       Ns(k) = 0.25d0*re_nprof(k-1) + 0.5d0*re_nprof(k) + 0.25d0*re_nprof(k+1)
     enddo
     do k = 1, re_eq_n_l
-      wb = min(max((re_nprof_l(k) - 0.5d0)/0.3d0, 0.d0), 1.d0)
+      wb = min(max((re_nprof_l(k) - w_lo)/w_wd, 0.d0), 1.d0)
       re_nprof(k) = (1.d0 - wb)*re_nprof(k) + wb*Ns(k)
     enddo
   enddo
+  call re_eq_apply_beam_envelope()
 end subroutine re_eq_smooth_nprof
 
 
@@ -1368,6 +1444,7 @@ subroutine re_eq_write_output(my_id)
   write(iunit,'(A,ES23.15)') 'psi_bnd ', re_eq_psi_bnd
   write(iunit,'(A,ES23.15)') 'taper   ', re_eq_edge_taper
   write(iunit,'(A,ES23.15)') 'l_beam  ', re_eq_l_beam
+  write(iunit,'(A,ES23.15)') 'l_beam_w', re_eq_l_beam_width
   write(iunit,'(A,ES23.15)') 'R_edge  ', re_eq_R_edge
   write(iunit,'(A)') '# classes: s  E_kin[eV]  xi  weight  gamma  v_par[m/s]  alpha[Wb/m]  A_axis[Wb]  A_edge[Wb]  R_axis[m]  Z_axis[m]  lost_fraction'
   do s = 1, re_eq_n_class

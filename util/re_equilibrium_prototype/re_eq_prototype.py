@@ -422,14 +422,22 @@ class REEquilibrium:
 
     # --- GS source ------------------------------------------------------------
     def _taper(self, l_raw):
-        """Edge truncation factor: 1 on closed drift surfaces (l <= 1),
-        C1 smoothstep decay to 0 over edge_taper beyond, 0 outside (a
-        linear taper has slope kinks that the discretization and the
-        transplant iteration ring against)."""
-        if self.edge_taper is None:
-            return np.ones_like(l_raw)
-        t = np.clip((np.maximum(l_raw, 1.0) - 1.0) / self.edge_taper, 0.0, 1.0)
-        return 1.0 - t*t*(3.0 - 2.0*t)
+        """Multiplicative edge factor at EVALUATION time (the stored Nprof
+        table stays raw -- baking envelopes into the table is not
+        idempotent and compounds over the outer iterations): the C1
+        smoothstep beam-edge envelope (current confined below l_beam,
+        roll-off width l_beam_width) times the C1 smoothstep wall taper
+        for open drift orbits beyond l = 1."""
+        f = np.ones_like(np.asarray(l_raw, dtype=float))
+        if self.l_beam < 1.0:
+            t = np.clip((l_raw - (self.l_beam - self.l_beam_width))
+                        / self.l_beam_width, 0.0, 1.0)
+            f = f * (1.0 - t*t*(3.0 - 2.0*t))
+        if self.edge_taper is not None:
+            t = np.clip((np.maximum(l_raw, 1.0) - 1.0) / self.edge_taper,
+                        0.0, 1.0)
+            f = f * (1.0 - t*t*(3.0 - 2.0*t))
+        return f
 
     def source(self, psi):
         """RHS of Delta* psi = mu0 e sum_s v_par,s w_s Nprof(Ahat_s).
@@ -671,6 +679,17 @@ class REEquilibrium:
                 log_ratio = log_ratio - np.log(c)
             else:
                 c = 1.0
+            # Freeze the update factor beyond the control clamp to its value
+            # AT the clamp: labels in the beam-edge roll-off all map to
+            # (nearly) the same frozen psihat, and a kink in the update
+            # factor there differentiates (through the cumulative transplant)
+            # into a bump-dip pair in Nprof that the q-feedback cannot see
+            # and that accumulates over the outer iterations.
+            if self.l_beam < 1.0:
+                l_ctl = max(self.l_beam - self.l_beam_width, 0.0)
+                k_ctl = np.searchsorted(self.nprof.l, l_ctl)
+                k_ctl = min(k_ctl, len(log_ratio) - 1)
+                log_ratio[k_ctl:] = log_ratio[k_ctl]
             ratio = np.exp(log_ratio)
 
             # Convergence metric: compare q and q_t directly on the psihat
@@ -742,11 +761,21 @@ class REEquilibrium:
             self.picard()
         return False
 
-    def _smooth_nprof(self, n_pass=6):
+    def _smooth_nprof(self, n_pass=None):
         """Remove the null-space ripple of Nprof: blended [1/4,1/2,1/4]
-        smoothing, full strength towards l = 1, off below l = 0.5."""
+        smoothing towards the profile edge. In vacuum-annulus mode
+        (l_beam < 1) the polish is much stronger (the accumulated
+        null-space structure at the beam edge has wavelengths ~0.1 in the
+        label, and the envelope re-imposes the physical edge shape after
+        smoothing anyway); in wall-limited mode the milder validated
+        setting is kept, since Nprof near l = 1 carries real edge current."""
+        if n_pass is None:
+            n_pass = 6 if self.l_beam >= 1.0 else 20
+        if self.l_beam >= 1.0:
+            w = np.clip((self.nprof.l - 0.5) / 0.3, 0.0, 1.0)
+        else:
+            w = np.clip((self.nprof.l - 0.45) / 0.25, 0.0, 1.0)
         N = self.nprof.N
-        w = np.clip((self.nprof.l - 0.5) / 0.3, 0.0, 1.0)
         for _ in range(n_pass):
             Ns = N.copy()
             Ns[1:-1] = 0.25*N[:-2] + 0.5*N[1:-1] + 0.25*N[2:]
@@ -755,14 +784,14 @@ class REEquilibrium:
         self._apply_beam_envelope()
 
     def _apply_beam_envelope(self):
-        """Confine the current to labels below l_beam (smoothstep roll-off
-        over l_beam_width), leaving a vacuum annulus to the wall. Applied
-        to the stored table so all consumers inherit it."""
+        """Table hygiene only: zero the RAW table strictly beyond the beam
+        edge (where the edge factor vanishes anyway) so the cumulative
+        transplant carries no phantom current there. Idempotent; the
+        smoothstep envelope itself lives in _taper (evaluation time)."""
         if self.l_beam >= 1.0:
             return
-        t = np.clip((self.nprof.l - (self.l_beam - self.l_beam_width))
-                    / self.l_beam_width, 0.0, 1.0)
-        self.nprof.N = self.nprof.N * (1.0 - t*t*(3.0 - 2.0*t))
+        self.nprof.N = np.where(self.nprof.l > self.l_beam, 0.0,
+                                self.nprof.N)
 
     def solve_fixed_nprof(self, nprof):
         """Inner solve only, for a prescribed Nprof (no q matching)."""
