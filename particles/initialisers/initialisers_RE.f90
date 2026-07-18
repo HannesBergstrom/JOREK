@@ -294,14 +294,16 @@ end subroutine read_re_equilibrium_file
 pure function req_nprof_eval(l) result(nval)
   implicit none
   real*8, intent(in) :: l
-  real*8             :: nval, x, dl
+  real*8             :: nval, x, dl, t
   integer            :: k
   x  = min(max(l, 0.d0), 1.d0)
   dl = req_nprof_l(2) - req_nprof_l(1)
   k  = min(int(x/dl) + 1, req_n_l - 1)
   nval = req_nprof(k) + (req_nprof(k+1) - req_nprof(k)) * (x - req_nprof_l(k)) / dl
   if (l .gt. 1.d0) then
-    nval = nval * max(0.d0, 1.d0 - (l - 1.d0) / max(req_edge_taper, 1.d-12))
+    ! C1 smoothstep taper -- identical to re_eq_nprof_at in the solver
+    t = min((l - 1.d0) / max(req_edge_taper, 1.d-12), 1.d0)
+    nval = nval * (1.d0 - t*t*(3.d0 - 2.d0*t))
   endif
 end function req_nprof_eval
 

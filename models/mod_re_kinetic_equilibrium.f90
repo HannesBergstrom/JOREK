@@ -431,10 +431,14 @@ end function re_eq_nprof_eval
 function re_eq_nprof_at(lraw) result(nval)
   implicit none
   real*8, intent(in) :: lraw
-  real*8             :: nval
+  real*8             :: nval, t
   nval = re_eq_nprof_eval(lraw)
   if (lraw .gt. 1.d0) then
-    nval = nval * max(0.d0, 1.d0 - (lraw - 1.d0) / max(re_eq_edge_taper, 1.d-12))
+    ! C1 smoothstep taper (zero slope at both ends of the band): a linear
+    ! taper has slope kinks at l=1 and l=1+w that both the FE projection
+    ! and the transplant iteration ring against
+    t = min((lraw - 1.d0) / max(re_eq_edge_taper, 1.d-12), 1.d0)
+    nval = nval * (1.d0 - t*t*(3.d0 - 2.d0*t))
   endif
 end function re_eq_nprof_at
 
@@ -824,8 +828,10 @@ subroutine re_eq_source_derivs(psi, R, S, dS_dpsi, dS_dR)
       k     = min(int(lhat/dl) + 1, re_eq_n_l - 1)
       slope = (re_nprof(k+1) - re_nprof(k)) / dl
     else if ((lhat .gt. 1.d0) .and. (lhat .lt. 1.d0 + re_eq_edge_taper)) then
-      ! inside the edge taper: d/dl of Nprof(1) * (1 - (l-1)/w)
-      slope = -re_nprof(re_eq_n_l) / max(re_eq_edge_taper, 1.d-12)
+      ! inside the edge taper: d/dl of Nprof(1) * smoothstep(1 -> 0)
+      slope = re_nprof(re_eq_n_l) * 6.d0 &
+              * ((lhat-1.d0)/re_eq_edge_taper) * ((lhat-1.d0)/re_eq_edge_taper - 1.d0) &
+              / max(re_eq_edge_taper, 1.d-12)
     else
       slope = 0.d0
     endif
@@ -1172,13 +1178,20 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   write(RE_EQ_LOG_UNIT,'(I6,I8,3ES16.6)') re_eq_outer_iter, n_inner, err, I_now, maxval(re_cl_lost)
   call flush_it(RE_EQ_LOG_UNIT)
 
-  if (converged) return
-
-  if ((re_eq_n_stall .ge. 15) .or. (re_eq_outer_iter .ge. re_eq_max_it_out)) then
-    write(*,'(A,I4,A,ES10.2)') ' re_eq: stopping the transplant after ', re_eq_outer_iter, &
-      ' outer iterations; restoring the best profile with max|q/q_t-1| = ', re_eq_best_err
-    re_nprof(1:re_eq_n_l) = re_eq_best_nprof(1:re_eq_n_l)
+  if (converged .or. (re_eq_n_stall .ge. 15) .or. (re_eq_outer_iter .ge. re_eq_max_it_out)) then
+    ! --- enter the finishing pass: take the best profile, remove the
+    !     null-space ripple of Nprof near the controllability edge (nearly
+    !     invisible to q, but it imprints element-scale-looking oscillations
+    !     on the edge current density), re-converge psi once more, and give
+    !     the final verdict on that state
+    if (re_eq_best_err .lt. err) re_nprof(1:re_eq_n_l) = re_eq_best_nprof(1:re_eq_n_l)
+    call re_eq_smooth_nprof()
+    write(*,'(A,I4,A,ES10.2)') ' re_eq: finishing after ', re_eq_outer_iter, &
+      ' outer iterations (best max|q/q_t-1| = ', min(re_eq_best_err, err)
+    write(*,'(A)') '        ): applied the edge null-space polish to Nprof;'
+    write(*,'(A)') '        final convergence is evaluated on the polished profile'
     re_eq_finishing = .true.
+    converged = .false.
     return
   endif
 
@@ -1215,6 +1228,30 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   end select
 
 end subroutine re_eq_outer_update
+
+
+!=======================================================================
+!> Remove the null-space ripple of Nprof: blended [1/4,1/2,1/4] smoothing,
+!> full strength towards l = 1, off below l = 0.5. Near the controllability
+!> edge of the transplant, short-wavelength structure in Nprof is nearly
+!> invisible to q (the flux-surface average smears it), so iteration noise
+!> accumulates there without feedback; it is physically insignificant but
+!> imprints oscillations on the edge current density.
+subroutine re_eq_smooth_nprof()
+  implicit none
+  integer :: k, ipass
+  real*8  :: Ns(re_eq_n_l), wb
+  do ipass = 1, 6
+    Ns = re_nprof(1:re_eq_n_l)
+    do k = 2, re_eq_n_l - 1
+      Ns(k) = 0.25d0*re_nprof(k-1) + 0.5d0*re_nprof(k) + 0.25d0*re_nprof(k+1)
+    enddo
+    do k = 1, re_eq_n_l
+      wb = min(max((re_nprof_l(k) - 0.5d0)/0.3d0, 0.d0), 1.d0)
+      re_nprof(k) = (1.d0 - wb)*re_nprof(k) + wb*Ns(k)
+    enddo
+  enddo
+end subroutine re_eq_smooth_nprof
 
 
 !=======================================================================

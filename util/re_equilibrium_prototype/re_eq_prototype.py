@@ -415,11 +415,13 @@ class REEquilibrium:
     # --- GS source ------------------------------------------------------------
     def _taper(self, l_raw):
         """Edge truncation factor: 1 on closed drift surfaces (l <= 1),
-        linear decay to 0 over edge_taper beyond, 0 outside."""
+        C1 smoothstep decay to 0 over edge_taper beyond, 0 outside (a
+        linear taper has slope kinks that the discretization and the
+        transplant iteration ring against)."""
         if self.edge_taper is None:
             return np.ones_like(l_raw)
-        return np.clip(1.0 - (np.maximum(l_raw, 1.0) - 1.0) / self.edge_taper,
-                       0.0, 1.0)
+        t = np.clip((np.maximum(l_raw, 1.0) - 1.0) / self.edge_taper, 0.0, 1.0)
+        return 1.0 - t*t*(3.0 - 2.0*t)
 
     def source(self, psi):
         """RHS of Delta* psi = mu0 e sum_s v_par,s w_s Nprof(Ahat_s).
@@ -682,19 +684,25 @@ class REEquilibrium:
                       + (f"  q-ampl = {c:.4f}" if self.match_mode == 'q_shape' else "")
                       + (f"  lost = {self.lost_fraction.max():.2e}"
                          if self.lost_fraction.max() > 0 else ""))
-            if err < self.tol_q:
-                return True
-            if n_stall >= 15:
-                # restore the best profile and re-converge psi on it
-                self.nprof.N = best_N
+            if err < self.tol_q or n_stall >= 15:
+                # finishing pass: best profile + edge null-space polish of
+                # Nprof (short-wavelength structure near l=1 is nearly
+                # invisible to q but imprints oscillations on the edge
+                # current density), then re-converge psi and re-evaluate
+                if best_err < err:
+                    self.nprof.N = best_N
+                self._smooth_nprof()
                 self.picard()
+                ph, q_now = self.q_profile()
+                mctl = ph <= ph_ctl
+                err = np.abs(q_now[mctl] / (c * self.qt(ph[mctl])) - 1.0).max()
                 if self.verbose:
-                    print(f"  stagnation after {outer} outer iterations: "
-                          f"restored best profile, max|q/q_t-1| = {best_err:.3e}")
+                    print(f"  finishing after {outer} outer iterations: "
+                          f"polished Nprof, final max|q/q_t-1| = {err:.3e}")
                 self.log.append(dict(outer=outer, inner_iters=0, inner_res=0.0,
-                                     q_err=best_err, I_RE=self.total_current(self.psi),
+                                     q_err=err, I_RE=self.total_current(self.psi),
                                      q_amplitude=c, lost=self.lost_fraction.max()))
-                return best_err < self.tol_q
+                return err < self.tol_q
             ratio = np.clip(ratio, 1.0 / self.RATIO_CLAMP, self.RATIO_CLAMP)
             # smooth the log-ratio (Nprof is smooth; single-point features in
             # the measured ratio are q-evaluation artifacts, and feeding them
@@ -714,8 +722,20 @@ class REEquilibrium:
                 self.nprof.N = np.clip(N_new, 0.0, None)
         if best_N is not None and best_err < np.inf:
             self.nprof.N = best_N
+            self._smooth_nprof()
             self.picard()
         return False
+
+    def _smooth_nprof(self, n_pass=6):
+        """Remove the null-space ripple of Nprof: blended [1/4,1/2,1/4]
+        smoothing, full strength towards l = 1, off below l = 0.5."""
+        N = self.nprof.N
+        w = np.clip((self.nprof.l - 0.5) / 0.3, 0.0, 1.0)
+        for _ in range(n_pass):
+            Ns = N.copy()
+            Ns[1:-1] = 0.25*N[:-2] + 0.5*N[1:-1] + 0.25*N[2:]
+            N = (1.0 - w)*N + w*Ns
+        self.nprof.N = N
 
     def solve_fixed_nprof(self, nprof):
         """Inner solve only, for a prescribed Nprof (no q matching)."""
