@@ -1388,7 +1388,9 @@ subroutine re_eq_smooth_nprof()
   if (re_eq_l_beam .ge. 1.d0) then
     n_pass = 6;   w_lo = 0.5d0;  w_wd = 0.3d0
   else
-    n_pass = 20;  w_lo = 0.45d0; w_wd = 0.25d0
+    ! 50 passes ~ smoothing width 0.05 in the label, matched to the
+    ! lambda ~ 0.1 null-space undulation at the beam edge
+    n_pass = 50;  w_lo = 0.45d0; w_wd = 0.25d0
   endif
   do ipass = 1, n_pass
     Ns = re_nprof(1:re_eq_n_l)

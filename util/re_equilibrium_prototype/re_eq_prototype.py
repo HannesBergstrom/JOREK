@@ -770,7 +770,9 @@ class REEquilibrium:
         smoothing anyway); in wall-limited mode the milder validated
         setting is kept, since Nprof near l = 1 carries real edge current."""
         if n_pass is None:
-            n_pass = 6 if self.l_beam >= 1.0 else 20
+            # 50 passes ~ smoothing width 0.05 in the label, matched to the
+            # lambda ~ 0.1 null-space undulation at the beam edge
+            n_pass = 6 if self.l_beam >= 1.0 else 50
         if self.l_beam >= 1.0:
             w = np.clip((self.nprof.l - 0.5) / 0.3, 0.0, 1.0)
         else:
