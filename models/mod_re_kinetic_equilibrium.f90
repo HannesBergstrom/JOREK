@@ -46,7 +46,8 @@ private
 
 ! --- namelist parameters
 public :: re_kinetic_equilibrium, re_eq_dist_file, re_eq_dist_format,          &
-          re_eq_q_file, re_eq_match_mode, re_eq_transplant, re_eq_I_RE,        &
+          re_eq_q_file, re_eq_match_mode, re_eq_transplant, re_eq_map_mode,    &
+          re_eq_I_RE,                                                          &
           re_eq_xi_min, re_eq_alpha_out, re_eq_tol_q, re_eq_tol_q_soft,        &
           re_eq_edge_taper, re_eq_l_beam, re_eq_l_beam_width,                  &
           re_eq_ratio_clamp,                                                   &
@@ -67,6 +68,13 @@ character(len=256) :: re_eq_q_file      = 'none'      !< target q profile table:
 character(len=16)  :: re_eq_match_mode  = 'full_q'    !< 'full_q': match q_t incl. amplitude, I_RE is an output;
                                                       !< 'q_shape': match the shape at prescribed re_eq_I_RE
 character(len=16)  :: re_eq_transplant  = 'cumulative'!< outer update variant: 'cumulative' (default) or 'pointwise'
+character(len=16)  :: re_eq_map_mode    = 'midplane'  !< label map Ahat<->psihat: 'midplane' (default, the
+                                                      !< 2-point midplane average, Eq. 8 of the doc) or
+                                                      !< 'contour' (average psihat_n over the WHOLE drift
+                                                      !< surface A_s=const by nodal kernel regression;
+                                                      !< faithful in shaped geometry, where two midplane
+                                                      !< points poorly represent the surface and floor the
+                                                      !< achievable q match)
 real*8             :: re_eq_I_RE        = 0.d0        !< prescribed RE current [A] (q_shape mode)
 real*8             :: re_eq_xi_min      = 0.9d0       !< minimum |pitch|; abort below (trapped REs out of scope)
 real*8             :: re_eq_alpha_out   = 0.3d0       !< under-relaxation of the outer transplant update
@@ -172,6 +180,13 @@ subroutine re_eq_init(my_id)
     stop 1
   endif
 
+  if ((trim(re_eq_map_mode) .ne. 'midplane') .and. &
+      (trim(re_eq_map_mode) .ne. 'contour')) then
+    write(*,*) 'ERROR: re_eq_map_mode must be ''midplane'' or ''contour'', got: ', &
+               trim(re_eq_map_mode)
+    stop 1
+  endif
+
   ! --- Guard against a NaN trap in the analytic profile evaluations: the
   ! --- FFprime (and temperature) routines divide by the shape widths even
   ! --- when the profile amplitude is zero. A pure-RE equilibrium needs
@@ -203,6 +218,7 @@ subroutine re_eq_init(my_id)
   write(*,'(A,I4)')     '   number of RE classes : ', re_eq_n_class
   write(*,'(A,A)')      '   match mode           : ', trim(re_eq_match_mode)
   write(*,'(A,A)')      '   transplant variant   : ', trim(re_eq_transplant)
+  write(*,'(A,A)')      '   label map            : ', trim(re_eq_map_mode)
   write(*,*) '    s    E_kin[eV]      xi        weight     gamma      v_par[m/s]     d_s'
   do s = 1, re_eq_n_class
     d_s = re_cl_alpha(s) / (B0 * amin)
@@ -1010,6 +1026,7 @@ end subroutine re_eq_rescale_current
 subroutine re_eq_label_map(my_id, node_list, element_list, alpha, n_lmap, l_values, psihat_m)
   use data_structure
   use equil_info, only: ES
+  use mod_model_settings, only: var_psi
   implicit none
   integer,                  intent(in)  :: my_id
   type (type_node_list),    intent(in)  :: node_list
@@ -1023,12 +1040,14 @@ subroutine re_eq_label_map(my_id, node_list, element_list, alpha, n_lmap, l_valu
   real*8  :: alpha_eff, R_ax, Z_ax, A_ax, A_edge, dpsi
   real*8  :: R_lo, R_hi, dR, dum1, dum2, lv, ph_out, ph_in, R_out_l, R_in_l
   real*8, allocatable :: Rg(:), psig(:), lhatg(:), phg(:)
-
-  np = re_eq_n_midplane
-  allocate(Rg(np), psig(np), lhatg(np), phg(np))
+  ! contour-map (nodal kernel regression) workspace
+  real*8, parameter   :: RE_EQ_MAP_BW = 0.03d0   ! label bandwidth of the kernel
+  real*8, allocatable :: lhat_n(:), phn_n(:)
+  real*8              :: wsum, wnum, dd, wk
 
   alpha_eff = alpha
 
+  ! --- shared setup: drift axis (label normalization) and the edge value
   call re_eq_find_drift_axis(node_list, element_list, alpha_eff, &
                              ES%R_axis, ES%Z_axis, R_ax, Z_ax, A_ax, ifail)
   if (ifail .ne. 0) then
@@ -1036,6 +1055,50 @@ subroutine re_eq_label_map(my_id, node_list, element_list, alpha, n_lmap, l_valu
     stop 1
   endif
   A_edge = alpha_eff * re_eq_R_edge - re_eq_psi_bnd
+  dpsi   = ES%psi_bnd - ES%psi_axis
+
+  ! === Contour-average label map (re_eq_map_mode = 'contour') ================
+  ! Average psihat_n over the WHOLE drift surface A_s = const rather than over
+  ! its two midplane crossings (the midplane branch below is the 2-point
+  ! special case, Eq. 8). Nadaraya-Watson kernel regression of the nodal
+  ! psihat_n on the nodal label lhat: uses NO point location (robust like the
+  ! drift-axis finder) and represents all poloidal angles of the surface,
+  ! which two midplane points do not in shaped geometry. Closed surfaces only
+  ! (lhat <= 1.2); psihat_m(l) is forced monotone.
+  if (trim(re_eq_map_mode) .eq. 'contour') then
+    allocate(lhat_n(node_list%n_nodes), phn_n(node_list%n_nodes))
+    do i = 1, node_list%n_nodes
+      lhat_n(i) = (alpha_eff*node_list%node(i)%x(1,1,1)                        &
+                   - node_list%node(i)%values(1,1,var_psi) - A_ax)            &
+                  / (A_edge - A_ax)
+      phn_n(i)  = min(max((node_list%node(i)%values(1,1,var_psi)              &
+                           - ES%psi_axis) / dpsi, 0.d0), 1.d0)
+    enddo
+    do k = 1, n_lmap
+      wsum = 0.d0;  wnum = 0.d0
+      do i = 1, node_list%n_nodes
+        if (lhat_n(i) .gt. 1.2d0) cycle
+        dd = (lhat_n(i) - l_values(k)) / RE_EQ_MAP_BW
+        wk = exp(-0.5d0*dd*dd)
+        wnum = wnum + wk*phn_n(i)
+        wsum = wsum + wk
+      enddo
+      if (wsum .gt. 0.d0) then
+        psihat_m(k) = min(max(wnum/wsum, 0.d0), 1.d0)
+      else
+        psihat_m(k) = min(max(l_values(k), 0.d0), 1.d0)
+      endif
+    enddo
+    do k = 2, n_lmap
+      if (psihat_m(k) .lt. psihat_m(k-1)) psihat_m(k) = psihat_m(k-1)
+    enddo
+    deallocate(lhat_n, phn_n)
+    return
+  endif
+
+  ! === Midplane-average label map (default, Eq. 8) ===========================
+  np = re_eq_n_midplane
+  allocate(Rg(np), psig(np), lhatg(np), phg(np))
 
   ! --- midplane scan at the Z of the effective drift axis. Point location
   !     can fail near the degenerate polar-grid centre; such interior points

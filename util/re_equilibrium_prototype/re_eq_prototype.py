@@ -344,7 +344,7 @@ class REEquilibrium:
                  alpha_in=0.5, tol_in=1e-10, max_it_in=200,
                  alpha_out=0.3, tol_q=1e-3, max_it_out=50,
                  transplant='cumulative', edge_taper=0.2,
-                 l_beam=1.0, l_beam_width=0.1,
+                 l_beam=1.0, l_beam_width=0.1, label_map='midplane',
                  n_l=101, n_theta_q=256, verbose=True):
         self.cl = classes
         self.gs = solver
@@ -354,6 +354,14 @@ class REEquilibrium:
         self.I_RE = I_RE
         if match_mode == 'q_shape' and I_RE is None:
             raise ValueError("match_mode='q_shape' requires a prescribed I_RE")
+        # Label map Ahat <-> psihat (a swappable modelling choice):
+        #   'midplane' (default): 2-point midplane average, Eq. (8) of the doc;
+        #   'contour': average psihat over the WHOLE drift surface A_s=const
+        #              (nodal kernel regression), faithful in shaped geometry
+        #              where two midplane points poorly represent the surface.
+        if label_map not in ('midplane', 'contour'):
+            raise ValueError(f"unknown label_map '{label_map}'")
+        self.label_map = label_map
         self.alpha_in, self.tol_in, self.max_it_in = alpha_in, tol_in, max_it_in
         self.alpha_out, self.tol_q, self.max_it_out = alpha_out, tol_q, max_it_out
         if transplant not in ('cumulative', 'pointwise'):
@@ -547,6 +555,51 @@ class REEquilibrium:
 
     # --- label map Ahat <-> psihat (swappable modelling choice) ----------------
     def label_to_psihat(self, l_values, alpha=None):
+        """Dispatch to the selected label-map variant (self.label_map)."""
+        if self.label_map == 'contour':
+            return self.label_to_psihat_contour(l_values, alpha=alpha)
+        return self.label_to_psihat_midplane(l_values, alpha=alpha)
+
+    def label_to_psihat_contour(self, l_values, alpha=None):
+        """Contour-average label map: for each drift-surface label l, average
+        the normalized flux psihat_n over the WHOLE drift surface A_s = const,
+        not merely its two midplane crossings (the midplane map, Eq. (8), is a
+        2-point special case). Computed from grid-node data by Nadaraya-Watson
+        kernel regression of the nodal psihat_n on the nodal label lhat, so it
+        uses NO point location (like the drift-axis finder) and represents all
+        poloidal angles of the surface. In shaped geometry two midplane points
+        are a poor proxy for the surface, which floors the achievable q match;
+        this is the geometry-faithful generalization. The near-axis degeneracy
+        of the midplane map (both crossings on one side) does not arise here:
+        the average is over grid nodes, which naturally surround the extremum."""
+        alpha_e = self.cl.alpha_eff() if alpha is None else alpha
+        R_ax, Z_ax, psi_ax = self.psi_axis()
+        dpsi = self.gs.psi_b - psi_ax
+        kind = self._extremum_kind(self.psi)
+
+        A = alpha_e * self.gs.RR - self.psi
+        _, _, A_ax = self.gs.find_extremum(A, kind)
+        A_edge = alpha_e * (self.gs.R0 + self.gs.a) - self.gs.psi_b
+
+        lhat = ((A - A_ax) / (A_edge - A_ax)).ravel()
+        phn = np.clip((self.psi.ravel() - psi_ax) / dpsi, 0.0, 1.0)
+
+        # kernel regression psihat_m(l) = <phn>_{lhat ~ l}; the bandwidth h is
+        # a few label spacings, wide enough to span the nodes on a surface and
+        # narrow enough to resolve psihat_m(l). Restrict to closed surfaces.
+        m = lhat <= 1.2
+        lhat, phn = lhat[m], phn[m]
+        h = 0.03
+        lv = np.asarray(l_values, dtype=float)
+        d = (lhat[None, :] - lv[:, None]) / h
+        W = np.exp(-0.5 * d * d)
+        sw = W.sum(axis=1)
+        out = np.where(sw > 0.0, (W * phn[None, :]).sum(axis=1)
+                       / np.where(sw > 0.0, sw, 1.0), lv)
+        out = np.clip(out, 0.0, 1.0)
+        return np.maximum.accumulate(out)      # enforce monotone psihat_m(l)
+
+    def label_to_psihat_midplane(self, l_values, alpha=None):
         """Midplane-average label map:
             psihat_m(l) = 0.5 * [psihat(R_out(l)) + psihat(R_in(l))]
         where R_out/R_in are the outboard/inboard midplane radii of the
