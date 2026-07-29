@@ -55,7 +55,7 @@ public :: re_kinetic_equilibrium, re_eq_dist_file, re_eq_dist_format,          &
 ! --- driver interface (used by equilibrium.f90 and the GS element assembly)
 public :: re_eq_init, re_eq_update_labels, re_eq_rescale_current,              &
           re_eq_source, re_eq_source_derivs, re_eq_outer_update,               &
-          re_eq_write_output, re_eq_finalize
+          re_eq_write_output, re_eq_finalize, re_eq_done
 
 ! ------------------------------------------------------------------
 ! --- Namelist input parameters (registered in the model's in1 group)
@@ -141,6 +141,9 @@ real*8, allocatable :: re_eq_best_nprof(:)      !< Nprof of the best iterate
 integer             :: re_eq_n_stall  = 0       !< outer iterations without improvement
 logical :: re_eq_finishing     = .false.        !< best profile restored; final evaluation pass
 logical :: re_eq_soft_accepted = .false.        !< finished above tol_q but below tol_q_soft
+logical :: re_eq_reverted      = .false.        !< finishing: polish worsened q, best profile restored
+logical :: re_eq_done          = .false.        !< finishing verdict rendered; the outer loop must stop
+                                                !< (accepted OR given up -- read by the equilibrium driver)
 
 integer, parameter :: RE_EQ_LOG_UNIT = 437  !< unit of re_eq_convergence.log
 
@@ -532,6 +535,8 @@ subroutine re_eq_init_nprof(my_id)
   re_eq_n_stall       = 0
   re_eq_finishing     = .false.
   re_eq_soft_accepted = .false.
+  re_eq_reverted      = .false.
+  re_eq_done          = .false.
 
   B0 = abs(F0) / R_geo
   do i = 1, nr
@@ -1252,6 +1257,25 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   !     inner Picard pass on the restored profile, in which this routine
   !     only re-evaluates the error and decides on soft acceptance).
   if (re_eq_finishing) then
+    ! --- Finishing pass: render the final verdict on this candidate. The
+    !     first candidate is the polished best profile; the edge polish is
+    !     nearly q-invisible in the circular geometry it was tuned for, but
+    !     with a less accurate label map (e.g. shaped plasmas) the structure
+    !     it removes can carry real q information, so the polish may WORSEN
+    !     the match. In that case revert to the unpolished best profile and
+    !     re-converge once more, then accept that -- the polish must never
+    !     lose a match the transplant had already achieved.
+    if ((.not. re_eq_reverted) .and. (err .gt. re_eq_best_err)) then
+      write(*,'(A,ES10.2,A,ES10.2,A)') &
+        ' re_eq: the edge polish worsened max|q/q_t-1| (', re_eq_best_err,     &
+        ' -> ', err, '); reverting to the unpolished best profile'
+      re_nprof(1:re_eq_n_l) = re_eq_best_nprof(1:re_eq_n_l)
+      call re_eq_apply_beam_envelope()
+      re_eq_reverted = .true.
+      write(RE_EQ_LOG_UNIT,'(I6,I8,3ES16.6)') re_eq_outer_iter, n_inner, err, I_now, maxval(re_cl_lost)
+      call flush_it(RE_EQ_LOG_UNIT)
+      return                          ! caller re-converges psi on the best profile
+    endif
     if (.not. converged) then
       if (err .lt. re_eq_tol_q_soft) then
         write(*,'(A)')        ' WARNING: re_eq: q matching stagnated above re_eq_tol_q;'
@@ -1262,6 +1286,10 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
         re_eq_soft_accepted = .true.
       endif
     endif
+    ! Terminal: the finishing candidate has been judged (accepted or not).
+    ! Nprof is frozen in this branch, so further outer iterations would only
+    ! re-converge and re-evaluate the identical state -- stop the loop here.
+    re_eq_done = .true.
     write(RE_EQ_LOG_UNIT,'(I6,I8,3ES16.6)') re_eq_outer_iter, n_inner, err, I_now, maxval(re_cl_lost)
     call flush_it(RE_EQ_LOG_UNIT)
     return

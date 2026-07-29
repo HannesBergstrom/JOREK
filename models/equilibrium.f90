@@ -266,10 +266,12 @@ if (my_id == 0) then
                             iter, re_eq_converged)
     if (re_eq_converged) then
       write(*,'(A,I4,A)') ' re_eq: q-profile matching converged after ', iter_outer, ' outer iterations'
+    else if (re_eq_done) then
+      write(*,'(A)') ' re_eq: q-profile matching stopped without reaching the tolerance'
     endif
   endif
 
-  if (re_eq_converged) exit
+  if (re_eq_converged .or. re_eq_done) exit
 
   enddo ! iter_outer
 

@@ -730,9 +730,26 @@ class REEquilibrium:
                 ph, q_now = self.q_profile()
                 mctl = ph <= ph_ctl
                 err = np.abs(q_now[mctl] / (c * self.qt(ph[mctl])) - 1.0).max()
+                # revert-on-worsening: the edge polish is nearly q-invisible
+                # only where the label map is accurate (the circular case it
+                # was tuned for); with a less accurate map (shaped plasmas)
+                # the structure it removes can carry real q information, so
+                # the polish may WORSEN the match. Never lose a match the
+                # transplant already achieved -- restore the unpolished best
+                # profile and re-converge in that case.
+                if best_N is not None and err > best_err:
+                    if self.verbose:
+                        print(f"  finishing: polish worsened max|q/q_t-1| "
+                              f"({best_err:.3e} -> {err:.3e}); reverting to best")
+                    self.nprof.N = best_N.copy()
+                    self._apply_beam_envelope()
+                    self.picard()
+                    ph, q_now = self.q_profile()
+                    mctl = ph <= ph_ctl
+                    err = np.abs(q_now[mctl] / (c * self.qt(ph[mctl])) - 1.0).max()
                 if self.verbose:
                     print(f"  finishing after {outer} outer iterations: "
-                          f"polished Nprof, final max|q/q_t-1| = {err:.3e}")
+                          f"final max|q/q_t-1| = {err:.3e}")
                 self.log.append(dict(outer=outer, inner_iters=0, inner_res=0.0,
                                      q_err=err, I_RE=self.total_current(self.psi),
                                      q_amplitude=c, lost=self.lost_fraction.max()))
