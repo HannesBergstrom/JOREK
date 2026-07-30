@@ -79,8 +79,11 @@ end module phys_module
 module equil_info
   implicit none
   type type_equil_state
-    real*8 :: R_axis, Z_axis, psi_axis, psi_bnd
-    real*8 :: psi_xpoint(2), Z_xpoint(2)
+    real*8  :: R_axis, Z_axis, psi_axis, psi_bnd
+    real*8  :: psi_xpoint(2), Z_xpoint(2)
+    logical :: xpoint = .false.        !< diverted (X-point) case? (unit test: limiter)
+    real*8  :: LCFS_Rgeo = 0.d0        !< outboard LCFS geometric centre [m]
+    real*8  :: LCFS_a    = 0.d0        !< LCFS minor radius [m]
   end type type_equil_state
   type(type_equil_state) :: ES
 end module equil_info
