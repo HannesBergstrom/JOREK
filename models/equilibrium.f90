@@ -116,13 +116,21 @@ current_tot  = 0.
 n_outer_eq      = 1
 re_eq_converged = .true.
 if (re_kinetic_equilibrium) then
-  if (freeboundary_equil .or. xpoint2 .or. newton_GS_fixbnd) then
+  if (freeboundary_equil .or. newton_GS_fixbnd) then
     if (my_id == 0) then
-      write(*,*) 'ERROR: re_kinetic_equilibrium currently requires a fixed-boundary,'
-      write(*,*) '       non-X-point equilibrium with Picard iterations'
-      write(*,*) '       (freeboundary_equil=.f., xpoint=.f., newton_GS_fixbnd=.f.)'
+      write(*,*) 'ERROR: re_kinetic_equilibrium currently requires a fixed-boundary'
+      write(*,*) '       equilibrium with Picard iterations'
+      write(*,*) '       (freeboundary_equil=.f., newton_GS_fixbnd=.f.).'
+      write(*,*) '       Diverted (X-point) fixed-boundary cases ARE supported;'
+      write(*,*) '       free-boundary is not yet.'
     endif
     stop 1
+  endif
+  if (xpoint2 .and. (my_id == 0)) then
+    write(*,*) ' re_eq: DIVERTED (X-point) equilibrium: labels normalized against'
+    write(*,*) '        the separatrix (ES%psi_bnd) and the outboard LCFS radius;'
+    write(*,*) '        open-region (scrape-off / private-flux) nodes are excluded,'
+    write(*,*) '        and q matching is capped below the separatrix.'
   endif
   n_outer_eq      = re_eq_max_it_out + 1   ! +1: final evaluation pass on the
                                            ! restored best profile after stagnation
@@ -251,8 +259,16 @@ if (my_id == 0) then
       call tr_allocate(q_lev,  1,surface_list_q%n_psi,  "q_lev",  CAT_GRID)
       call tr_allocate(rad_lev,1,surface_list_q%n_psi,  "rad_lev",CAT_GRID)
     endif
+    ! q evaluation levels in psihat. For a diverted (X-point) case the top
+    ! level is pulled in from 0.985 to 0.95: q -> infinity at the separatrix
+    ! and the flux-surface tracer should not be asked to follow surfaces
+    ! hugging it. The controllable range is well below this anyway (the beam
+    ! edge, and with l_beam<1 the vacuum annulus), so nothing matchable is
+    ! lost -- q between the beam edge and the separatrix is an outcome. The
+    ! non-X-point path keeps 0.985 exactly (bit-identical).
     do i_lev = 1, n_lev_q
-      ph_lev(i_lev) = 0.02d0 + (0.985d0 - 0.02d0) * dble(i_lev-1) / dble(n_lev_q-1)
+      ph_lev(i_lev) = 0.02d0 + (merge(0.95d0, 0.985d0, xpoint2) - 0.02d0) &
+                              * dble(i_lev-1) / dble(n_lev_q-1)
       surface_list_q%psi_values(i_lev+1) = ES%psi_axis + ph_lev(i_lev) * (ES%psi_bnd - ES%psi_axis)
     enddo
     surface_list_q%psi_values(1) = ES%psi_axis + 0.01d0 * (ES%psi_bnd - ES%psi_axis)

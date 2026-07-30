@@ -626,9 +626,20 @@ subroutine re_eq_update_labels(my_id, node_list, element_list)
   integer :: s, ifail
   real*8  :: R0s, Z0s, R_ax, Z_ax, A_ax
 
-  ! --- outboard midplane boundary radius: for the fixed-boundary grids this
-  !     solver supports, the largest R of the grid lies on the boundary
-  re_eq_R_edge  = maxval(node_list%node(1:node_list%n_nodes)%x(1,1,1))
+  ! --- outboard midplane edge radius (used for the A_edge label
+  !     normalization). For a limiter / non-X-point grid the domain boundary
+  !     IS the last closed flux surface, so the largest-R grid node is the
+  !     outboard edge. For a diverted (X-point) grid the largest-R node lies
+  !     in the scrape-off layer BEYOND the separatrix, so use the outboard
+  !     last-closed-flux-surface radius from the equilibrium state
+  !     (ES%LCFS_Rgeo + ES%LCFS_a). ES%psi_bnd is already the separatrix psi
+  !     for a diverted case (update_equil_state / find_xpoint set it before
+  !     this routine runs), so it needs no branch.
+  if (ES%xpoint .and. (ES%LCFS_a .gt. 0.d0)) then
+    re_eq_R_edge = ES%LCFS_Rgeo + ES%LCFS_a
+  else
+    re_eq_R_edge = maxval(node_list%node(1:node_list%n_nodes)%x(1,1,1))
+  endif
   re_eq_psi_bnd = ES%psi_bnd
 
   do s = 1, re_eq_n_class
@@ -691,7 +702,7 @@ subroutine re_eq_find_drift_axis(node_list, element_list, alpha, R0, Z0, &
 
   integer, parameter :: n_fit_min = 10
   real*8  :: sgn, A_node, A_best, R_scan, Z_scan, r_fit, dx, dy, d2
-  real*8  :: M(6,6), rhs(6), c(6), row(6), det, ddx, ddy
+  real*8  :: M(6,6), rhs(6), c(6), row(6), det, ddx, ddy, phn_raw
   integer :: i, k, l, n_fit, i_pass
 
   ifail = 0
@@ -703,6 +714,15 @@ subroutine re_eq_find_drift_axis(node_list, element_list, alpha, R0, Z0, &
   A_best = -1.d99
   R_scan = R0;  Z_scan = Z0
   do i = 1, node_list%n_nodes
+    ! diverted grid: the drift axis is interior, so skip open-region nodes
+    ! (scrape-off / private flux, beyond the separatrix) as candidates --
+    ! at large outboard R the alpha*R term can otherwise make A extremal on
+    ! an open field line. Non-X-point path unchanged (ES%xpoint=.false.).
+    if (ES%xpoint) then
+      phn_raw = (node_list%node(i)%values(1,1,var_psi) - ES%psi_axis) &
+                / (ES%psi_bnd - ES%psi_axis)
+      if (phn_raw .gt. 1.d0 + 1.d-6) cycle
+    endif
     A_node = sgn * (alpha * node_list%node(i)%x(1,1,1) - node_list%node(i)%values(1,1,var_psi))
     if (A_node .gt. A_best) then
       A_best = A_node
@@ -1043,7 +1063,7 @@ subroutine re_eq_label_map(my_id, node_list, element_list, alpha, n_lmap, l_valu
   ! contour-map (nodal kernel regression) workspace
   real*8, parameter   :: RE_EQ_MAP_BW = 0.03d0   ! label bandwidth of the kernel
   real*8, allocatable :: lhat_n(:), phn_n(:)
-  real*8              :: wsum, wnum, dd, wk
+  real*8              :: wsum, wnum, dd, wk, phn_raw
 
   alpha_eff = alpha
 
@@ -1071,8 +1091,15 @@ subroutine re_eq_label_map(my_id, node_list, element_list, alpha, n_lmap, l_valu
       lhat_n(i) = (alpha_eff*node_list%node(i)%x(1,1,1)                        &
                    - node_list%node(i)%values(1,1,var_psi) - A_ax)            &
                   / (A_edge - A_ax)
-      phn_n(i)  = min(max((node_list%node(i)%values(1,1,var_psi)              &
-                           - ES%psi_axis) / dpsi, 0.d0), 1.d0)
+      phn_raw   = (node_list%node(i)%values(1,1,var_psi) - ES%psi_axis) / dpsi
+      phn_n(i)  = min(max(phn_raw, 0.d0), 1.d0)
+      ! diverted grid: exclude open-region nodes (the scrape-off layer and
+      ! the private-flux region sit beyond the separatrix, phn_raw > 1) so
+      ! they cannot pull the contour average towards the open field lines.
+      ! Flagged via the lhat > 1.2 cut used in the binning loop below. Only
+      ! when X-point -- a limiter grid has no open region, and gating on
+      ! ES%xpoint keeps the non-X-point path bit-identical.
+      if (ES%xpoint .and. (phn_raw .gt. 1.d0 + 1.d-6)) lhat_n(i) = 1.d99
     enddo
     do k = 1, n_lmap
       wsum = 0.d0;  wnum = 0.d0
