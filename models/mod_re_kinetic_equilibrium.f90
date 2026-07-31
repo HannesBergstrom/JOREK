@@ -1294,20 +1294,25 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
     ph_ctl_max = max(ph_ctl_max, min(ph_beam, ph_lev(n_lev)))
   enddo
 
-  ! --- sign-consistency guard: the equilibrium q (from the RE current) and
-  !     the target q_t must share a sign. The sign of q is fixed by the RE
-  !     current direction (the pitch xi in the distribution table); the
-  !     transplant can only match the MAGNITUDE |q|. If the two disagree, no
-  !     amount of profile shaping will match q_t -- the pitch is inconsistent
-  !     with the sign of the q_t table. Fail early and clearly instead of
-  !     grinding to a large, irreducible error.
+  ! --- sign-consistency guard: the equilibrium q and the target q_t must
+  !     share a sign. The transplant can only match the MAGNITUDE |q| (the
+  !     sign of q is not a free profile parameter). The sign of q is fixed by
+  !     sign(q) = sign(j_phi) * sign(F0), i.e. by BOTH the RE current
+  !     direction (the pitch xi in the distribution table) AND the toroidal
+  !     field (sign of F0) -- so the pitch alone does not determine it. This
+  !     guard checks the OUTCOME (sign of the solved q vs the target), so it
+  !     is geometry- and F0-sign agnostic; it does not predict the right xi.
+  !     On a mismatch no profile shaping can match q_t, so fail early and
+  !     clearly instead of grinding to a large, irreducible error.
   if (re_eq_outer_iter .eq. 1) then
     if (sum(q_acc) * sum(qt_acc) .lt. 0.d0) then
       write(*,*) 'ERROR: re_eq: the equilibrium q has the OPPOSITE sign to the'
-      write(*,*) '       target q_t. The RE current direction (set by the pitch'
-      write(*,*) '       xi in the distribution table) is inconsistent with the'
-      write(*,*) '       sign of the q_t profile. Flip the sign of the RE pitch'
-      write(*,*) '       OR the sign of the q_t table so the two agree.'
+      write(*,*) '       target q_t. The sign of q is set by sign(current) *'
+      write(*,*) '       sign(F0), i.e. by BOTH the RE pitch xi AND the sign of'
+      write(*,*) '       F0 -- so the required xi depends on the sign of F0.'
+      write(*,*) '       Make the two agree by flipping whichever is physically'
+      write(*,*) '       correct for your scenario: the RE pitch xi, the sign of'
+      write(*,*) '       F0, or the sign of the q_t table.'
       write(*,'(A,ES12.4,A,ES12.4,A)') '        (current-weighted mean q = ', &
         sum(q_acc), ', mean q_t = ', sum(qt_acc), ')'
       stop 1

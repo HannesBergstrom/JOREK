@@ -731,14 +731,17 @@ class REEquilibrium:
                 qt_at += cw[s] * self.qt(pe)
                 ph_ctl = max(ph_ctl, min(ph_beam, ph[-1]))
 
-            # sign-consistency guard: q (from the RE current) and q_t must share
-            # a sign; otherwise the pitch is inconsistent with the q_t table and
-            # no profile shaping can match it.
+            # sign-consistency guard: q and q_t must share a sign (the
+            # transplant matches only |q|). sign(q) = sign(current)*sign(F0),
+            # i.e. it is set by BOTH the RE pitch AND the sign of F0 -- this
+            # checks the outcome, so it is geometry/F0 agnostic. On a mismatch
+            # no profile shaping can match q_t.
             if np.sum(q_at) * np.sum(qt_at) < 0.0:
                 raise RuntimeError(
                     "equilibrium q has the opposite sign to the target q_t: "
-                    "the RE pitch is inconsistent with the sign of the q_t "
-                    "profile (flip the RE pitch or the q_t sign)")
+                    "sign(q) = sign(current)*sign(F0), so make them agree by "
+                    "flipping whichever is physically correct -- the RE pitch, "
+                    "the sign of F0, or the sign of the q_t table")
 
             if self.match_mode == 'q_shape':
                 # compare shapes only; report the achieved amplitude
