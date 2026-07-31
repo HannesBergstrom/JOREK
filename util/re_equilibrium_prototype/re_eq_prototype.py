@@ -721,10 +721,24 @@ class REEquilibrium:
                         max(self.l_beam - self.l_beam_width, 0.0)
                 ph_beam = np.interp(l_ctl, self.nprof.l, phm_s)
                 pe = np.clip(phm_s, ph[0], min(ph[-1], ph_beam))
-                log_ratio += cw[s] * np.log(q_i(pe) / self.qt(pe))
+                # transplant on the MAGNITUDE of q: |q|/|q_t| gives the correct
+                # update direction for either sign convention of q (its sign is
+                # fixed by the RE current direction / pitch; only the magnitude
+                # is shaped by Nprof). A signed ratio would break a negative-q
+                # target (co-B_phi RE pitch).
+                log_ratio += cw[s] * np.log(np.abs(q_i(pe)) / np.abs(self.qt(pe)))
                 q_at += cw[s] * q_i(pe)
                 qt_at += cw[s] * self.qt(pe)
                 ph_ctl = max(ph_ctl, min(ph_beam, ph[-1]))
+
+            # sign-consistency guard: q (from the RE current) and q_t must share
+            # a sign; otherwise the pitch is inconsistent with the q_t table and
+            # no profile shaping can match it.
+            if np.sum(q_at) * np.sum(qt_at) < 0.0:
+                raise RuntimeError(
+                    "equilibrium q has the opposite sign to the target q_t: "
+                    "the RE pitch is inconsistent with the sign of the q_t "
+                    "profile (flip the RE pitch or the q_t sign)")
 
             if self.match_mode == 'q_shape':
                 # compare shapes only; report the achieved amplitude
@@ -912,7 +926,7 @@ class REEquilibrium:
         # first pass: use psihat ~ (r/a)^2 as the argument of q_t
         for _ in range(2):
             ph = getattr(self, '_ph_cyl', (r / a)**2)
-            q = self.qt(ph)
+            q = np.abs(self.qt(ph))    # current MAGNITUDE profile; sign of q_t is a convention
             Ienc = 2.0 * np.pi * r**2 * B0 / (MU_ZERO * R0 * q)
             Bth = MU_ZERO * Ienc / (2.0 * np.pi * r)
             psi_pol = np.concatenate([[0.0], np.cumsum(

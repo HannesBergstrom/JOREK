@@ -562,7 +562,11 @@ subroutine re_eq_init_nprof(my_id)
 
   do ipass = 1, 2
     do i = 1, nr
-      q(i)    = re_eq_qt_eval(ph(i))
+      ! use |q_t|: this cylindrical guess sets the current MAGNITUDE profile
+      ! (Nprof >= 0), independent of the sign convention of q (which only
+      ! reflects the current direction, i.e. the RE pitch sign). A negative
+      ! q_t would otherwise give a negative j that is clamped to zero below.
+      q(i)    = abs(re_eq_qt_eval(ph(i)))
       Ienc(i) = 2.d0*PI * r(i)**2 * B0 / (MU_ZERO * R_geo * q(i))
       Bth(i)  = MU_ZERO * Ienc(i) / (2.d0*PI * r(i))
     enddo
@@ -1279,12 +1283,36 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
       phe   = min(max(phm(k), ph_lev(1)), min(ph_lev(n_lev), ph_beam))
       q_at  = re_eq_interp_q(n_lev, ph_lev, q_lev, phe)
       qt_at = re_eq_qt_eval(phe)
-      lr(k)     = lr(k)     + cw(s) * log(max(q_at, 1.d-30) / max(qt_at, 1.d-30))
+      ! transplant on the MAGNITUDE of q: the ratio |q|/|q_t| gives the
+      ! correct update direction for either sign convention (q and q_t share
+      ! a sign, enforced by the guard below). Clamping the raw signed values
+      ! to 1e-30 would destroy a negative-q target (co-B_phi RE pitch).
+      lr(k)     = lr(k)     + cw(s) * log(max(abs(q_at), 1.d-30) / max(abs(qt_at), 1.d-30))
       q_acc(k)  = q_acc(k)  + cw(s) * q_at
       qt_acc(k) = qt_acc(k) + cw(s) * qt_at
     enddo
     ph_ctl_max = max(ph_ctl_max, min(ph_beam, ph_lev(n_lev)))
   enddo
+
+  ! --- sign-consistency guard: the equilibrium q (from the RE current) and
+  !     the target q_t must share a sign. The sign of q is fixed by the RE
+  !     current direction (the pitch xi in the distribution table); the
+  !     transplant can only match the MAGNITUDE |q|. If the two disagree, no
+  !     amount of profile shaping will match q_t -- the pitch is inconsistent
+  !     with the sign of the q_t table. Fail early and clearly instead of
+  !     grinding to a large, irreducible error.
+  if (re_eq_outer_iter .eq. 1) then
+    if (sum(q_acc) * sum(qt_acc) .lt. 0.d0) then
+      write(*,*) 'ERROR: re_eq: the equilibrium q has the OPPOSITE sign to the'
+      write(*,*) '       target q_t. The RE current direction (set by the pitch'
+      write(*,*) '       xi in the distribution table) is inconsistent with the'
+      write(*,*) '       sign of the q_t profile. Flip the sign of the RE pitch'
+      write(*,*) '       OR the sign of the q_t table so the two agree.'
+      write(*,'(A,ES12.4,A,ES12.4,A)') '        (current-weighted mean q = ', &
+        sum(q_acc), ', mean q_t = ', sum(qt_acc), ')'
+      stop 1
+    endif
+  endif
 
   if ((re_eq_l_beam .lt. 1.d0) .and. (re_eq_outer_iter .eq. 1)) then
     write(*,'(A,F7.4,A)') ' re_eq: beam-edge label l_beam = ', re_eq_l_beam, &
