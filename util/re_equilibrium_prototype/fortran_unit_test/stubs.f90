@@ -74,6 +74,7 @@ module phys_module
   real*8  :: FF_coef(10) = (/ 0.d0, 0.d0, 0.d0, 0.03d0, 5.d0, 0.d0, 10.d0, 1.d0, 0.d0, 0.d0 /)
   real*8  :: T_coef(10)  = (/ 0.d0, 0.d0, 0.d0, 1.d0,   5.d0, 0.d0, 0.d0,  0.d0, 0.d0, 0.d0 /)
   logical :: num_ffprime = .false.
+  logical :: num_T        = .false.
 end module phys_module
 
 module equil_info

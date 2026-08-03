@@ -161,7 +161,7 @@ contains
 !> Read the input tables, build the classes, write the startup log.
 !> Called once (my_id == 0) at the beginning of the equilibrium solve.
 subroutine re_eq_init(my_id)
-  use phys_module, only: F0, R_geo, amin, FF_coef, T_coef, num_ffprime
+  use phys_module, only: F0, R_geo, amin, FF_coef, T_coef, num_ffprime, num_T
   implicit none
   integer, intent(in) :: my_id
   integer :: s
@@ -187,21 +187,27 @@ subroutine re_eq_init(my_id)
     stop 1
   endif
 
-  ! --- Guard against a NaN trap in the analytic profile evaluations: the
-  ! --- FFprime (and temperature) routines divide by the shape widths even
-  ! --- when the profile amplitude is zero. A pure-RE equilibrium needs
-  ! --- FF_0 = FF_1 = 0 but FINITE FF_coef(4) and FF_coef(8).
+  ! --- Guard against a NaN trap in the ANALYTIC profile evaluations: the
+  ! --- analytic FFprime and temperature routines divide by the shape widths
+  ! --- (FF_coef(4)/(8), T_coef(4)) even when the profile amplitude is zero,
+  ! --- so a pure-RE equilibrium (FF_0 = FF_1 = 0) needs those FINITE. This
+  ! --- only applies when the analytic form is used: with a numerical profile
+  ! --- from a file (ffprime_file / T_file -> num_ffprime / num_T set true in
+  ! --- read_num_profiles) the shape coefficients are unused, so skip the guard.
   if (.not. num_ffprime) then
     if ((FF_coef(4) .eq. 0.d0) .or. (FF_coef(8) .eq. 0.d0)) then
       write(*,*) 'ERROR: re_eq: FF_coef(4) and FF_coef(8) must be nonzero even for'
       write(*,*) '       a zero-amplitude FFprime profile (FF_0=FF_1=0): the analytic'
       write(*,*) '       profile evaluation divides by them and yields NaN otherwise.'
       write(*,*) '       Use e.g. FF_coef(4)=0.03, FF_coef(5)=5., FF_coef(8)=1.'
+      write(*,*) '       (Not needed when FFprime is read from ffprime_file.)'
       stop 1
     endif
   endif
-  if ((T_coef(4) .eq. 0.d0)) then
-    write(*,*) 'ERROR: re_eq: T_coef(4) must be nonzero (see FF_coef note above).'
+  if ((.not. num_T) .and. (T_coef(4) .eq. 0.d0)) then
+    write(*,*) 'ERROR: re_eq: T_coef(4) must be nonzero for the analytic temperature'
+    write(*,*) '       profile (see the FF_coef note above). Not needed when the'
+    write(*,*) '       temperature is read from T_file.'
     stop 1
   endif
 
