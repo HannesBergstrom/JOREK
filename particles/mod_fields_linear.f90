@@ -493,7 +493,7 @@ subroutine do_read(this, sim, ev)
         
         ! Find the following file (next timestep number)
         next_file_found=.false.
-        do i=this%i+1,this%i+20 ! check 20 files ahead
+        do i=this%i+1,this%i+200 ! check 200 files ahead
           restart_file = find_jorek_restart_file(this%basename, i)
           inquire(file=trim(restart_file), exist=file_exists)
           if (file_exists) then
