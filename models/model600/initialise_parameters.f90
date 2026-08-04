@@ -220,7 +220,8 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 export_polar_boundary, xpoint_search_tries,         &
                 use_manual_random_seed, manual_seed,                &
                 use_fixed_rng_value, fixed_rng_value,               &            
-                loop_voltage, export_aux_node_list
+                loop_voltage, export_aux_node_list,                 &
+                restart_particles, wall_collision_model
 
 
 if (my_id .eq. 0) then
