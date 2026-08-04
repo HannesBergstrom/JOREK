@@ -391,7 +391,7 @@ class REEquilibrium:
         self.A_ax = np.zeros(self.cl.n_s)     # A_s/e at the class drift axis [Wb]
         self.A_edge = np.zeros(self.cl.n_s)
         self.ax_RZ = np.zeros((self.cl.n_s, 2))
-        self.lost_fraction = np.zeros(self.cl.n_s)
+        self.edge_fraction = np.zeros(self.cl.n_s)   # current fraction in Ahat > 0.95
         self.log = []                          # convergence log records
 
     # --- per-class invariant labels ------------------------------------------
@@ -405,17 +405,38 @@ class REEquilibrium:
         psi_ax = psi[0, :].mean()
         return 'min' if psi_ax > self.gs.psi_b else 'max'
 
+    def _A_edge_from_boundary(self, s, kind):
+        """A of the last drift surface that does NOT reach the loss boundary:
+        the extremum of A_s = alpha_s R - psi over the boundary nodes.
+
+        A drift orbit is lost when its surface reaches the WALL (limiter /
+        divertor target), not when it crosses a flux surface, so the critical
+        label is a property of the boundary contour and nothing else. Written
+        this way the definition makes NO assumption that the boundary is a
+        flux surface -- the previous form (alpha * max R - psi_bnd) is the
+        special case psi = psi_bnd all along the boundary, and reproduces it
+        exactly there. On a vessel-shaped boundary with varying psi the old
+        form is over-restrictive by ~|alpha| * (R range) / |dpsi|, i.e. it
+        truncates the beam well inside the true last confined surface, and
+        the error grows linearly with the class energy.
+
+        `kind` is the extremum type of A at the drift axis: 'min' means A
+        increases outwards, so confined surfaces are those with A below the
+        boundary minimum (and vice versa for 'max')."""
+        R_b = self.gs.R0 + self.gs.a * np.cos(self.gs.th)
+        A_b = self.cl.alpha[s] * R_b - self.gs.psi_b
+        return A_b.min() if kind == 'min' else A_b.max()
+
     def update_labels(self, psi):
         """Per-class drift axes and edge values -> normalization of Ahat_s.
         Must be called every time psi changes (the axes move!)."""
         kind = self._extremum_kind(psi)
-        R_edge = self.gs.R0 + self.gs.a       # outboard midplane boundary
         for s in range(self.cl.n_s):
             A = self._A_field(s, psi)
             R_ax, Z_ax, A_ax = self.gs.find_extremum(A, kind)
             self.ax_RZ[s] = (R_ax, Z_ax)
             self.A_ax[s] = A_ax
-            self.A_edge[s] = self.cl.alpha[s] * R_edge - self.gs.psi_b
+            self.A_edge[s] = self._A_edge_from_boundary(s, kind)
             if self.A_edge[s] == self.A_ax[s]:
                 raise RuntimeError(f"class {s}: degenerate label normalization")
 
@@ -450,18 +471,28 @@ class REEquilibrium:
     def source(self, psi):
         """RHS of Delta* psi = mu0 e sum_s v_par,s w_s Nprof(Ahat_s).
         Note: no explicit R factor (the 1/R of n_s cancels the R of the GS RHS).
-        Also accumulates the per-class lost-current fraction (drift surfaces
-        with Ahat > 1, whose current is removed by the taper policy)."""
+        Also refreshes the per-class beam-edge fraction (see below)."""
         S = np.zeros((self.gs.Nr, self.gs.Nt))
+        dA = self.gs.r[:, None] * self.gs.dr * self.gs.dth
         for s in range(self.cl.n_s):
             l_raw = self.Ahat(s, psi, clip=False)
             N = self.nprof(l_raw) * self._taper(l_raw)
             S += MU_ZERO * EL_CHG * self.cl.v_par[s] * self.cl.w[s] * N
-            with np.errstate(invalid='ignore'):
-                N_unt = self.nprof(l_raw)
-                tot = np.abs(N_unt).sum()
-                lost = np.abs(N_unt[l_raw > 1.0]).sum()
-            self.lost_fraction[s] = lost / tot if tot > 0 else 0.0
+            # Beam-edge diagnostic. This REPLACES the former "lost fraction",
+            # which evaluated the CLIPPED table -- i.e. Nprof(1) -- at every
+            # point with Ahat > 1 and divided by the same clipped integral. On
+            # a domain that extends past the plasma (a vessel-shaped boundary)
+            # that is dominated by vacuum volume and is not a current fraction
+            # at all: it reported 0.64 for a case whose beam is entirely
+            # confined. Nprof is defined on [0,1] only and, with A_edge taken
+            # from the loss boundary, everything on it is confined by
+            # construction -- nothing is lost. The quantity that actually
+            # matters is how hard the beam edge is, i.e. how much of the
+            # carried current sits in the outermost 5% of the label range.
+            w = np.abs(N / self.gs.RR) * dA
+            tot = w.sum()
+            self.edge_fraction[s] = (w[l_raw > 0.95].sum() / tot
+                                     if tot > 0 else 0.0)
         return S
 
     def total_current(self, psi):
@@ -781,13 +812,13 @@ class REEquilibrium:
             self.log.append(dict(outer=outer, inner_iters=n_in,
                                  inner_res=res_in, q_err=err, I_RE=I_now,
                                  q_amplitude=c,
-                                 lost=self.lost_fraction.max()))
+                                 lost=self.edge_fraction.max()))
             if self.verbose:
                 print(f"  outer {outer:3d}: inner {n_in:3d} (res {res_in:.2e})"
                       f"  max|q/q_t-1| = {err:.3e}  I_RE = {I_now/1e6:8.4f} MA"
                       + (f"  q-ampl = {c:.4f}" if self.match_mode == 'q_shape' else "")
-                      + (f"  lost = {self.lost_fraction.max():.2e}"
-                         if self.lost_fraction.max() > 0 else ""))
+                      + (f"  edge = {self.edge_fraction.max():.2e}"
+                         if self.edge_fraction.max() > 0 else ""))
             if err < self.tol_q or n_stall >= 15:
                 # finishing pass: best profile + edge null-space polish of
                 # Nprof (short-wavelength structure near l=1 is nearly
@@ -822,7 +853,7 @@ class REEquilibrium:
                           f"final max|q/q_t-1| = {err:.3e}")
                 self.log.append(dict(outer=outer, inner_iters=0, inner_res=0.0,
                                      q_err=err, I_RE=self.total_current(self.psi),
-                                     q_amplitude=c, lost=self.lost_fraction.max()))
+                                     q_amplitude=c, lost=self.edge_fraction.max()))
                 return err < self.tol_q
             ratio = np.clip(ratio, 1.0 / self.RATIO_CLAMP, self.RATIO_CLAMP)
             # smooth the log-ratio (Nprof is smooth; single-point features in
@@ -977,7 +1008,7 @@ class REEquilibrium:
                             axis_shift=ax_shift, boundary_shift=float(bnd_shift),
                             d_s=float(self.cl.d_shift(abs(self.F0) / self.gs.R0,
                                                       self.gs.a)[s]),
-                            lost_fraction=float(self.lost_fraction[s])))
+                            edge_fraction=float(self.edge_fraction[s])))
         return out
 
     def write_output(self, basename='re_eq_prototype'):
@@ -988,20 +1019,20 @@ class REEquilibrium:
                  psi_b=self.gs.psi_b, F0=self.F0)
         with open(basename + '_classes.dat', 'w') as f:
             f.write("# s  E_kin[eV]  xi  weight  gamma  v_par[m/s]  "
-                    "A_axis[Wb]  A_edge[Wb]  R_ax[m]  Z_ax[m]  lost_fraction\n")
+                    "A_axis[Wb]  A_edge[Wb]  R_ax[m]  Z_ax[m]  edge_fraction\n")
             for s in range(self.cl.n_s):
                 f.write(f"{s + 1:3d} {self.cl.E_kin[s]:14.6e} {self.cl.xi[s]:9.5f} "
                         f"{self.cl.w[s]:12.6e} {self.cl.gamma[s]:10.4f} "
                         f"{self.cl.v_par[s]:14.6e} {self.A_ax[s]:14.6e} "
                         f"{self.A_edge[s]:14.6e} {self.ax_RZ[s, 0]:10.5f} "
-                        f"{self.ax_RZ[s, 1]:10.5f} {self.lost_fraction[s]:10.3e}\n")
+                        f"{self.ax_RZ[s, 1]:10.5f} {self.edge_fraction[s]:10.3e}\n")
         with open(basename + '_nprof.dat', 'w') as f:
             f.write("# l  Nprof(l) [m^-2]\n")
             for l, N in zip(self.nprof.l, self.nprof.N):
                 f.write(f"{l:10.6f} {N:14.6e}\n")
         with open(basename + '_convergence.log', 'w') as f:
             f.write("# outer  inner_iters  inner_res  max|q/qt-1|  I_RE[A]  "
-                    "q_amplitude  max_lost_fraction\n")
+                    "q_amplitude  max_edge_fraction\n")
             for rec in self.log:
                 f.write(f"{rec['outer']:5d} {rec['inner_iters']:6d} "
                         f"{rec['inner_res']:12.4e} {rec['q_err']:12.4e} "

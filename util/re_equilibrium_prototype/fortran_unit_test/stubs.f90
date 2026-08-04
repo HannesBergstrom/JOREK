@@ -64,6 +64,16 @@ module data_structure
     integer :: n_elements
     type(type_element), allocatable :: element(:)
   end type type_element_list
+  ! boundary nodes: only index_jorek is used by mod_re_kinetic_equilibrium
+  ! (re_eq_A_edge_bnd walks the boundary contour to find the loss-boundary
+  ! value of A); the real type carries STARWALL indices and dof counts too.
+  type type_bnd_node
+    integer :: index_jorek
+  end type type_bnd_node
+  type type_bnd_node_list
+    integer :: n_bnd_nodes
+    type(type_bnd_node), allocatable :: bnd_node(:)
+  end type type_bnd_node_list
 end module data_structure
 
 module phys_module

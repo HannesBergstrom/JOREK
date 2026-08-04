@@ -26,12 +26,25 @@ Physics checks when preparing/updating the reference data:
 * Current on drift orbits leaving the domain is REMOVED (linear taper of
   width `re_eq_edge_taper` in the label beyond the last closed surface):
   RE orbits crossing the wall are lost, and the marker loader applies the
-  identical truncation. When a large current fraction sits on open orbits
-  (high energy at low field), exactly matching q_t is outside the range of
-  the single-Nprof ansatz; the solver then stops at the achievable optimum
-  and accepts it if below `re_eq_tol_q_soft` (with a warning), so choose
-  the class energies of a regression case such that the lost fractions stay
-  at the percent level (as the shipped distribution does).
+  identical truncation. The last confined surface is `Ahat = 1`, whose
+  `A_edge` is the extremum of `alpha_s R - psi` over the BOUNDARY nodes,
+  i.e. the last drift surface that does not reach the wall. On a boundary
+  that is itself a flux surface (as here) this equals the previous
+  `alpha_s * max(R) - psi_bnd` exactly, so this case is unchanged; the two
+  differ only on a boundary with varying psi (a vessel-shaped contour),
+  where the old form truncated the beam well inside the wall by an amount
+  growing linearly with class energy.
+* The convergence log reports `max_edge_fraction`: the fraction of the
+  CARRIED current sitting in the outermost 5% of the label range, i.e. how
+  hard the beam edge is against the loss boundary. (It replaces the former
+  `max_lost_fraction`, which evaluated the clipped `Nprof(1)` over every
+  point outside the beam and was dominated by vacuum volume on a domain
+  larger than the plasma.) When a large current fraction sits at the beam
+  edge, exactly matching q_t is outside the range of the single-Nprof
+  ansatz; the solver then stops at the achievable optimum and accepts it if
+  below `re_eq_tol_q_soft` (with a warning), so choose the class energies of
+  a regression case such that the edge fraction stays modest (as the shipped
+  distribution does).
 * `qprofile.dat` of the equilibrium run must agree with
   `qprofile_target.dat`.
 * The per-class drift-axis positions in `re_equilibrium.dat` (columns

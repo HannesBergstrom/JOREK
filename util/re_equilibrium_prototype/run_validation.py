@@ -122,7 +122,7 @@ def test_bandaru():
               f"axis shift = {sh['axis_shift'] * 100:.2f} cm, "
               f"boundary shift = {sh['boundary_shift'] * 100:.2f} cm "
               f"(analytic est {sh['delta_est'] * 100:.2f} cm), "
-              f"lost = {sh['lost_fraction']:.1e} "
+              f"edge = {sh['edge_fraction']:.1e} "
               f"({n_in} it, res {res:.1e}, {time.time() - t0:.1f} s)")
 
     for E_MeV, lo, hi in ((40.0, 4.0, 16.0), (80.0, 8.0, 30.0)):
@@ -170,7 +170,7 @@ def test_q_matching():
         I_MA = eq.log[-1]['I_RE'] / 1e6
         check(f"q-match ({name}, full_q)", err < tol_accept and n_out <= 30,
               f"{n_out} outer it, err = {err:.2e} (accept < {tol_accept:.0e}), "
-              f"I_RE = {I_MA:.3f} MA, lost = {eq.lost_fraction.max():.1e}, "
+              f"I_RE = {I_MA:.3f} MA, edge = {eq.edge_fraction.max():.1e}, "
               f"{time.time() - t0:.1f} s")
 
     # q_shape mode: fix I_RE, match the shape, report amplitude

@@ -57,6 +57,8 @@ public :: re_kinetic_equilibrium, re_eq_dist_file, re_eq_dist_format,          &
 public :: re_eq_init, re_eq_update_labels, re_eq_rescale_current,              &
           re_eq_source, re_eq_source_derivs, re_eq_outer_update,               &
           re_eq_write_output, re_eq_finalize, re_eq_done
+! --- exposed for the standalone unit test (util/re_equilibrium_prototype)
+public :: re_cl_alpha, re_cl_A_edge
 
 ! ------------------------------------------------------------------
 ! --- Namelist input parameters (registered in the model's in1 group)
@@ -124,7 +126,8 @@ real*8, allocatable :: re_cl_A_axis(:)  !< A_s/e at the class drift axis [Wb]
 real*8, allocatable :: re_cl_A_edge(:)  !< A_s/e at the outboard midplane edge [Wb]
 real*8, allocatable :: re_cl_R_axis(:)  !< R of the class drift axis [m]
 real*8, allocatable :: re_cl_Z_axis(:)  !< Z of the class drift axis [m]
-real*8, allocatable :: re_cl_lost(:)    !< current fraction on drift surfaces leaving the domain
+real*8, allocatable :: re_cl_edge_frac(:) !< carried-current fraction at Ahat > 0.95: how hard
+                                          !< the beam edge sits against the loss boundary
 
 !> common normalized profile function Nprof(l) [m^-2], uniform l grid in [0,1]
 real*8, allocatable :: re_nprof_l(:), re_nprof(:)
@@ -233,7 +236,7 @@ subroutine re_eq_init(my_id)
   enddo
 
   open(RE_EQ_LOG_UNIT, file='re_eq_convergence.log', action='write', status='replace')
-  write(RE_EQ_LOG_UNIT,'(A)') '# outer  inner_iters  max|q/qt-1|   I_RE[A]        max_lost_fraction'
+  write(RE_EQ_LOG_UNIT,'(A)') '# outer  inner_iters  max|q/qt-1|   I_RE[A]        max_edge_fraction'
 
   re_eq_outer_iter  = 0
   re_eq_initialized = .true.
@@ -310,7 +313,7 @@ subroutine re_eq_read_distribution(my_id)
   call tr_allocate(re_cl_A_edge,1, n, "re_cl_A_edge",CAT_GRID)
   call tr_allocate(re_cl_R_axis,1, n, "re_cl_R_axis",CAT_GRID)
   call tr_allocate(re_cl_Z_axis,1, n, "re_cl_Z_axis",CAT_GRID)
-  call tr_allocate(re_cl_lost,  1, n, "re_cl_lost",  CAT_GRID)
+  call tr_allocate(re_cl_edge_frac, 1, n, "re_cl_edge_frac", CAT_GRID)
 
   re_cl_ekin(1:n) = tmp_e(1:n)
   re_cl_xi(1:n)   = tmp_xi(1:n)
@@ -347,7 +350,7 @@ subroutine re_eq_read_distribution(my_id)
 
   re_cl_A_axis = 0.d0;  re_cl_A_edge = 0.d0
   re_cl_R_axis = 0.d0;  re_cl_Z_axis = 0.d0
-  re_cl_lost   = 0.d0
+  re_cl_edge_frac = 0.d0
 
 end subroutine re_eq_read_distribution
 
@@ -622,29 +625,77 @@ end subroutine re_eq_init_nprof
 
 
 !=======================================================================
+!> A of the last drift surface of a class that does NOT reach the loss
+!> boundary: the extremum of A_s = alpha_s R - psi over the BOUNDARY nodes.
+!>
+!> A drift orbit is lost when its surface reaches the WALL (limiter /
+!> divertor target), not when it crosses a flux surface, so the critical
+!> label is a property of the boundary contour and of nothing else. Written
+!> this way the definition makes NO assumption about the boundary: the
+!> previous form (alpha * maxval(R) - ES%psi_bnd) is the special case
+!> psi = psi_bnd all along the boundary and is reproduced EXACTLY there.
+!>
+!> That special case does not hold in general. On a vessel-shaped fixed
+!> boundary (psi prescribed and varying along the contour) the old form is
+!> over-restrictive by ~ |alpha| * (R range) / |psi_bnd - psi_axis|, i.e. it
+!> truncates the beam inside the true last confined surface by an amount
+!> that grows LINEARLY with the class energy -- 19% of the label range at
+!> 10 MeV on the JET-like limiter test case, where it leaves an unphysical
+!> current-free gap between the beam and the wall around the whole contour.
+!> It also forced the diverted case to treat the SEPARATRIX as the loss
+!> boundary, whereas a confined orbit may legitimately excurse into the
+!> scrape-off layer.
+!>
+!> sgn < 0 means A has a MINIMUM at the drift axis and increases outwards,
+!> so the confined surfaces are those below the boundary minimum (and the
+!> other way round for sgn > 0). It is the same branch selector that
+!> re_eq_find_drift_axis uses, keyed on psi and NOT on the sign of alpha:
+!> alpha and the sign of j_phi (hence of psi_axis - psi_bnd) both follow
+!> sign(v_par), so the two flips cancel and either pitch sign is handled.
+function re_eq_A_edge_bnd(alpha, node_list, bnd_node_list) result(A_edge)
+  use data_structure
+  use equil_info, only: ES
+  use mod_model_settings, only: var_psi
+  implicit none
+  real*8,                      intent(in) :: alpha
+  type (type_node_list),       intent(in) :: node_list
+  type (type_bnd_node_list),   intent(in) :: bnd_node_list
+  real*8  :: A_edge, A_i, sgn
+  integer :: i, iv
+
+  sgn = 1.d0
+  if (ES%psi_axis .gt. ES%psi_bnd) sgn = -1.d0     ! psi max at axis -> A min at axis
+
+  A_edge = -sgn * 1.d99
+  do i = 1, bnd_node_list%n_bnd_nodes
+    iv   = bnd_node_list%bnd_node(i)%index_jorek
+    A_i  = alpha * node_list%node(iv)%x(1,1,1) - node_list%node(iv)%values(1,1,var_psi)
+    if (sgn * A_i .gt. sgn * A_edge) A_edge = A_i
+  enddo
+
+end function re_eq_A_edge_bnd
+
+
+!=======================================================================
 !> Update the per-class invariant labels: locate the drift axis of every
 !> class (the extremum of A_s, displaced from the magnetic axis) and the
-!> outboard midplane edge value. MUST be called every time psi changes
-!> during the Picard iteration -- the axes move as psi converges.
-subroutine re_eq_update_labels(my_id, node_list, element_list)
+!> loss-boundary value (re_eq_A_edge_bnd). MUST be called every time psi
+!> changes during the Picard iteration -- both move as psi converges.
+subroutine re_eq_update_labels(my_id, node_list, element_list, bnd_node_list)
   use data_structure
   use equil_info, only: ES
   implicit none
-  integer,                  intent(in) :: my_id
-  type (type_node_list),    intent(in) :: node_list
-  type (type_element_list), intent(in) :: element_list
+  integer,                    intent(in) :: my_id
+  type (type_node_list),      intent(in) :: node_list
+  type (type_element_list),   intent(in) :: element_list
+  type (type_bnd_node_list),  intent(in) :: bnd_node_list
   integer :: s, ifail
   real*8  :: R0s, Z0s, R_ax, Z_ax, A_ax
 
-  ! --- outboard midplane edge radius (used for the A_edge label
-  !     normalization). For a limiter / non-X-point grid the domain boundary
-  !     IS the last closed flux surface, so the largest-R grid node is the
-  !     outboard edge. For a diverted (X-point) grid the largest-R node lies
-  !     in the scrape-off layer BEYOND the separatrix, so use the outboard
-  !     last-closed-flux-surface radius from the equilibrium state
-  !     (ES%LCFS_Rgeo + ES%LCFS_a). ES%psi_bnd is already the separatrix psi
-  !     for a diverted case (update_equil_state / find_xpoint set it before
-  !     this routine runs), so it needs no branch.
+  ! --- outboard midplane edge radius. No longer used for the A_edge label
+  !     normalization (that now comes from the boundary contour itself, see
+  !     re_eq_A_edge_bnd); retained because the midplane label map scans out
+  !     to it and the startup report quotes it.
   if (ES%xpoint .and. (ES%LCFS_a .gt. 0.d0)) then
     re_eq_R_edge = ES%LCFS_Rgeo + ES%LCFS_a
   else
@@ -673,7 +724,7 @@ subroutine re_eq_update_labels(my_id, node_list, element_list)
       re_cl_Z_axis(s) = Z_ax
       re_cl_A_axis(s) = A_ax
     endif
-    re_cl_A_edge(s) = re_cl_alpha(s) * re_eq_R_edge - re_eq_psi_bnd
+    re_cl_A_edge(s) = re_eq_A_edge_bnd(re_cl_alpha(s), node_list, bnd_node_list)
     if (abs(re_cl_A_edge(s) - re_cl_A_axis(s)) .le. 0.d0) then
       write(*,*) 'ERROR: re_eq: degenerate label normalization for class ', s
       stop 1
@@ -903,8 +954,8 @@ end subroutine re_eq_grad_psi
 !>   S_RE = mu0 e sum_s v_par,s w_s Nprof(Ahat_s)
 !> Note there is no explicit R factor left (the 1/R of the class density
 !> cancels the R of the GS right-hand side); the element assembly adds
-!> S_RE / R to its rhs integrand. Also accumulates, per evaluation, nothing:
-!> the lost-current bookkeeping is done in re_eq_report_lost on the grid.
+!> S_RE / R to its rhs integrand. This routine accumulates no diagnostics;
+!> the beam-edge bookkeeping is done in re_eq_total_current on the grid.
 function re_eq_source(psi, R) result(S)
   implicit none
   real*8, intent(in) :: psi, R
@@ -960,8 +1011,7 @@ end subroutine re_eq_source_derivs
 !> Total RE current [A] carried by the source on the present psi:
 !>   I_RE = int j_phi dA = -e sum_s v_par,s w_s int Nprof(Ahat_s)/R dA
 !> evaluated by Gaussian quadrature over all elements. Also refreshes the
-!> per-class lost-current fractions (drift surfaces with Ahat > 1 carrying
-!> nonzero Nprof).
+!> per-class beam-edge fractions (carried current at Ahat > 0.95).
 subroutine re_eq_total_current(my_id, node_list, element_list, I_RE)
   use mod_parameters, only: n_vertex_max, n_degrees
   use data_structure
@@ -977,9 +1027,9 @@ subroutine re_eq_total_current(my_id, node_list, element_list, I_RE)
   integer :: i, iv, kv, kf, ms, mt, s
   real*8  :: x_g, y_g, x_s, x_t, y_s, y_t, eq_g, eq_s, eq_t
   real*8  :: xjac, wst, lhat, Nval
-  real*8  :: I_cl(re_eq_n_class), lost_cl(re_eq_n_class), tot_cl(re_eq_n_class)
+  real*8  :: I_cl(re_eq_n_class), edge_cl(re_eq_n_class), tot_cl(re_eq_n_class)
 
-  I_cl = 0.d0;  lost_cl = 0.d0;  tot_cl = 0.d0
+  I_cl = 0.d0;  edge_cl = 0.d0;  tot_cl = 0.d0
 
   do i = 1, element_list%n_elements
     do ms = 1, n_gauss
@@ -1004,12 +1054,21 @@ subroutine re_eq_total_current(my_id, node_list, element_list, I_RE)
         do s = 1, re_eq_n_class
           lhat = (re_cl_alpha(s)*x_g - eq_g - re_cl_A_axis(s)) &
                  / (re_cl_A_edge(s) - re_cl_A_axis(s))
-          ! carried current: with the edge taper; lost bookkeeping: the
-          ! would-be (untapered) current fraction on open drift surfaces
-          Nval = re_eq_nprof_eval(lhat)
-          I_cl(s)   = I_cl(s) - EL_CHG * re_cl_vpar(s) * re_cl_w(s) * re_eq_nprof_at(lhat) / x_g * wst
+          Nval      = re_eq_nprof_at(lhat)
+          I_cl(s)   = I_cl(s) - EL_CHG * re_cl_vpar(s) * re_cl_w(s) * Nval / x_g * wst
+          ! Beam-edge bookkeeping: how much of the CARRIED current sits in the
+          ! outermost 5% of the label range, i.e. how hard the beam edge is
+          ! against the loss boundary. This REPLACES the former lost-current
+          ! fraction, which accumulated the CLIPPED table -- re_eq_nprof_eval
+          ! returns Nprof(1) for lhat > 1 -- over every Gauss point outside the
+          ! beam. On a domain that extends past the plasma that sum is
+          ! dominated by vacuum volume and is not a current fraction at all
+          ! (it reported 0.64 on the JET-like limiter case, whose beam is
+          ! entirely confined). With A_edge taken from the loss boundary,
+          ! everything on lhat <= 1 is confined by construction: nothing is
+          ! lost, so the quantity worth reporting is the edge sharpness.
           tot_cl(s) = tot_cl(s) + abs(Nval) / x_g * wst
-          if (lhat .gt. 1.d0) lost_cl(s) = lost_cl(s) + abs(Nval) / x_g * wst
+          if (lhat .gt. 0.95d0) edge_cl(s) = edge_cl(s) + abs(Nval) / x_g * wst
         enddo
       enddo
     enddo
@@ -1017,9 +1076,9 @@ subroutine re_eq_total_current(my_id, node_list, element_list, I_RE)
 
   do s = 1, re_eq_n_class
     if (tot_cl(s) .gt. 0.d0) then
-      re_cl_lost(s) = lost_cl(s) / tot_cl(s)
+      re_cl_edge_frac(s) = edge_cl(s) / tot_cl(s)
     else
-      re_cl_lost(s) = 0.d0
+      re_cl_edge_frac(s) = 0.d0
     endif
   enddo
   I_RE = sum(I_cl)
@@ -1053,7 +1112,8 @@ end subroutine re_eq_rescale_current
 !> This is a separate, swappable modelling choice. Handles the near-axis
 !> degeneracy where both crossings sit on the same side of the magnetic
 !> axis (strong drift shift) by falling back to the outboard branch.
-subroutine re_eq_label_map(my_id, node_list, element_list, alpha, n_lmap, l_values, psihat_m)
+subroutine re_eq_label_map(my_id, node_list, element_list, alpha, A_edge_in, &
+                           n_lmap, l_values, psihat_m)
   use data_structure
   use equil_info, only: ES
   use mod_model_settings, only: var_psi
@@ -1062,6 +1122,10 @@ subroutine re_eq_label_map(my_id, node_list, element_list, alpha, n_lmap, l_valu
   type (type_node_list),    intent(in)  :: node_list
   type (type_element_list), intent(in)  :: element_list
   real*8,                   intent(in)  :: alpha    !< gamma m v_par/e of the class [Wb/m]
+  real*8,                   intent(in)  :: A_edge_in !< loss-boundary A of this class
+                                                     !< (re_eq_A_edge_bnd; passed in so the
+                                                     !< map cannot re-derive it from the old
+                                                     !< flux-surface-boundary assumption)
   integer,                  intent(in)  :: n_lmap
   real*8,                   intent(in)  :: l_values(n_lmap)
   real*8,                   intent(out) :: psihat_m(n_lmap)
@@ -1084,7 +1148,7 @@ subroutine re_eq_label_map(my_id, node_list, element_list, alpha, n_lmap, l_valu
     write(*,*) 'ERROR: re_eq_label_map: class drift axis not found'
     stop 1
   endif
-  A_edge = alpha_eff * re_eq_R_edge - re_eq_psi_bnd
+  A_edge = A_edge_in
   dpsi   = ES%psi_bnd - ES%psi_axis
 
   ! === Contour-average label map (re_eq_map_mode = 'contour') ================
@@ -1263,7 +1327,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   ph_ctl_max = ph_lev(1)
   do s = 1, re_eq_n_class
     call re_eq_label_map(my_id, node_list, element_list, re_cl_alpha(s), &
-                         re_eq_n_l, re_nprof_l, phm)
+                         re_cl_A_edge(s), re_eq_n_l, re_nprof_l, phm)
 
     ! psihat of the controllable beam interior for this class: labels
     ! beyond re_eq_l_beam carry no current (vacuum annulus), and labels
@@ -1325,14 +1389,24 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
     endif
   endif
 
-  if ((re_eq_l_beam .lt. 1.d0) .and. (re_eq_outer_iter .eq. 1)) then
+  ! --- Where the beam edge actually sits in normalized flux. Reported for
+  !     EVERY configuration (it used to be gated on l_beam < 1, so the
+  !     default wall-limited case never showed it): with a drift-shifted
+  !     label the Ahat = l_beam surface spans a RANGE of psihat_n and its
+  !     mean can sit far inside the wall -- 0.90 on the 10 MeV hollow-q case
+  !     -- which is exactly the flux region the outer loop then cannot
+  !     control. ph_ctl_max is the top of the controllable range, so q above
+  !     it is an OUTCOME, not a match.
+  if (re_eq_outer_iter .eq. 1) then
     write(*,'(A,F7.4,A)') ' re_eq: beam-edge label l_beam = ', re_eq_l_beam, &
       '; per-class beam edge in normalized flux:'
     do s = 1, re_eq_n_class
-      write(*,'(A,I4,A,F8.4)') '        class ', s, ':  psihat_n = ', ph_beam_cl(s)
+      write(*,'(A,I4,A,F8.4,A,ES13.5)') '        class ', s, ':  psihat_n = ', &
+        ph_beam_cl(s), '   A_edge [Wb] = ', re_cl_A_edge(s)
       if (ph_beam_cl(s) .gt. 0.98d0) &
         write(*,'(A)') '        WARNING: beam edge of this class is very close to the wall'
     enddo
+    write(*,'(A,F8.4)') '        q is matched only below psihat_n = ', ph_ctl_max
   endif
 
   ! --- amplitude factor: 1 in full_q mode; least-squares shape amplitude in
@@ -1401,7 +1475,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
       re_nprof(1:re_eq_n_l) = re_eq_best_nprof(1:re_eq_n_l)
       call re_eq_apply_beam_envelope()
       re_eq_reverted = .true.
-      write(RE_EQ_LOG_UNIT,'(I6,I8,3ES16.6)') re_eq_outer_iter, n_inner, err, I_now, maxval(re_cl_lost)
+      write(RE_EQ_LOG_UNIT,'(I6,I8,3ES16.6)') re_eq_outer_iter, n_inner, err, I_now, maxval(re_cl_edge_frac)
       call flush_it(RE_EQ_LOG_UNIT)
       return                          ! caller re-converges psi on the best profile
     endif
@@ -1419,7 +1493,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
     ! Nprof is frozen in this branch, so further outer iterations would only
     ! re-converge and re-evaluate the identical state -- stop the loop here.
     re_eq_done = .true.
-    write(RE_EQ_LOG_UNIT,'(I6,I8,3ES16.6)') re_eq_outer_iter, n_inner, err, I_now, maxval(re_cl_lost)
+    write(RE_EQ_LOG_UNIT,'(I6,I8,3ES16.6)') re_eq_outer_iter, n_inner, err, I_now, maxval(re_cl_edge_frac)
     call flush_it(RE_EQ_LOG_UNIT)
     return
   endif
@@ -1433,15 +1507,15 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
 
   write(*,'(A,I4,A,ES11.3,A,ES13.5,A,ES10.2)') &
     ' re_eq outer ', re_eq_outer_iter, ':  max|q/q_t-1| = ', err, &
-    '   I_RE [A] = ', I_now, '   max lost fraction = ', maxval(re_cl_lost)
+    '   I_RE [A] = ', I_now, '   max edge fraction = ', maxval(re_cl_edge_frac)
   if (trim(re_eq_match_mode) .eq. 'q_shape') &
     write(*,'(A,F10.5)') '                q amplitude (achieved/target) = ', c_amp
-  if (maxval(re_cl_lost) .gt. 5.d-2) &
-    write(*,'(A,ES10.2,A)') ' WARNING: re_eq: ', maxval(re_cl_lost), &
-      ' of the (untapered) current of the worst class lies on drift surfaces'  // &
-      ' leaving the domain and is removed by the edge taper'
+  if (maxval(re_cl_edge_frac) .gt. 2.d-1) &
+    write(*,'(A,ES10.2,A)') ' WARNING: re_eq: ', maxval(re_cl_edge_frac), &
+      ' of the current of the worst class is carried on the outermost 5% of'  // &
+      ' the label range: the beam edge is hard against the loss boundary'
 
-  write(RE_EQ_LOG_UNIT,'(I6,I8,3ES16.6)') re_eq_outer_iter, n_inner, err, I_now, maxval(re_cl_lost)
+  write(RE_EQ_LOG_UNIT,'(I6,I8,3ES16.6)') re_eq_outer_iter, n_inner, err, I_now, maxval(re_cl_edge_frac)
   call flush_it(RE_EQ_LOG_UNIT)
 
   if (converged .or. (re_eq_n_stall .ge. 15) .or. (re_eq_outer_iter .ge. re_eq_max_it_out)) then
@@ -1605,11 +1679,11 @@ subroutine re_eq_write_output(my_id)
   write(iunit,'(A,ES23.15)') 'l_beam  ', re_eq_l_beam
   write(iunit,'(A,ES23.15)') 'l_beam_w', re_eq_l_beam_width
   write(iunit,'(A,ES23.15)') 'R_edge  ', re_eq_R_edge
-  write(iunit,'(A)') '# classes: s  E_kin[eV]  xi  weight  gamma  v_par[m/s]  alpha[Wb/m]  A_axis[Wb]  A_edge[Wb]  R_axis[m]  Z_axis[m]  lost_fraction'
+  write(iunit,'(A)') '# classes: s  E_kin[eV]  xi  weight  gamma  v_par[m/s]  alpha[Wb/m]  A_axis[Wb]  A_edge[Wb]  R_axis[m]  Z_axis[m]  edge_fraction'
   do s = 1, re_eq_n_class
     write(iunit,'(I5,11ES23.15)') s, re_cl_ekin(s), re_cl_xi(s), re_cl_w(s),   &
       re_cl_gamma(s), re_cl_vpar(s), re_cl_alpha(s), re_cl_A_axis(s),          &
-      re_cl_A_edge(s), re_cl_R_axis(s), re_cl_Z_axis(s), re_cl_lost(s)
+      re_cl_A_edge(s), re_cl_R_axis(s), re_cl_Z_axis(s), re_cl_edge_frac(s)
   enddo
   write(iunit,'(A)') '# nprof: l  Nprof(l) [m^-2]'
   do k = 1, re_eq_n_l

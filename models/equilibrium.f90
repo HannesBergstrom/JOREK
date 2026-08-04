@@ -152,7 +152,7 @@ if (my_id == 0) then
     ! --- (the per-class drift axes move while psi converges), and hold the
     ! --- prescribed RE current in q_shape mode
     if (re_kinetic_equilibrium) then
-      call re_eq_update_labels(my_id, node_list, element_list)
+      call re_eq_update_labels(my_id, node_list, element_list, bnd_node_list)
       if (trim(re_eq_match_mode) .eq. 'q_shape') &
         call re_eq_rescale_current(my_id, node_list, element_list)
     endif
@@ -248,7 +248,7 @@ if (my_id == 0) then
   if (re_kinetic_equilibrium) then
 
     call update_equil_state(my_id,node_list, element_list, bnd_elm_list, xpoint, xcase)
-    call re_eq_update_labels(my_id, node_list, element_list)
+    call re_eq_update_labels(my_id, node_list, element_list, bnd_node_list)
 
     n_lev_q = re_eq_n_q_levels
     surface_list_q%n_psi = n_lev_q + 1     ! entry 1 (magnetic axis) is skipped by determine_q_profile
