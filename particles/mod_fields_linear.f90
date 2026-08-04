@@ -9,6 +9,7 @@ use mod_interp
 implicit none
 private
 public jorek_fields_interp_linear, read_jorek_fields_interp_linear, last_file_before_time
+public find_jorek_restart_file
 
 !> Action to read in the fields into sim%fields
 type, extends(action) :: read_jorek_fields_interp_linear
@@ -254,6 +255,33 @@ function new_read_jorek_fields_interp_linear(basename, i, rst_format, stop_at_en
 end function new_read_jorek_fields_interp_linear
 
 
+!> Build the name of the JOREK restart file belonging to step index i.
+!> Every supported index format is tried (6 digits first, then 5 digits), so
+!> that restart files written by older versions of JOREK are found as well.
+!> If no matching file exists, the name in the default (6-digit) format is
+!> returned, so that the caller can report it in an error message.
+function find_jorek_restart_file(basename, i) result(restart_file)
+  use mod_import_restart, only: rst_file_ind_fmt
+  character(len=*), intent(in) :: basename
+  integer,          intent(in) :: i
+  character(len=80) :: restart_file
+  character(len=80) :: tmp_name
+  integer :: i_fmt
+  logical :: file_exists
+
+  do i_fmt=1,size(rst_file_ind_fmt)
+    write(tmp_name,rst_file_ind_fmt(i_fmt)) trim(basename), i
+    restart_file = trim(tmp_name)//'.h5'
+    inquire(file=trim(restart_file), exist=file_exists)
+    if (file_exists) return
+  end do
+
+  ! Nothing found: fall back to the default format for the error message
+  write(tmp_name,rst_file_ind_fmt(1)) trim(basename), i
+  restart_file = trim(tmp_name)//'.h5'
+end function find_jorek_restart_file
+
+
 !> Find the number of the latest restart file < time (SI units)
 !> Perform a bisection method of all the jorek$num.h5 files in the directory
 !> Perhaps better to use xtime if this is always present, combined with a filter
@@ -264,7 +292,7 @@ function last_file_before_time(time) result(file_number)
   real*8, intent(in) :: time
   integer :: file_number
   integer :: i, ierr, my_id, u
-  character(len=5) :: my_id_s, num_s
+  character(len=5) :: my_id_s
   integer, dimension(:), allocatable :: filenums_tmp, filenums
   integer :: n, i_lower, i_guess, i_upper, io
   real*8 :: t_norm, t_lower, t_guess, t_upper
@@ -274,11 +302,14 @@ function last_file_before_time(time) result(file_number)
   if (my_id .eq. 0) then
     write(*,*) "Looking for jorek restart file just before time ", time
 
-    ! Get list of filenumbers
+    ! Get list of filenumbers. The number of digits of the step index is not
+    ! fixed: older restart files use 5 digits, newer ones 6, so take whatever
+    ! sits between the basename and the extension.
     write(my_id_s,"(i0.5)") my_id
-    call execute_command_line("ls jorek[0-9]*.h5 | grep -o '[0-9]\{5\}' > .jorek_filenums."//my_id_s)
+    call execute_command_line("ls jorek[0-9]*.h5 | sed -n 's/^jorek\([0-9]*\)\.h5$/\1/p'"// &
+      " > .jorek_filenums."//my_id_s)
     open(newunit=u,file=".jorek_filenums."//my_id_s)
-    allocate(filenums_tmp(100000)) ! assumes 5-digit numbers
+    allocate(filenums_tmp(100000)) ! maximum number of restart files handled
     n=0
     do i=1,100000
       read(u,*,iostat=io) filenums_tmp(i)
@@ -298,11 +329,9 @@ function last_file_before_time(time) result(file_number)
 
     ! Calculate upper and lower bounds
     i_lower = 1 ! index into filenumber array
-    write(num_s,'(i0.5)') filenums(i_lower)
-    t_lower = get_jorek_hdf5_time('jorek'//num_s//'.h5')*t_norm
+    t_lower = get_jorek_hdf5_time(find_jorek_restart_file('jorek',filenums(i_lower)))*t_norm
     i_upper = n
-    write(num_s,'(i0.5)') filenums(i_upper)
-    t_upper = get_jorek_hdf5_time('jorek'//num_s//'.h5')*t_norm
+    t_upper = get_jorek_hdf5_time(find_jorek_restart_file('jorek',filenums(i_upper)))*t_norm
     i_guess = nint((time-t_lower)/(t_upper-t_lower)*real(i_upper - i_lower)) + i_lower
 
     do i=1,20
@@ -312,8 +341,7 @@ function last_file_before_time(time) result(file_number)
       end if
       if (i_guess .eq. i_lower .or. i_guess .eq. i_upper) exit
 
-      write(num_s,'(i0.5)') filenums(i_guess)
-      t_guess = get_jorek_hdf5_time('jorek'//num_s//'.h5')*t_norm
+      t_guess = get_jorek_hdf5_time(find_jorek_restart_file('jorek',filenums(i_guess)))*t_norm
       if (my_id .eq. 0) write(*,"(i5,A,g14.7,A,i5,A,g14.7,A,i5,A,g14.7,A)") i_lower, " (", t_lower, &
         ")    ", i_guess, " (", t_guess, &
         ")    ", i_upper, " (", t_upper, ")    "
@@ -341,8 +369,18 @@ function get_jorek_hdf5_time(filename) result(time)
   real*8 :: time
   integer(HID_T) :: file
   integer :: hdferr
+  logical :: file_exists
+  inquire(file=trim(filename), exist=file_exists)
+  if (.not. file_exists) then
+    write(*,*) "ERROR: cannot read the time from restart file ", trim(filename), " which does not exist"
+    call exit(1)
+  end if
   call h5open_f(hdferr)
   call h5fopen_f(filename, H5F_ACC_RDONLY_F, file, hdferr)
+  if (hdferr .ne. 0) then
+    write(*,*) "ERROR: cannot open restart file ", trim(filename)
+    call exit(1)
+  end if
   call HDF5_real_reading(file,time,'/t_now')
   call h5fclose_f(file,hdferr)
   call h5close_f(hdferr)
@@ -360,7 +398,7 @@ subroutine do_read(this, sim, ev)
   class(read_jorek_fields_interp_linear), intent(inout) :: this
   type(particle_sim), intent(inout) :: sim
   type(event), intent(inout), optional :: ev
-  character(len=80) :: restart_file, tmp_name
+  character(len=80) :: restart_file
   integer :: i, ierr, my_id,i_nodes,n_nodes
   logical :: file_exists, next_file_found
 
@@ -396,8 +434,7 @@ subroutine do_read(this, sim, ev)
         if (this%i .eq. -1) then
           write(restart_file,'(A,A)') trim(this%basename), '_restart.h5'
         else
-          write(tmp_name,rst_file_ind_fmt(1)) trim(this%basename), this%i
-          write(restart_file,'(A,A)') trim(tmp_name), '.h5'
+          restart_file = find_jorek_restart_file(this%basename, this%i)
         end if
         inquire(file=trim(restart_file), exist=file_exists)
         if (file_exists) then
@@ -429,8 +466,7 @@ subroutine do_read(this, sim, ev)
       else ! Linearly interpolating case
         ! If nothing has been loaded (i.e. fields%time_prev = 0.d0) load the initial file
         if (abs(f%time_prev) .lt. 1.d-50) then
-          write(tmp_name,rst_file_ind_fmt(1)) trim(this%basename), this%i
-          write(restart_file,'(A,A)') trim(tmp_name), '.h5'
+          restart_file = find_jorek_restart_file(this%basename, this%i)
           inquire(file=trim(restart_file), exist=file_exists)
           if (file_exists) then
             call import_hdf5_restart(f%node_list,f%element_list,trim(restart_file),this%rst_format,ierr)
@@ -458,8 +494,7 @@ subroutine do_read(this, sim, ev)
         ! Find the following file (next timestep number)
         next_file_found=.false.
         do i=this%i+1,this%i+20 ! check 20 files ahead
-          write(tmp_name,rst_file_ind_fmt(1)) trim(this%basename), i
-          write(restart_file,'(A,A)') tmp_name, '.h5'
+          restart_file = find_jorek_restart_file(this%basename, i)
           inquire(file=trim(restart_file), exist=file_exists)
           if (file_exists) then
             next_file_found=.true.
