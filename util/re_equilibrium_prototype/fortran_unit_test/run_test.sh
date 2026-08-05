@@ -15,9 +15,16 @@ FC=${FC:-gfortran}
 if [ "$(uname)" = "Darwin" ] && command -v xcrun >/dev/null 2>&1; then
   export LIBRARY_PATH="${LIBRARY_PATH:+$LIBRARY_PATH:}$(xcrun --show-sdk-path)/usr/lib"
 fi
+# mod_re_kinetic_equilibrium calls LAPACK dgesv (the 'operator' transplant
+# variant); link the platform BLAS/LAPACK.
+if [ "$(uname)" = "Darwin" ]; then
+  LAPACK_LIBS="-F$(xcrun --show-sdk-path)/System/Library/Frameworks -framework Accelerate"
+else
+  LAPACK_LIBS="-llapack -lblas"
+fi
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 $FC -ffree-line-length-none -fcheck=bounds -ffpe-trap=invalid,zero,overflow -g \
     -J "$TMP" stubs.f90 ../../../models/mod_re_kinetic_equilibrium.f90 \
-    test_re_eq_unit.f90 -o "$TMP/test_re_eq"
+    test_re_eq_unit.f90 -o "$TMP/test_re_eq" $LAPACK_LIBS
 ( cd "$TMP" && ./test_re_eq )

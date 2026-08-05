@@ -50,7 +50,7 @@ public :: re_kinetic_equilibrium, re_eq_dist_file, re_eq_dist_format,          &
           re_eq_I_RE,                                                          &
           re_eq_xi_min, re_eq_alpha_out, re_eq_tol_q, re_eq_tol_q_soft,        &
           re_eq_edge_taper, re_eq_l_beam, re_eq_l_beam_width,                  &
-          re_eq_ratio_clamp, re_eq_absorbing_edge,                             &
+          re_eq_ratio_clamp, re_eq_absorbing_edge, re_eq_op_lambda,             &
           re_eq_max_it_out, re_eq_n_l, re_eq_n_q_levels, re_eq_n_midplane,     &
           re_eq_finite_pitch
 ! --- driver interface (used by equilibrium.f90 and the GS element assembly)
@@ -117,6 +117,9 @@ logical            :: re_eq_absorbing_edge = .false.  !< force Nprof(Ahat = 1) =
                                                       !< only acts for lraw > 1, and re_eq_nprof_eval
                                                       !< clips to [0,1], so once Nprof(1) = 0 the source
                                                       !< already vanishes at and beyond Ahat = 1.
+real*8             :: re_eq_op_lambda   = 1.d-2       !< smoothness regularization of the 'operator'
+                                                      !< transplant variant (damped least squares on the
+                                                      !< relative Nprof correction); unused otherwise
 real*8             :: re_eq_ratio_clamp = 2.d0        !< per-iteration clamp of the transplant ratio
 integer            :: re_eq_max_it_out  = 50          !< maximum outer iterations
 integer            :: re_eq_n_l         = 101         !< number of points of the Nprof(l) table
@@ -227,6 +230,14 @@ subroutine re_eq_init(my_id)
     write(*,*) 'ERROR: re_eq: T_coef(4) must be nonzero for the analytic temperature'
     write(*,*) '       profile (see the FF_coef note above). Not needed when the'
     write(*,*) '       temperature is read from T_file.'
+    stop 1
+  endif
+
+  if ((trim(re_eq_transplant) .ne. 'cumulative') .and. &
+      (trim(re_eq_transplant) .ne. 'pointwise')  .and. &
+      (trim(re_eq_transplant) .ne. 'operator')) then
+    write(*,*) 'ERROR: re_eq_transplant must be ''cumulative'', ''pointwise'' or'
+    write(*,*) '       ''operator'', got: ', trim(re_eq_transplant)
     stop 1
   endif
 
@@ -1296,6 +1307,187 @@ end subroutine re_eq_label_map
 
 
 !=======================================================================
+!> Linear response operator K(i,k) = dI(psihat_i)/dN_k : the toroidal
+!> current that unit weight of the k-th Nprof basis function puts INSIDE
+!> the flux surface psihat_i.
+!>
+!> This is the object the label map (re_eq_label_map) approximates by a
+!> single psihat per label. The source is EXACTLY linear in the Nprof
+!> coefficients at fixed psi, so K needs no linearization: it is assembled
+!> by binning every Gauss point into (its label interval, its flux level).
+!> The edge factor is folded in, so K describes the current actually
+!> present in the equilibrium (beam envelope and wall cut included).
+!>
+!> Why it matters: a drift surface is NOT a flux surface. It spans a RANGE
+!> of psihat (~0.18 at 10 MeV) and threads a given flux surface only
+!> PARTIALLY. Collapsing that to one psihat per label is what makes the
+!> implicit inverse ill-conditioned and what leaves the outermost labels
+!> free to absorb an arbitrary amplitude. K represents the partial coverage
+!> exactly.
+subroutine re_eq_response_operator(node_list, element_list, n_lev, ph_lev, K)
+  use mod_parameters, only: n_vertex_max, n_degrees
+  use data_structure
+  use equil_info, only: ES
+  use gauss
+  use basis_at_gaussian
+  use mod_model_settings, only: var_psi
+  implicit none
+  type (type_node_list),    intent(in)  :: node_list
+  type (type_element_list), intent(in)  :: element_list
+  integer,                  intent(in)  :: n_lev
+  real*8,                   intent(in)  :: ph_lev(n_lev)
+  real*8,                   intent(out) :: K(n_lev, re_eq_n_l)
+
+  integer :: i, iv, kv, kf, ms, mt, s, j, kk, jb
+  real*8  :: x_g, y_g, x_s, x_t, y_s, y_t, eq_g, xjac, wst
+  real*8  :: lhat, lc, dl, frac, coef, phn, dpsi
+  real*8  :: D(n_lev+1, re_eq_n_l)
+
+  D    = 0.d0
+  dl   = re_nprof_l(2) - re_nprof_l(1)
+  dpsi = ES%psi_bnd - ES%psi_axis
+
+  do i = 1, element_list%n_elements
+    do ms = 1, n_gauss
+      do mt = 1, n_gauss
+        x_g = 0.d0; x_s = 0.d0; x_t = 0.d0
+        y_g = 0.d0; y_s = 0.d0; y_t = 0.d0
+        eq_g = 0.d0
+        do kv = 1, n_vertex_max
+          iv = element_list%element(i)%vertex(kv)
+          do kf = 1, n_degrees
+            x_g = x_g + node_list%node(iv)%x(1,kf,1) * element_list%element(i)%size(kv,kf) * H(kv,kf,ms,mt)
+            y_g = y_g + node_list%node(iv)%x(1,kf,2) * element_list%element(i)%size(kv,kf) * H(kv,kf,ms,mt)
+            x_s = x_s + node_list%node(iv)%x(1,kf,1) * element_list%element(i)%size(kv,kf) * H_s(kv,kf,ms,mt)
+            x_t = x_t + node_list%node(iv)%x(1,kf,1) * element_list%element(i)%size(kv,kf) * H_t(kv,kf,ms,mt)
+            y_s = y_s + node_list%node(iv)%x(1,kf,2) * element_list%element(i)%size(kv,kf) * H_s(kv,kf,ms,mt)
+            y_t = y_t + node_list%node(iv)%x(1,kf,2) * element_list%element(i)%size(kv,kf) * H_t(kv,kf,ms,mt)
+            eq_g = eq_g + node_list%node(iv)%values(1,kf,var_psi) * element_list%element(i)%size(kv,kf) * H(kv,kf,ms,mt)
+          enddo
+        enddo
+        xjac = x_s*y_t - x_t*y_s
+        wst  = wgauss(ms) * wgauss(mt) * abs(xjac)
+
+        ! flux bin: this point lies inside every level with ph_lev >= phn
+        phn = (eq_g - ES%psi_axis) / dpsi
+        jb  = 1
+        do j = 1, n_lev
+          if (ph_lev(j) .gt. phn) exit
+          jb = j + 1
+        enddo
+        if (jb .gt. n_lev) cycle          ! outside every evaluated surface
+
+        do s = 1, re_eq_n_class
+          lhat = (re_cl_alpha(s)*x_g - eq_g - re_cl_A_axis(s)) &
+                 / (re_cl_A_edge(s) - re_cl_A_axis(s))
+          lc   = min(max(lhat, 0.d0), 1.d0)
+          coef = -EL_CHG * re_cl_vpar(s) * re_cl_w(s) &
+                 * re_eq_edge_factor(lhat) / x_g * wst
+          kk   = min(int(lc/dl) + 1, re_eq_n_l - 1)
+          frac = lc/dl - dble(kk-1)
+          D(jb, kk  ) = D(jb, kk  ) + coef * (1.d0 - frac)
+          D(jb, kk+1) = D(jb, kk+1) + coef * frac
+        enddo
+      enddo
+    enddo
+  enddo
+
+  do kk = 1, re_eq_n_l
+    K(1,kk) = D(1,kk)
+    do j = 2, n_lev
+      K(j,kk) = K(j-1,kk) + D(j,kk)
+    enddo
+  enddo
+
+end subroutine re_eq_response_operator
+
+
+!=======================================================================
+!> Outer update via the response operator (re_eq_transplant = 'operator').
+!>
+!> q ~ 1/I_enc (exact in the cylindrical limit; the same relation the
+!> cumulative transplant and re_eq_init_nprof already assume), so the
+!> enclosed current must be rescaled by q/q_t at every level. With
+!> I(psihat) = K N exactly, and writing the update multiplicatively as
+!> N -> N (1 + u) so positivity is preserved and u is dimensionless:
+!>
+!>     M u = q/q_t - 1,      M(i,k) = K(i,k) N_k / I_i
+!>
+!> solved as damped least squares with a second-difference smoothness
+!> penalty of weight re_eq_op_lambda. The ill-posedness that the label map
+!> hid in its null space becomes one explicit regularization parameter.
+!>
+!> With re_eq_absorbing_edge the constraint N(1) = 0 (u(n_l) = -1) is
+!> imposed INSIDE the solve, so the neighbouring labels relax into a
+!> roll-off. That is the difference from the cumulative path, where the
+!> same flag can only zero the last table point afterwards and leaves a
+!> one-interval cliff (which the finite elements then render as an
+!> element-scale ripple of a few percent of the peak current).
+!>
+!> Solved through the normal equations with LAPACK dgesv: the system is
+!> only re_eq_n_l square, and the regularization keeps it well conditioned.
+subroutine re_eq_operator_update(node_list, element_list, n_lev, ph_lev, q_lev, c_amp)
+  use data_structure
+  implicit none
+  type (type_node_list),    intent(in) :: node_list
+  type (type_element_list), intent(in) :: element_list
+  integer,                  intent(in) :: n_lev
+  real*8,                   intent(in) :: ph_lev(n_lev), q_lev(n_lev), c_amp
+
+  integer :: i, k, n_good, info, ipiv(re_eq_n_l)
+  real*8  :: Kop(n_lev, re_eq_n_l), M(n_lev, re_eq_n_l), Ivec(n_lev), rhs(n_lev)
+  real*8  :: L(re_eq_n_l, re_eq_n_l), AtA(re_eq_n_l, re_eq_n_l), Atb(re_eq_n_l)
+  real*8  :: u(re_eq_n_l), qt_at, wcon, umin, umax
+
+  call re_eq_response_operator(node_list, element_list, n_lev, ph_lev, Kop)
+
+  Ivec = matmul(Kop, re_nprof(1:re_eq_n_l))
+  M    = 0.d0;  rhs = 0.d0;  n_good = 0
+  do i = 1, n_lev
+    if (abs(Ivec(i)) .le. 0.d0) cycle
+    n_good  = n_good + 1
+    M(i,:)  = Kop(i,:) * re_nprof(1:re_eq_n_l) / Ivec(i)
+    qt_at   = c_amp * re_eq_qt_eval(ph_lev(i))
+    rhs(i)  = abs(q_lev(i)) / max(abs(qt_at), 1.d-30) - 1.d0
+  enddo
+  if (n_good .eq. 0) return
+
+  ! second-difference smoothness operator (one-sided at the ends)
+  L = 0.d0
+  do k = 2, re_eq_n_l - 1
+    L(k,k-1) =  1.d0;  L(k,k) = -2.d0;  L(k,k+1) = 1.d0
+  enddo
+  L(1,1) = -1.d0;  L(1,2) = 1.d0
+  L(re_eq_n_l,re_eq_n_l-1) = 1.d0;  L(re_eq_n_l,re_eq_n_l) = -1.d0
+
+  AtA = matmul(transpose(M), M) + re_eq_op_lambda * matmul(transpose(L), L)
+  Atb = matmul(transpose(M), rhs)
+
+  if (re_eq_absorbing_edge) then
+    wcon = 1.d3 * max(maxval(abs(M)), 1.d0)
+    AtA(re_eq_n_l,re_eq_n_l) = AtA(re_eq_n_l,re_eq_n_l) + wcon*wcon
+    Atb(re_eq_n_l)           = Atb(re_eq_n_l)           - wcon*wcon
+  endif
+
+  call dgesv(re_eq_n_l, 1, AtA, re_eq_n_l, ipiv, Atb, re_eq_n_l, info)
+  if (info .ne. 0) then
+    write(*,'(A,I6,A)') ' WARNING: re_eq: operator solve failed (dgesv info = ', &
+      info, '); Nprof left unchanged this iteration'
+    return
+  endif
+  u = Atb
+
+  ! same per-iteration bound as the transplant ratio clamp
+  umin = 1.d0/re_eq_ratio_clamp - 1.d0
+  umax = re_eq_ratio_clamp - 1.d0
+  do k = 1, re_eq_n_l
+    u(k) = min(max(u(k), umin), umax)
+    re_nprof(k) = max(re_nprof(k) * (1.d0 + re_eq_alpha_out * u(k)), 0.d0)
+  enddo
+
+end subroutine re_eq_operator_update
+
+!=======================================================================
 !> One outer q-matching update. Takes the q profile computed on psihat
 !> levels (from determine_q_profile on the converged psi), builds the
 !> transplant ratio through the label map and updates Nprof. Sets
@@ -1626,6 +1818,8 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
     re_nprof(1)         = (-1.5d0*C(1) + 2.d0*C(2) - 0.5d0*C(3)) / dl
     re_nprof(re_eq_n_l) = ( 1.5d0*C(re_eq_n_l) - 2.d0*C(re_eq_n_l-1) + 0.5d0*C(re_eq_n_l-2)) / dl
     re_nprof = max(re_nprof, 0.d0)
+  case ('operator')
+    call re_eq_operator_update(node_list, element_list, n_lev, ph_lev, q_lev, c_amp)
   case default
     write(*,*) 'ERROR: unknown re_eq_transplant: ', trim(re_eq_transplant)
     stop 1
