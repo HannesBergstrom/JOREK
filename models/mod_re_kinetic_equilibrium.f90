@@ -50,7 +50,7 @@ public :: re_kinetic_equilibrium, re_eq_dist_file, re_eq_dist_format,          &
           re_eq_I_RE,                                                          &
           re_eq_xi_min, re_eq_alpha_out, re_eq_tol_q, re_eq_tol_q_soft,        &
           re_eq_edge_taper, re_eq_l_beam, re_eq_l_beam_width,                  &
-          re_eq_ratio_clamp,                                                   &
+          re_eq_ratio_clamp, re_eq_absorbing_edge,                             &
           re_eq_max_it_out, re_eq_n_l, re_eq_n_q_levels, re_eq_n_midplane,     &
           re_eq_finite_pitch
 ! --- driver interface (used by equilibrium.f90 and the GS element assembly)
@@ -103,6 +103,20 @@ real*8             :: re_eq_l_beam      = 1.d0        !< beam-edge label: the RE
                                                       !< the beam; q in the vacuum annulus is an output.
 real*8             :: re_eq_l_beam_width = 0.1d0      !< label width of the smoothstep roll-off of the beam
                                                       !< current inside [l_beam - width, l_beam]
+logical            :: re_eq_absorbing_edge = .false.  !< force Nprof(Ahat = 1) = 0, i.e. treat the last
+                                                      !< confined drift surface as an ABSORBING boundary
+                                                      !< for the RE density. Off by default. Intended for
+                                                      !< cases whose domain extends past the LCFS, where
+                                                      !< Ahat = 1 lies in the open-field-line region and
+                                                      !< the constraint therefore costs nothing where q_t
+                                                      !< is demanded. On a domain that IS the LCFS (no
+                                                      !< vacuum region, e.g. re_kin_equil_600) it deletes
+                                                      !< current exactly where q_t needs it and is very
+                                                      !< expensive -- do not enable there.
+                                                      !< NOTE it makes re_eq_edge_taper INERT: the taper
+                                                      !< only acts for lraw > 1, and re_eq_nprof_eval
+                                                      !< clips to [0,1], so once Nprof(1) = 0 the source
+                                                      !< already vanishes at and beyond Ahat = 1.
 real*8             :: re_eq_ratio_clamp = 2.d0        !< per-iteration clamp of the transplant ratio
 integer            :: re_eq_max_it_out  = 50          !< maximum outer iterations
 integer            :: re_eq_n_l         = 101         !< number of points of the Nprof(l) table
@@ -230,6 +244,10 @@ subroutine re_eq_init(my_id)
   write(*,'(A,A)')      '   match mode           : ', trim(re_eq_match_mode)
   write(*,'(A,A)')      '   transplant variant   : ', trim(re_eq_transplant)
   write(*,'(A,A)')      '   label map            : ', trim(re_eq_map_mode)
+  if (re_eq_absorbing_edge) then
+    write(*,'(A)')      '   absorbing edge       : ON  (Nprof(Ahat=1) = 0;'
+    write(*,'(A)')      '                          re_eq_edge_taper has no effect)'
+  endif
   write(*,*) '    s    E_kin[eV]      xi        weight     gamma      v_par[m/s]     d_s'
   do s = 1, re_eq_n_class
     d_s = re_cl_alpha(s) / (B0 * amin)
@@ -1638,6 +1656,16 @@ subroutine re_eq_apply_beam_envelope()
   ! EVALUATION time (re_eq_edge_factor), never to the table.
   implicit none
   integer :: k
+  ! Absorbing edge: the last confined drift surface carries no density. This
+  ! is the one place every profile-modifying path (transplant, edge polish,
+  ! initial guess) passes through, so enforcing it here covers them all.
+  ! In the cumulative transplant this is a post-hoc zero of the last table
+  ! point: the update is explicit and pointwise, so the NEIGHBOURS do not
+  ! adapt and the profile meets zero across one table interval rather than
+  ! rolling off. Prototype (hollow 10 MeV): the jump at the beam edge falls
+  ! from 0.94 to 0.28 of the profile peak. A true roll-off needs the
+  ! constraint imposed inside a solve, i.e. the response-operator update.
+  if (re_eq_absorbing_edge) re_nprof(re_eq_n_l) = 0.d0
   if (re_eq_l_beam .ge. 1.d0) return
   do k = 1, re_eq_n_l
     if (re_nprof_l(k) .gt. re_eq_l_beam) re_nprof(k) = 0.d0
