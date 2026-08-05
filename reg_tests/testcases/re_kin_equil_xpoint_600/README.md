@@ -38,7 +38,7 @@ finite shape widths, negligible T/rho) follows `re_kin_equil_600`.
 
 ## Physics checks (once it runs)
 
-* `re_eq_convergence.log` converges (hard or soft) with `lost_fraction = 0`
+* `re_eq_convergence.log` converges (hard or soft) with `edge_fraction` small
   (beam confined inside the separatrix).
 * The drift axis and beam sit inside the LCFS; per-class beam-edge `psihat`
   reported at iteration 1 should be < 0.98 (clear of the separatrix).

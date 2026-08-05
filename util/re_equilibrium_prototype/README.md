@@ -59,9 +59,17 @@ data, lost-current fractions), `<output>_convergence.log`.
    linearly with momentum (cf. Bandaru & Hoelzl Fig. 1; the quantitative
    5%-tolerance figure comparison requires their exact current profile and is
    part of the in-code test suite).
-3. **q-matching**: mono 20 MeV, mono 60 MeV, and an 8-node two-decade
-   exponential spectrum all converge to `max|q/q_t - 1| < 1e-3` in **10 outer
-   iterations** (alpha_out = 0.3), in both `full_q` and `q_shape` modes.
+3. **q-matching**: mono 20 MeV, mono 35 MeV, and an 8-node two-decade
+   exponential spectrum all converge in both `full_q` and `q_shape` modes
+   (alpha_out = 0.3): the 20 MeV and spectrum cases to
+   `max|q/q_t - 1| < 1e-3` in **10 outer iterations**, the 35 MeV case to
+   2.0e-3 in 27. The convergence metric covers the FULL evaluated psihat
+   range; it was previously restricted to the beam-edge label range, which
+   understated the error by ~5x once the drift smearing is wide (the former
+   60 MeV case read 2.4e-3 but is really at 1.2e-2). That floor is set by the
+   psihat span of a drift surface: the map Nprof(Ahat) -> I(psihat) smooths
+   over ~|alpha| (R_out - R_in) / |dpsi|, so target structure finer than that
+   cannot be represented, worst at the edge and growing with class energy.
 
 ## M0 findings that the in-code implementation MUST carry over
 

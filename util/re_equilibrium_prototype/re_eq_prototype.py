@@ -364,9 +364,12 @@ class REEquilibrium:
         self.label_map = label_map
         self.alpha_in, self.tol_in, self.max_it_in = alpha_in, tol_in, max_it_in
         self.alpha_out, self.tol_q, self.max_it_out = alpha_out, tol_q, max_it_out
-        if transplant not in ('cumulative', 'pointwise'):
+        if transplant not in ('cumulative', 'pointwise', 'operator'):
             raise ValueError(f"unknown transplant variant '{transplant}'")
         self.transplant = transplant
+        # regularization of the 'operator' variant (damped least squares on
+        # the relative Nprof correction); unused by the map-based variants
+        self.op_lambda = 1.0e-2
         # Truncation policy for drift surfaces leaving the domain (Ahat > 1):
         # their current is REMOVED (RE orbits crossing the wall are lost),
         # with a linear taper of width edge_taper in the label for numerical
@@ -405,7 +408,7 @@ class REEquilibrium:
         psi_ax = psi[0, :].mean()
         return 'min' if psi_ax > self.gs.psi_b else 'max'
 
-    def _A_edge_from_boundary(self, s, kind):
+    def _A_edge_from_boundary(self, alpha, kind):
         """A of the last drift surface that does NOT reach the loss boundary:
         the extremum of A_s = alpha_s R - psi over the boundary nodes.
 
@@ -424,7 +427,7 @@ class REEquilibrium:
         increases outwards, so confined surfaces are those with A below the
         boundary minimum (and vice versa for 'max')."""
         R_b = self.gs.R0 + self.gs.a * np.cos(self.gs.th)
-        A_b = self.cl.alpha[s] * R_b - self.gs.psi_b
+        A_b = alpha * R_b - self.gs.psi_b
         return A_b.min() if kind == 'min' else A_b.max()
 
     def update_labels(self, psi):
@@ -436,7 +439,7 @@ class REEquilibrium:
             R_ax, Z_ax, A_ax = self.gs.find_extremum(A, kind)
             self.ax_RZ[s] = (R_ax, Z_ax)
             self.A_ax[s] = A_ax
-            self.A_edge[s] = self._A_edge_from_boundary(s, kind)
+            self.A_edge[s] = self._A_edge_from_boundary(self.cl.alpha[s], kind)
             if self.A_edge[s] == self.A_ax[s]:
                 raise RuntimeError(f"class {s}: degenerate label normalization")
 
@@ -539,7 +542,9 @@ class REEquilibrium:
         Surfaces are traced by 1D root finding along rays from the psi axis
         (valid for the nested surfaces of this fixed-boundary prototype)."""
         if psihat_levels is None:
-            psihat_levels = np.linspace(0.02, 0.985, 80)
+            # q_lev_max lets a caller restrict the demanded range (the gap-scan
+            # experiment: how far inside the loss boundary q_t is asked for)
+            psihat_levels = np.linspace(0.02, getattr(self, 'q_lev_max', 0.985), 80)
         R_ax, Z_ax, psi_ax = self.psi_axis()
         dpsi = self.gs.psi_b - psi_ax
         gR, gZ = self.gs.grad(self.psi)
@@ -610,7 +615,7 @@ class REEquilibrium:
 
         A = alpha_e * self.gs.RR - self.psi
         _, _, A_ax = self.gs.find_extremum(A, kind)
-        A_edge = alpha_e * (self.gs.R0 + self.gs.a) - self.gs.psi_b
+        A_edge = self._A_edge_from_boundary(alpha_e, kind)
 
         lhat = ((A - A_ax) / (A_edge - A_ax)).ravel()
         phn = np.clip((self.psi.ravel() - psi_ax) / dpsi, 0.0, 1.0)
@@ -652,7 +657,7 @@ class REEquilibrium:
         i_ax = np.argmin(Ag) if kind == 'min' else np.argmax(Ag)
         R_dax = Rg[i_ax]
         A_ax = Ag[i_ax]
-        A_edge = alpha_e * (self.gs.R0 + self.gs.a) - self.gs.psi_b
+        A_edge = self._A_edge_from_boundary(alpha_e, kind)
         lhat = (Ag - A_ax) / (A_edge - A_ax)
 
         # small negative values can occur when the fitted psi_ax differs
@@ -687,6 +692,142 @@ class REEquilibrium:
     # outer iteration keeps the update monotone while barely slowing
     # convergence from a good initial guess.
     RATIO_CLAMP = 2.0
+
+    # --- linear response operator (transplant='operator') --------------------
+    def response_operator(self, psihat_levels):
+        """K[i,k] = dI(psihat_i)/dN_k : the toroidal current that unit weight
+        of the k-th Nprof basis function puts INSIDE the flux surface
+        psihat_i.
+
+        This is the object the delta-map (label_to_psihat) approximates. The
+        source is *exactly linear* in the Nprof coefficients at fixed psi,
+
+            j_phi(x) = sum_k N_k [ -e sum_s v_par,s w_s B_k(Ahat_s(x))
+                                    * taper(Ahat_s(x)) / R(x) ]
+
+        so K needs no linearization: it is assembled by binning every grid
+        point into (its label interval, its flux level) and accumulating.
+        Nprof(l) = sum_k N_k B_k(clip(l,0,1)) with B_k the hat basis of the
+        table, and the edge factor is folded in so K describes the current
+        that is actually in the equilibrium (beam envelope + wall cut).
+
+        Why this matters: a drift surface is NOT a flux surface -- it spans a
+        RANGE of psihat (0.82..0.99 at 10 MeV) and threads a given flux
+        surface only PARTIALLY. Collapsing that to one psihat per label is
+        what makes the implicit inverse ill-conditioned (null-space ripple at
+        the beam edge) and what creates the reachability gap that drives the
+        transplant to over-shoot the outermost labels. K represents the
+        partial coverage exactly, so no clamp, no map mode and no
+        energy-dependent ratio smoothing are needed.
+        """
+        psi = self.psi
+        _, _, psi_ax = self.psi_axis()
+        phn = ((psi - psi_ax) / (self.gs.psi_b - psi_ax)).ravel()
+        dA = (self.gs.r[:, None] * self.gs.dr * self.gs.dth
+              * np.ones_like(self.gs.th)[None, :]).ravel()
+        Rg = self.gs.RR.ravel()
+
+        l_grid = self.nprof.l
+        n_l = len(l_grid)
+        dl = l_grid[1] - l_grid[0]
+        lev = np.asarray(psihat_levels, dtype=float)
+        n_lev = len(lev)
+
+        # flux bin of every point: points with phn < lev[j] contribute to all
+        # levels >= j, so accumulate differentially and cumulate afterwards
+        jbin = np.searchsorted(lev, phn)
+
+        D = np.zeros((n_lev + 1, n_l))
+        for s in range(self.cl.n_s):
+            l_raw = self.Ahat(s, psi, clip=False).ravel()
+            lc = np.clip(l_raw, 0.0, 1.0)
+            coef = (-EL_CHG * self.cl.v_par[s] * self.cl.w[s]
+                    * self._taper(l_raw) * dA / Rg)
+            idx = np.clip((lc / dl).astype(int), 0, n_l - 2)
+            frac = lc / dl - idx
+            np.add.at(D, (jbin, idx), coef * (1.0 - frac))
+            np.add.at(D, (jbin, idx + 1), coef * frac)
+        return np.cumsum(D, axis=0)[:n_lev]
+
+    def _operator_update(self, ph, q_now, c, lam, absorbing=False):
+        """Relative Nprof correction u from the response operator.
+
+        q ~ 1/I_enc (exact in the cylindrical limit; the same relation the
+        cumulative transplant and init_nprof_from_qt already assume), so the
+        enclosed current must be rescaled by q/q_t at every level. With
+        I(psihat) = K N exactly, and writing the update multiplicatively as
+        N -> N (1 + u) so that positivity is preserved and u is dimensionless:
+
+            M u = q/q_t - 1,     M[i,k] = K[i,k] N_k / I_i
+
+        solved as damped least squares with a second-difference smoothness
+        penalty. The ill-posedness that the delta-map hid in its null space
+        is now explicit in one regularization parameter instead of an
+        energy-dependent ratio-smoothing width.
+        """
+        N = self.nprof.N
+        K = self.response_operator(ph)
+        I = K @ N
+        good = np.abs(I) > 0.0
+        M = (K * N[None, :])[good] / I[good, None]
+        rhs = np.abs(q_now[good]) / np.abs(c * self.qt(ph[good])) - 1.0
+
+        n_l = len(N)
+        L = (np.diag(np.full(n_l, -2.0)) + np.diag(np.ones(n_l - 1), 1)
+             + np.diag(np.ones(n_l - 1), -1))
+        L[0, :2] = [-1.0, 1.0]
+        L[-1, -2:] = [1.0, -1.0]
+        rows = [M, np.sqrt(lam) * L]
+        rhs_rows = [rhs, np.zeros(n_l)]
+
+        # Magnitude prior on the UNCONTROLLED labels. The operator makes each
+        # label's leverage on the demanded q explicit -- it is the column norm
+        # of M -- and labels near the loss boundary have almost none, because
+        # their drift surfaces lie mostly outside the outermost demanded flux
+        # surface. Nothing in the data then holds them down, so the solve is
+        # free to pile amplitude there: measured N(1)/Nmax = 1.000 regardless
+        # of where q_t is demanded (0.80 ... 0.985), i.e. the edge spike is
+        # driven by absence of leverage, NOT by the q target.
+        # So supply the missing information as a prior instead of as a hard
+        # boundary condition: shrink Nprof towards zero with a weight that
+        # grows as the leverage vanishes. Where q has a say this is inert;
+        # where it has none it replaces an arbitrary answer with a physical
+        # one (the density cannot keep rising onto orbits that are about to
+        # be lost). Unlike Nprof(1) = 0 this needs no assumption about where
+        # the loss boundary sits relative to the LCFS.
+        # NOTE the leverage must be measured on K, NOT on M. M[i,k] =
+        # K[i,k] N_k / I_i is proportional to N_k, so scoring leverage with it
+        # marks any label where Nprof happens to be SMALL as uncontrolled and
+        # shrinks it further -- positive feedback that hollows out the tail
+        # while protecting the spike (which, having large N, scores as high
+        # leverage). Measured: it crushed l = 0.80..0.98 to <0.05 and left
+        # N(1)/Nmax = 1.000 untouched. ||K[:,k]|| is the current per unit N
+        # that label k puts inside the demanded surfaces: purely geometric,
+        # independent of the profile being solved for.
+        mu = getattr(self, 'op_mu', 0.0)
+        if mu > 0.0:
+            lev = np.linalg.norm(K[good], axis=0)
+            lev = lev / max(lev.max(), 1e-300)
+            # (1-lev)^2 is too blunt: 0.46 at l=0.70 vs 0.84 at l=1.00, under 2x
+            # contrast, so it shrinks the whole outer half instead of the
+            # uncontrolled tail. The penalty has to DIVERGE as the leverage
+            # vanishes, so that it dominates exactly where the data does not.
+            w = mu * (1.0 / np.maximum(lev, 1e-3) - 1.0)
+            rows.append(np.diag(w))
+            rhs_rows.append(-w)
+        if absorbing:
+            # N_new[-1] = 0  <=>  u[-1] = -1, imposed as a heavily weighted row
+            # INSIDE the solve so the neighbouring labels adapt to it. Stamping
+            # N[-1] = 0 on afterwards does not work: the next iteration simply
+            # refills the last point and the neighbours never learn, leaving a
+            # one-interval cliff instead of a roll-off.
+            w = 1.0e3 * max(np.abs(M).max(), 1.0)
+            e = np.zeros((1, n_l)); e[0, -1] = w
+            rows.append(e); rhs_rows.append(np.array([-w]))
+        A = np.vstack(rows)
+        b = np.concatenate(rhs_rows)
+        u, *_ = np.linalg.lstsq(A, b, rcond=None)
+        return u
 
     def match_q(self):
         """Outer q-matching loop: multiplicative profile transplant with
@@ -794,28 +935,56 @@ class REEquilibrium:
             ratio = np.exp(log_ratio)
 
             # Convergence metric: compare q and q_t directly on the psihat
-            # levels of the q diagnostic (this is the actual goal), restricted
-            # to the range controllable through the label maps. The mapped
-            # ratio above is only used to PLACE the update on the l grid.
+            # levels of the q diagnostic (this is the actual goal), over the
+            # FULL evaluated range. The mapped ratio above is only used to
+            # PLACE the update on the l grid.
+            # It used to be restricted to ph <= ph_ctl on the reasoning that q
+            # above the beam-edge label is uncontrollable. That does not hold:
+            # ph_beam = phm[-1] and phm is monotone, so phm <= ph_beam for
+            # every label and the clamp on the ratio evaluation never binds at
+            # l_beam = 1. The transplant already matches q over the whole
+            # range, so restricting only the METRIC hid the worst region
+            # (7.9e-3 reported for a state whose true worst error was 9.1e-3).
+            # err_ctl is kept alongside so the split stays visible.
+            err = np.abs(q_now / (c * self.qt(ph)) - 1.0).max()
             mctl = ph <= ph_ctl
-            err = np.abs(q_now[mctl] / (c * self.qt(ph[mctl])) - 1.0).max()
+            err_ctl = np.abs(q_now[mctl] / (c * self.qt(ph[mctl])) - 1.0).max()
 
             # --- best-iterate tracking and stagnation detection: with one
             # common Nprof and strongly different class maps, exactly
             # matching q_t can be outside the range of the ansatz; keep the
             # best profile and stop when no longer improving.
-            if err < 0.98 * best_err:
-                best_err, best_N, n_stall = err, self.nprof.N.copy(), 0
+            # The two errors have DIFFERENT roles and must not be conflated:
+            #   err     (full range) -> the VERDICT (convergence / soft tol),
+            #                           so tol_q means what it says;
+            #   err_ctl (in beam)    -> the OBJECTIVE (best iterate, stall,
+            #                           revert-on-worsening).
+            # Driving best-iterate/stall with the full-range error makes the
+            # solver trade away accuracy where the transplant HAS leverage in
+            # order to chase a residual it cannot move. Measured on mono
+            # 60 MeV: that degraded the achievable in-beam match from 2.4e-3
+            # to 1.4e-2 and made the tail diverge, while the full-range error
+            # floors at ~1.2e-2 regardless, to be REPORTED, not chased: the
+            # map Nprof(Ahat) -> I(psihat) is a smoothing operator whose width
+            # is the psihat span of a drift surface (~0.18 at 10 MeV, scaling
+            # with |alpha|), so finer target structure is outside its range.
+            # Both cases are MONO-ENERGETIC -- this is not about sharing one
+            # Nprof between classes, and per-class profiles would change
+            # nothing.
+            if err_ctl < 0.98 * best_err:
+                best_err, best_N, n_stall = err_ctl, self.nprof.N.copy(), 0
             else:
                 n_stall += 1
             I_now = self.total_current(self.psi)
             self.log.append(dict(outer=outer, inner_iters=n_in,
                                  inner_res=res_in, q_err=err, I_RE=I_now,
                                  q_amplitude=c,
+                                 q_err_ctl=err_ctl,
                                  lost=self.edge_fraction.max()))
             if self.verbose:
                 print(f"  outer {outer:3d}: inner {n_in:3d} (res {res_in:.2e})"
-                      f"  max|q/q_t-1| = {err:.3e}  I_RE = {I_now/1e6:8.4f} MA"
+                      f"  max|q/q_t-1| = {err:.3e} (in beam {err_ctl:.3e})"
+                      f"  I_RE = {I_now/1e6:8.4f} MA"
                       + (f"  q-ampl = {c:.4f}" if self.match_mode == 'q_shape' else "")
                       + (f"  edge = {self.edge_fraction.max():.2e}"
                          if self.edge_fraction.max() > 0 else ""))
@@ -824,13 +993,14 @@ class REEquilibrium:
                 # Nprof (short-wavelength structure near l=1 is nearly
                 # invisible to q but imprints oscillations on the edge
                 # current density), then re-converge psi and re-evaluate
-                if best_err < err:
+                if best_err < err_ctl:
                     self.nprof.N = best_N
                 self._smooth_nprof()
                 self.picard()
                 ph, q_now = self.q_profile()
+                err = np.abs(q_now / (c * self.qt(ph)) - 1.0).max()
                 mctl = ph <= ph_ctl
-                err = np.abs(q_now[mctl] / (c * self.qt(ph[mctl])) - 1.0).max()
+                err_ctl = np.abs(q_now[mctl] / (c * self.qt(ph[mctl])) - 1.0).max()
                 # revert-on-worsening: the edge polish is nearly q-invisible
                 # only where the label map is accurate (the circular case it
                 # was tuned for); with a less accurate map (shaped plasmas)
@@ -838,23 +1008,38 @@ class REEquilibrium:
                 # the polish may WORSEN the match. Never lose a match the
                 # transplant already achieved -- restore the unpolished best
                 # profile and re-converge in that case.
-                if best_N is not None and err > best_err:
+                if best_N is not None and err_ctl > best_err:
                     if self.verbose:
                         print(f"  finishing: polish worsened max|q/q_t-1| "
-                              f"({best_err:.3e} -> {err:.3e}); reverting to best")
+                              f"({best_err:.3e} -> {err_ctl:.3e}); reverting to best")
                     self.nprof.N = best_N.copy()
                     self._apply_beam_envelope()
                     self.picard()
                     ph, q_now = self.q_profile()
+                    err = np.abs(q_now / (c * self.qt(ph)) - 1.0).max()
                     mctl = ph <= ph_ctl
-                    err = np.abs(q_now[mctl] / (c * self.qt(ph[mctl])) - 1.0).max()
+                    err_ctl = np.abs(q_now[mctl] / (c * self.qt(ph[mctl])) - 1.0).max()
                 if self.verbose:
                     print(f"  finishing after {outer} outer iterations: "
                           f"final max|q/q_t-1| = {err:.3e}")
                 self.log.append(dict(outer=outer, inner_iters=0, inner_res=0.0,
-                                     q_err=err, I_RE=self.total_current(self.psi),
+                                     q_err=err, q_err_ctl=err_ctl,
+                                     I_RE=self.total_current(self.psi),
                                      q_amplitude=c, lost=self.edge_fraction.max()))
                 return err < self.tol_q
+            if self.transplant == 'operator':
+                # Response-operator update: the label map above is still
+                # evaluated, but ONLY for the ph_ctl / err_ctl diagnostic --
+                # it no longer places the update.
+                u = self._operator_update(ph, q_now, c, self.op_lambda,
+                                          absorbing=getattr(self, 'absorbing_edge', False))
+                u = np.clip(u, 1.0 / self.RATIO_CLAMP - 1.0,
+                            self.RATIO_CLAMP - 1.0)
+                self.nprof.N = np.clip(self.nprof.N * (1.0 + self.alpha_out * u),
+                                       0.0, None)
+                self._apply_beam_envelope()
+                continue
+
             ratio = np.clip(ratio, 1.0 / self.RATIO_CLAMP, self.RATIO_CLAMP)
             # smooth the log-ratio (Nprof is smooth; single-point features in
             # the measured ratio are q-evaluation artifacts, and feeding them
@@ -872,6 +1057,8 @@ class REEquilibrium:
                 C *= factor
                 N_new = np.gradient(C, l, edge_order=2)
                 self.nprof.N = np.clip(N_new, 0.0, None)
+            if getattr(self, 'absorbing_edge', False):
+                self.nprof.N[-1] = 0.0
             self._apply_beam_envelope()
         if best_N is not None and best_err < np.inf:
             self.nprof.N = best_N
@@ -1031,11 +1218,12 @@ class REEquilibrium:
             for l, N in zip(self.nprof.l, self.nprof.N):
                 f.write(f"{l:10.6f} {N:14.6e}\n")
         with open(basename + '_convergence.log', 'w') as f:
-            f.write("# outer  inner_iters  inner_res  max|q/qt-1|  I_RE[A]  "
-                    "q_amplitude  max_edge_fraction\n")
+            f.write("# outer  inner_iters  inner_res  max|q/qt-1|  "
+                    "q_err_in_beam  I_RE[A]  q_amplitude  max_edge_fraction\n")
             for rec in self.log:
                 f.write(f"{rec['outer']:5d} {rec['inner_iters']:6d} "
                         f"{rec['inner_res']:12.4e} {rec['q_err']:12.4e} "
+                        f"{rec['q_err_ctl']:12.4e} "
                         f"{rec['I_RE']:14.6e} {rec['q_amplitude']:10.5f} "
                         f"{rec['lost']:12.4e}\n")
 

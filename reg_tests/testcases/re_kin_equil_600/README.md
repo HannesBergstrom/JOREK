@@ -22,7 +22,15 @@ Tests the `re_kinetic_equilibrium` feature end to end with model 600 and the
 Physics checks when preparing/updating the reference data:
 
 * `re_eq_convergence.log` must end with max|q/q_t - 1| < 1e-3 (typically
-  ~10 outer iterations).
+  ~10 outer iterations). NOTE: this metric now covers the FULL evaluated
+  psihat range. It used to be restricted to the "label-controllable" range
+  psihat <= ph_ctl_max, which was based on a false premise (the clamp on the
+  ratio evaluation never binds at l_beam = 1, so the transplant always
+  matched the whole range) and hid the region where the match is worst. The
+  log carries both: column 3 `max|q/qt-1|` is the full-range value that
+  decides convergence, column 4 `q_err_in_beam` is the old restricted value.
+  Expect column 3 to be somewhat larger than the historical numbers, so a
+  case sitting just under `re_eq_tol_q` may now need more outer iterations.
 * Current on drift orbits leaving the domain is REMOVED (linear taper of
   width `re_eq_edge_taper` in the label beyond the last closed surface):
   RE orbits crossing the wall are lost, and the marker loader applies the

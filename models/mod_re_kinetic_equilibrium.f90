@@ -147,7 +147,9 @@ real*8  :: re_eq_psi_bnd = 0.d0         !< boundary psi used in the labels
 real*8  :: re_eq_q_err   = 1.d99        !< latest max|q/q_t - 1|
 real*8  :: re_eq_I_now   = 0.d0         !< latest RE current [A]
 !> best-iterate tracking / stagnation handling of the outer loop
-real*8              :: re_eq_best_err = 1.d99   !< best max|q/q_t - 1| so far
+real*8              :: re_eq_best_err = 1.d99   !< best IN-BEAM max|q/q_t - 1| so far
+                                                 !< (the controllable objective; the verdict
+                                                 !<  uses the full-range error, see below)
 real*8, allocatable :: re_eq_best_nprof(:)      !< Nprof of the best iterate
 integer             :: re_eq_n_stall  = 0       !< outer iterations without improvement
 logical :: re_eq_finishing     = .false.        !< best profile restored; final evaluation pass
@@ -236,7 +238,7 @@ subroutine re_eq_init(my_id)
   enddo
 
   open(RE_EQ_LOG_UNIT, file='re_eq_convergence.log', action='write', status='replace')
-  write(RE_EQ_LOG_UNIT,'(A)') '# outer  inner_iters  max|q/qt-1|   I_RE[A]        max_edge_fraction'
+  write(RE_EQ_LOG_UNIT,'(A)') '# outer  inner_iters  max|q/qt-1|   q_err_in_beam   I_RE[A]        max_edge_fraction'
 
   re_eq_outer_iter  = 0
   re_eq_initialized = .true.
@@ -1308,7 +1310,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   real*8  :: phm(re_eq_n_l), phe, q_at, qt_at, ratio(re_eq_n_l), lr(re_eq_n_l)
   real*8  :: q_acc(re_eq_n_l), qt_acc(re_eq_n_l)
   real*8  :: cw(re_eq_n_class), cw_sum, ph_beam_cl(re_eq_n_class)
-  real*8  :: c_amp, num, den, err, I_now, ph_ctl_max, ph_beam, l_eff
+  real*8  :: c_amp, num, den, err, err_ctl, I_now, ph_ctl_max, ph_beam, l_eff
   real*8  :: C(re_eq_n_l), dl, qq
 
   re_eq_outer_iter = re_eq_outer_iter + 1
@@ -1441,21 +1443,61 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
     ratio(k) = min(max(exp(lr(k)), 1.d0/re_eq_ratio_clamp), re_eq_ratio_clamp)
   enddo
 
-  ! --- convergence metric directly in q space, restricted to the
-  !     label-controllable psihat range
-  err = 0.d0
+  ! --- Convergence metric directly in q space, over the FULL evaluated
+  !     psihat range. It used to be restricted to ph_lev(i) <= ph_ctl_max, on
+  !     the reasoning that q above the beam-edge label is uncontrollable. That
+  !     reasoning does not hold: ph_beam = phm(re_eq_n_l) and phm is forced
+  !     monotone, so phm(k) <= ph_beam for every label and the clamp on the
+  !     ratio evaluation above NEVER binds when l_beam = 1. The transplant is
+  !     therefore already matching q across the whole label range, and
+  !     restricting only the METRIC just hid the region where the match is
+  !     worst -- reporting e.g. 7.9e-3 for a state whose true worst-case error
+  !     was 9.1e-3, i.e. the difference between passing re_eq_tol_q and not.
+  !     err_ctl is kept and reported alongside so the split stays visible.
+  err     = 0.d0
+  err_ctl = 0.d0
   do i = 1, n_lev
-    if (ph_lev(i) .le. ph_ctl_max) then
-      qq  = q_lev(i) / (c_amp * re_eq_qt_eval(ph_lev(i)))
-      err = max(err, abs(qq - 1.d0))
-    endif
+    qq  = q_lev(i) / (c_amp * re_eq_qt_eval(ph_lev(i)))
+    err = max(err, abs(qq - 1.d0))
+    if (ph_lev(i) .le. ph_ctl_max) err_ctl = max(err_ctl, abs(qq - 1.d0))
   enddo
   re_eq_q_err = err
   converged   = (err .lt. re_eq_tol_q)
 
-  ! --- best-iterate tracking and stagnation detection: with one common
-  !     Nprof and strongly different class maps, exactly matching q_t can
-  !     be outside the range of the ansatz. Keep the best profile; when no
+  ! --- The two errors have DIFFERENT roles and must not be conflated:
+  !       err     (full range)  -> the VERDICT: convergence and the soft
+  !                               tolerance, so re_eq_tol_q means what it says
+  !                               and no run can claim success on the strength
+  !                               of a region that was never reported.
+  !       err_ctl (in the beam) -> the OBJECTIVE: best-iterate tracking,
+  !                               stagnation and revert-on-worsening.
+  !     Driving the best-iterate/stall logic with the full-range error makes
+  !     the solver trade away accuracy where the transplant HAS leverage in
+  !     order to chase a residual it cannot move (the flux region only
+  !     partially covered by the outermost drift surfaces). Measured on the
+  !     mono 60 MeV prototype case: doing so degraded the achievable in-beam
+  !     match from 2.4e-3 to 1.4e-2 and made the tail diverge. The full-range
+  !     error there floors at ~1.2e-2 whatever the solver does, and the right
+  !     response is to REPORT it rather than chase it.
+  !
+  !     WHY it floors: the map from Nprof(Ahat) to the enclosed current
+  !     I(psihat) is a SMOOTHING operator. A drift surface spans a range of
+  !     psihat -- |alpha| (R_out - R_in) / |psi_bnd - psi_axis|, about 0.18 at
+  !     10 MeV -- and threads a given flux surface only partially, so
+  !     structure in the target finer than that width lies outside the
+  !     operator's effective range. The width scales with |alpha|, i.e. with
+  !     the class ENERGY, which is why 20 MeV matches to 1e-4 and 60 MeV
+  !     cannot. It has NOTHING to do with how many classes there are: both of
+  !     the cases above are MONO-ENERGETIC, so nothing is being shared and a
+  !     per-class Nprof would change nothing. (The multi-class disparity noted
+  !     below is a genuine but SEPARATE effect.) The failure is also local:
+  !     the gross shape of a target varying over ~0.5 in psihat is matched
+  !     fine; it is the EDGE, where only the outermost -- and most smeared --
+  !     labels reach, that cannot be resolved.
+  ! --- best-iterate tracking and stagnation detection: exactly matching q_t
+  !     can be outside the range of the ansatz -- through the smearing above,
+  !     and additionally, for a MULTI-class distribution, because one common
+  !     Nprof must serve strongly different class maps. Keep the best profile; when no
   !     longer improving, restore it and finish (the caller runs one more
   !     inner Picard pass on the restored profile, in which this routine
   !     only re-evaluates the error and decides on soft acceptance).
@@ -1468,14 +1510,14 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
     !     the match. In that case revert to the unpolished best profile and
     !     re-converge once more, then accept that -- the polish must never
     !     lose a match the transplant had already achieved.
-    if ((.not. re_eq_reverted) .and. (err .gt. re_eq_best_err)) then
+    if ((.not. re_eq_reverted) .and. (err_ctl .gt. re_eq_best_err)) then
       write(*,'(A,ES10.2,A,ES10.2,A)') &
-        ' re_eq: the edge polish worsened max|q/q_t-1| (', re_eq_best_err,     &
-        ' -> ', err, '); reverting to the unpolished best profile'
+        ' re_eq: the edge polish worsened the in-beam max|q/q_t-1| (', re_eq_best_err, &
+        ' -> ', err_ctl, '); reverting to the unpolished best profile'
       re_nprof(1:re_eq_n_l) = re_eq_best_nprof(1:re_eq_n_l)
       call re_eq_apply_beam_envelope()
       re_eq_reverted = .true.
-      write(RE_EQ_LOG_UNIT,'(I6,I8,3ES16.6)') re_eq_outer_iter, n_inner, err, I_now, maxval(re_cl_edge_frac)
+      write(RE_EQ_LOG_UNIT,'(I6,I8,4ES16.6)') re_eq_outer_iter, n_inner, err, err_ctl, I_now, maxval(re_cl_edge_frac)
       call flush_it(RE_EQ_LOG_UNIT)
       return                          ! caller re-converges psi on the best profile
     endif
@@ -1483,8 +1525,9 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
       if (err .lt. re_eq_tol_q_soft) then
         write(*,'(A)')        ' WARNING: re_eq: q matching stagnated above re_eq_tol_q;'
         write(*,'(A,ES10.2)') '          accepted at the soft tolerance with max|q/q_t-1| = ', err
-        write(*,'(A)')        '          (single common Nprof with strongly different class drift'
-        write(*,'(A)')        '          shifts cannot match q_t exactly; see the module header)'
+        write(*,'(A)')        '          (a drift surface spans a RANGE of psihat, so Nprof cannot'
+        write(*,'(A)')        '          resolve target structure finer than that width -- worst at the'
+        write(*,'(A)')        '          edge, and growing with class energy; see the module header)'
         converged = .true.
         re_eq_soft_accepted = .true.
       endif
@@ -1493,12 +1536,12 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
     ! Nprof is frozen in this branch, so further outer iterations would only
     ! re-converge and re-evaluate the identical state -- stop the loop here.
     re_eq_done = .true.
-    write(RE_EQ_LOG_UNIT,'(I6,I8,3ES16.6)') re_eq_outer_iter, n_inner, err, I_now, maxval(re_cl_edge_frac)
+    write(RE_EQ_LOG_UNIT,'(I6,I8,4ES16.6)') re_eq_outer_iter, n_inner, err, err_ctl, I_now, maxval(re_cl_edge_frac)
     call flush_it(RE_EQ_LOG_UNIT)
     return
   endif
-  if (err .lt. 0.98d0 * re_eq_best_err) then
-    re_eq_best_err = err
+  if (err_ctl .lt. 0.98d0 * re_eq_best_err) then
+    re_eq_best_err = err_ctl
     re_eq_best_nprof(1:re_eq_n_l) = re_nprof(1:re_eq_n_l)
     re_eq_n_stall = 0
   else
@@ -1508,6 +1551,9 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   write(*,'(A,I4,A,ES11.3,A,ES13.5,A,ES10.2)') &
     ' re_eq outer ', re_eq_outer_iter, ':  max|q/q_t-1| = ', err, &
     '   I_RE [A] = ', I_now, '   max edge fraction = ', maxval(re_cl_edge_frac)
+  write(*,'(A,ES11.3,A,F7.4,A)') &
+    '                (within the beam-edge label range: ', err_ctl, &
+    ', i.e. psihat_n <= ', ph_ctl_max, ')'
   if (trim(re_eq_match_mode) .eq. 'q_shape') &
     write(*,'(A,F10.5)') '                q amplitude (achieved/target) = ', c_amp
   if (maxval(re_cl_edge_frac) .gt. 2.d-1) &
@@ -1515,7 +1561,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
       ' of the current of the worst class is carried on the outermost 5% of'  // &
       ' the label range: the beam edge is hard against the loss boundary'
 
-  write(RE_EQ_LOG_UNIT,'(I6,I8,3ES16.6)') re_eq_outer_iter, n_inner, err, I_now, maxval(re_cl_edge_frac)
+  write(RE_EQ_LOG_UNIT,'(I6,I8,4ES16.6)') re_eq_outer_iter, n_inner, err, err_ctl, I_now, maxval(re_cl_edge_frac)
   call flush_it(RE_EQ_LOG_UNIT)
 
   if (converged .or. (re_eq_n_stall .ge. 15) .or. (re_eq_outer_iter .ge. re_eq_max_it_out)) then
@@ -1524,10 +1570,10 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
     !     invisible to q, but it imprints element-scale-looking oscillations
     !     on the edge current density), re-converge psi once more, and give
     !     the final verdict on that state
-    if (re_eq_best_err .lt. err) re_nprof(1:re_eq_n_l) = re_eq_best_nprof(1:re_eq_n_l)
+    if (re_eq_best_err .lt. err_ctl) re_nprof(1:re_eq_n_l) = re_eq_best_nprof(1:re_eq_n_l)
     call re_eq_smooth_nprof()          ! includes the beam-edge table hygiene
     write(*,'(A,I4,A,ES10.2)') ' re_eq: finishing after ', re_eq_outer_iter, &
-      ' outer iterations (best max|q/q_t-1| = ', min(re_eq_best_err, err)
+      ' outer iterations (best in-beam max|q/q_t-1| = ', min(re_eq_best_err, err_ctl)
     write(*,'(A)') '        ): applied the edge null-space polish to Nprof;'
     write(*,'(A)') '        final convergence is evaluated on the polished profile'
     re_eq_finishing = .true.
