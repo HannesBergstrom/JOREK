@@ -29,6 +29,9 @@ Physics checks when preparing/updating the reference data:
   matched the whole range) and hid the region where the match is worst. The
   log carries both: column 3 `max|q/qt-1|` is the full-range value that
   decides convergence, column 4 `q_err_in_beam` is the old restricted value.
+  Column 6 `I_err` is |I_RE/re_eq_I_RE - 1|, zero unless the total-current
+  control is active (`re_eq_alpha_current > 0`); when it is, convergence
+  requires BOTH column 3 and column 6 below `re_eq_tol_q`.
   Expect column 3 to be somewhat larger than the historical numbers, so a
   case sitting just under `re_eq_tol_q` may now need more outer iterations.
 * Current on drift orbits leaving the domain is REMOVED (linear taper of
