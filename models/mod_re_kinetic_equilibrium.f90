@@ -175,6 +175,7 @@ real*8  :: re_eq_psi_bnd = 0.d0         !< boundary psi used in the labels
 real*8  :: re_eq_q_err   = 1.d99        !< latest max|q/q_t - 1|
 real*8  :: re_eq_I_now   = 0.d0         !< latest RE current [A]
 !> best-iterate tracking / stagnation handling of the outer loop
+real*8              :: re_eq_sigma_cum = 1.d0   !< running product of the dilation factors
 real*8              :: re_eq_best_err_cur = 1.d99 !< best |I_RE/target - 1| so far; only used when the
                                                    !< total-current control is active
 real*8              :: re_eq_best_err = 1.d99   !< best IN-BEAM max|q/q_t - 1| so far
@@ -289,7 +290,7 @@ subroutine re_eq_init(my_id)
   enddo
 
   open(RE_EQ_LOG_UNIT, file='re_eq_convergence.log', action='write', status='replace')
-  write(RE_EQ_LOG_UNIT,'(A)') '# outer  inner_iters  max|q/qt-1|   q_err_in_beam   I_RE[A]        I_err          max_edge_fraction'
+  write(RE_EQ_LOG_UNIT,'(A)') '# outer  inner_iters  max|q/qt-1|   q_err_in_beam   I_RE[A]        I_err          q_amplitude    sigma_cum      max_edge_fraction'
 
   re_eq_outer_iter  = 0
   re_eq_initialized = .true.
@@ -611,6 +612,7 @@ subroutine re_eq_init_nprof(my_id)
   enddo
   re_eq_best_err      = 1.d99
   re_eq_best_err_cur  = 1.d99
+  re_eq_sigma_cum     = 1.d0
   re_eq_n_stall       = 0
   re_eq_finishing     = .false.
   re_eq_soft_accepted = .false.
@@ -1774,7 +1776,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
       re_nprof(1:re_eq_n_l) = re_eq_best_nprof(1:re_eq_n_l)
       call re_eq_apply_beam_envelope()
       re_eq_reverted = .true.
-      write(RE_EQ_LOG_UNIT,'(I6,I8,5ES16.6)') re_eq_outer_iter, n_inner, err, err_ctl, I_now, err_cur, maxval(re_cl_edge_frac)
+      write(RE_EQ_LOG_UNIT,'(I6,I8,7ES16.6)') re_eq_outer_iter, n_inner, err, err_ctl, I_now, err_cur, c_glob, re_eq_sigma_cum, maxval(re_cl_edge_frac)
       call flush_it(RE_EQ_LOG_UNIT)
       return                          ! caller re-converges psi on the best profile
     endif
@@ -1794,7 +1796,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
     ! Nprof is frozen in this branch, so further outer iterations would only
     ! re-converge and re-evaluate the identical state -- stop the loop here.
     re_eq_done = .true.
-    write(RE_EQ_LOG_UNIT,'(I6,I8,5ES16.6)') re_eq_outer_iter, n_inner, err, err_ctl, I_now, err_cur, maxval(re_cl_edge_frac)
+    write(RE_EQ_LOG_UNIT,'(I6,I8,7ES16.6)') re_eq_outer_iter, n_inner, err, err_ctl, I_now, err_cur, c_glob, re_eq_sigma_cum, maxval(re_cl_edge_frac)
     call flush_it(RE_EQ_LOG_UNIT)
     return
   endif
@@ -1827,13 +1829,14 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   if (cur_active) &
     write(*,'(A,ES11.3,A,ES12.4,A)') '                |I_RE/target - 1| = ', err_cur, &
       '   (target ', re_eq_I_RE, ' A)'
-  write(*,'(A,F10.5)') '                q amplitude (achieved/target) = ', c_glob
+  write(*,'(A,F10.5,A,F10.5)') '                q amplitude (achieved/target) = ', c_glob, &
+    '   cumulative dilation = ', re_eq_sigma_cum
   if (maxval(re_cl_edge_frac) .gt. 2.d-1) &
     write(*,'(A,ES10.2,A)') ' WARNING: re_eq: ', maxval(re_cl_edge_frac), &
       ' of the current of the worst class is carried on the outermost 5% of'  // &
       ' the label range: the beam edge is hard against the loss boundary'
 
-  write(RE_EQ_LOG_UNIT,'(I6,I8,5ES16.6)') re_eq_outer_iter, n_inner, err, err_ctl, I_now, err_cur, maxval(re_cl_edge_frac)
+  write(RE_EQ_LOG_UNIT,'(I6,I8,7ES16.6)') re_eq_outer_iter, n_inner, err, err_ctl, I_now, err_cur, c_glob, re_eq_sigma_cum, maxval(re_cl_edge_frac)
   call flush_it(RE_EQ_LOG_UNIT)
 
   if (converged .or. (re_eq_n_stall .ge. 15) .or. (re_eq_outer_iter .ge. re_eq_max_it_out)) then
@@ -1926,6 +1929,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
         Ndil(k) = re_eq_nprof_eval(re_nprof_l(k) / sigma)
       enddo
       re_nprof(1:re_eq_n_l) = Ndil
+      re_eq_sigma_cum = re_eq_sigma_cum * sigma
       call re_eq_apply_beam_envelope()
     endif
   endif
