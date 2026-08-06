@@ -176,6 +176,11 @@ real*8  :: re_eq_q_err   = 1.d99        !< latest max|q/q_t - 1|
 real*8  :: re_eq_I_now   = 0.d0         !< latest RE current [A]
 !> best-iterate tracking / stagnation handling of the outer loop
 real*8              :: re_eq_sigma_cum = 1.d0   !< running product of the dilation factors
+real*8              :: re_eq_c_prev    = 1.d99  !< previous q amplitude, for the dilation secant
+real*8              :: re_eq_lnsig_prev = 0.d0  !< log(sigma_cum) that produced it
+integer             :: re_eq_n_qlast   = 0      !< last evaluated q profile, kept so it can be
+real*8, allocatable :: re_eq_ph_last(:)         !< written out even when the run does NOT converge
+real*8, allocatable :: re_eq_q_last(:)
 real*8              :: re_eq_best_err_cur = 1.d99 !< best |I_RE/target - 1| so far; only used when the
                                                    !< total-current control is active
 real*8              :: re_eq_best_err = 1.d99   !< best IN-BEAM max|q/q_t - 1| so far
@@ -613,6 +618,8 @@ subroutine re_eq_init_nprof(my_id)
   re_eq_best_err      = 1.d99
   re_eq_best_err_cur  = 1.d99
   re_eq_sigma_cum     = 1.d0
+  re_eq_c_prev        = 1.d99
+  re_eq_lnsig_prev    = 0.d0
   re_eq_n_stall       = 0
   re_eq_finishing     = .false.
   re_eq_soft_accepted = .false.
@@ -1553,11 +1560,20 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   real*8  :: cw(re_eq_n_class), cw_sum, ph_beam_cl(re_eq_n_class)
   real*8  :: c_amp, num, den, err, err_ctl, I_now, ph_ctl_max, ph_beam, l_eff, err_cur
   real*8  :: c_glob, sigma, Ndil(re_eq_n_l), Nold(re_eq_n_l), ddir(re_eq_n_l)
-  real*8  :: dnum, dden
+  real*8  :: dnum, dden, lnsig, slope, dlnsig
   logical :: dil_active
   real*8  :: C(re_eq_n_l), dl, qq
 
   re_eq_outer_iter = re_eq_outer_iter + 1
+
+  ! keep the q profile just evaluated so re_eq_write_output can dump it even
+  ! when the run gives up: re_eq_finalize stops the code before the standard
+  ! qprofile.dat is written, leaving a failed run with no way to see WHERE the
+  ! q match went wrong.
+  if (.not. allocated(re_eq_ph_last)) allocate(re_eq_ph_last(n_lev), re_eq_q_last(n_lev))
+  re_eq_n_qlast = n_lev
+  re_eq_ph_last(1:n_lev) = ph_lev(1:n_lev)
+  re_eq_q_last (1:n_lev) = q_lev (1:n_lev)
 
   call re_eq_total_current(my_id, node_list, element_list, I_now)
 
@@ -1954,8 +1970,29 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   !     (no new namelist parameter) and clamped, since the response is only
   !     approximately quadratic.
   if (dil_active .and. (c_glob .gt. 0.d0)) then
-    sigma = c_glob**(-0.5d0 * re_eq_alpha_out)
-    sigma = min(max(sigma, 0.9d0), 1.1d0)
+    ! Gain: SECANT on the observed response, falling back to the nominal
+    ! a ~ sigma, q ~ a^2 law until there is history. The fixed law always
+    ! drives the same way while c_glob > 1, so once the response changes sign
+    ! it becomes positive feedback and sigma runs away past its optimum --
+    ! observed: sigma_cum fell monotonically for 50 outer iterations while the
+    ! amplitude bottomed out around iteration 23 and then crept back up. The
+    ! secant changes sign with the response and turns around instead.
+    lnsig = log(max(re_eq_sigma_cum, 1.d-30))
+    slope = 0.d0
+    if (re_eq_c_prev .lt. 1.d90) then
+      if (abs(lnsig - re_eq_lnsig_prev) .gt. 1.d-8) &
+        slope = (c_glob - re_eq_c_prev) / (lnsig - re_eq_lnsig_prev)
+    endif
+    if (abs(slope) .gt. 1.d-3) then
+      dlnsig = -(c_glob - 1.d0) / slope          ! Newton on c_glob(ln sigma)
+    else
+      dlnsig = -0.5d0 * log(c_glob)              ! nominal quadratic law
+    endif
+    dlnsig = re_eq_alpha_out * dlnsig
+    dlnsig = min(max(dlnsig, log(0.9d0)), log(1.1d0))
+    re_eq_c_prev     = c_glob
+    re_eq_lnsig_prev = lnsig
+    sigma = exp(dlnsig)
     if (abs(sigma - 1.d0) .gt. 1.d-12) then
       do k = 1, re_eq_n_l
         Ndil(k) = re_eq_nprof_eval(re_nprof_l(k) / sigma)
@@ -2090,6 +2127,20 @@ subroutine re_eq_write_output(my_id)
       re_cl_gamma(s), re_cl_vpar(s), re_cl_alpha(s), re_cl_A_axis(s),          &
       re_cl_A_edge(s), re_cl_R_axis(s), re_cl_Z_axis(s), re_cl_edge_frac(s)
   enddo
+
+  ! --- achieved vs target q on the evaluation levels. Written unconditionally
+  !     (this routine runs before re_eq_finalize), so a run that gave up still
+  !     leaves enough to localize the residual in psihat_n.
+  if (re_eq_n_qlast .gt. 0) then
+    open(iunit+1, file='re_qprofile.dat', action='write', status='replace')
+    write(iunit+1,'(A)') '# psihat_n    q_achieved    q_target    q/q_t - 1'
+    do k = 1, re_eq_n_qlast
+      write(iunit+1,'(4ES23.15)') re_eq_ph_last(k), re_eq_q_last(k), &
+        re_eq_qt_eval(re_eq_ph_last(k)), &
+        re_eq_q_last(k)/re_eq_qt_eval(re_eq_ph_last(k)) - 1.d0
+    enddo
+    close(iunit+1)
+  endif
   write(iunit,'(A)') '# nprof: l  Nprof(l) [m^-2]'
   do k = 1, re_eq_n_l
     write(iunit,'(2ES23.15)') re_nprof_l(k), re_nprof(k)
