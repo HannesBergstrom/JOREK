@@ -175,12 +175,15 @@ real*8  :: re_eq_psi_bnd = 0.d0         !< boundary psi used in the labels
 real*8  :: re_eq_q_err   = 1.d99        !< latest max|q/q_t - 1|
 real*8  :: re_eq_I_now   = 0.d0         !< latest RE current [A]
 !> best-iterate tracking / stagnation handling of the outer loop
-real*8              :: re_eq_sigma_cum = 1.d0   !< running product of the dilation factors
-real*8              :: re_eq_c_prev    = 1.d99  !< previous q amplitude, for the dilation secant
-real*8              :: re_eq_lnsig_prev = 0.d0  !< log(sigma_cum) that produced it
 integer             :: re_eq_n_qlast   = 0      !< last evaluated q profile, kept so it can be
 real*8, allocatable :: re_eq_ph_last(:)         !< written out even when the run does NOT converge
 real*8, allocatable :: re_eq_q_last(:)
+!> Broyden history for the operator update: the previous applied step (in
+!> relative-Nprof space) and the residual it acted on. Used to correct the
+!> response matrix for the part of the true Jacobian that K cannot contain.
+real*8, allocatable :: re_eq_s_prev(:)      !< previous step, size re_eq_n_l
+real*8, allocatable :: re_eq_r_prev(:)      !< previous residual, size n_lev
+logical             :: re_eq_have_hist = .false.
 real*8              :: re_eq_best_err_cur = 1.d99 !< best |I_RE/target - 1| so far; only used when the
                                                    !< total-current control is active
 real*8              :: re_eq_best_err = 1.d99   !< best IN-BEAM max|q/q_t - 1| so far
@@ -295,7 +298,7 @@ subroutine re_eq_init(my_id)
   enddo
 
   open(RE_EQ_LOG_UNIT, file='re_eq_convergence.log', action='write', status='replace')
-  write(RE_EQ_LOG_UNIT,'(A)') '# outer  inner_iters  max|q/qt-1|   q_err_in_beam   I_RE[A]        I_err          q_amplitude    sigma_cum      max_edge_fraction'
+  write(RE_EQ_LOG_UNIT,'(A)') '# outer  inner_iters  max|q/qt-1|   q_err_in_beam   I_RE[A]        I_err          q_amplitude    q_tilt         max_edge_fraction'
 
   re_eq_outer_iter  = 0
   re_eq_initialized = .true.
@@ -617,9 +620,7 @@ subroutine re_eq_init_nprof(my_id)
   enddo
   re_eq_best_err      = 1.d99
   re_eq_best_err_cur  = 1.d99
-  re_eq_sigma_cum     = 1.d0
-  re_eq_c_prev        = 1.d99
-  re_eq_lnsig_prev    = 0.d0
+  re_eq_have_hist     = .false.
   re_eq_n_stall       = 0
   re_eq_finishing     = .false.
   re_eq_soft_accepted = .false.
@@ -1475,6 +1476,7 @@ subroutine re_eq_operator_update(node_list, element_list, n_lev, ph_lev, q_lev, 
   real*8  :: Ktot(re_eq_n_l)
   real*8  :: L(re_eq_n_l, re_eq_n_l), AtA(re_eq_n_l, re_eq_n_l), Atb(re_eq_n_l)
   real*8  :: u(re_eq_n_l), qt_at, wcon, umin, umax
+  real*8  :: sts, bfac, Ms(n_lev), yv(n_lev)
 
   call re_eq_response_operator(node_list, element_list, n_lev, ph_lev, Kop, Ktot)
 
@@ -1496,6 +1498,46 @@ subroutine re_eq_operator_update(node_list, element_list, n_lev, ph_lev, q_lev, 
   enddo
   L(1,1) = -1.d0;  L(1,2) = 1.d0
   L(re_eq_n_l,re_eq_n_l-1) = 1.d0;  L(re_eq_n_l,re_eq_n_l) = -1.d0
+
+  ! --- Broyden correction to the response matrix.
+  !
+  !     M is assembled at FIXED psi, so it contains dI(psihat)/dN with the
+  !     flux surfaces frozen. The true outer-loop response also includes the
+  !     LCFS MOVING when the profile changes -- redistributing the same total
+  !     current alters where psi falls to psi_lim, hence r(psihat), hence
+  !     q ~ r^2/I_enc. That term is absent from M by construction, and it is
+  !     what leaves a stalled case with a smooth monotonic tilt in the
+  !     residual that the solve cannot remove (measured: -1.5e-2 in the core
+  !     to +3.4e-2 at the edge, while the global amplitude was only -0.5%).
+  !
+  !     Rather than adding a control for that mode -- which turns the problem
+  !     multivariate and lets the search settle on spurious optima -- correct
+  !     the DERIVATIVE from what the iteration already reveals. Applying step
+  !     s changed the residual by dr, whereas the model predicted -M s. The
+  !     rank-1 (memoryless "good Broyden") update
+  !         M_eff = M + (-dr - M s) s^T / (s^T s)
+  !     satisfies M_eff s = -dr exactly, i.e. it reproduces the TRUE observed
+  !     response along the direction just explored, geometry included. It adds
+  !     no free parameter and no search dimension.
+  !
+  !     Memoryless (one step, not accumulated) on purpose: M itself is rebuilt
+  !     from K and Nprof every iteration, so a stale accumulated correction
+  !     would not transfer. Damped so a small step cannot produce a huge
+  !     correction.
+  if (re_eq_have_hist) then
+    sts = dot_product(re_eq_s_prev, re_eq_s_prev)
+    if (sts .gt. 1.d-30) then
+      Ms  = matmul(M, re_eq_s_prev)
+      yv  = -(rhs - re_eq_r_prev) - Ms
+      ! limit the correction to the scale of M itself
+      bfac = 1.d0
+      if (sqrt(dot_product(yv,yv)*sts) .gt. maxval(abs(M))*sts) &
+        bfac = maxval(abs(M))*sts / max(sqrt(dot_product(yv,yv)*sts), 1.d-30)
+      do i = 1, n_lev
+        M(i,:) = M(i,:) + bfac * yv(i) * re_eq_s_prev / sts
+      enddo
+    endif
+  endif
 
   AtA = matmul(transpose(M), M) + re_eq_op_lambda * matmul(transpose(L), L)
   Atb = matmul(transpose(M), rhs)
@@ -1521,6 +1563,13 @@ subroutine re_eq_operator_update(node_list, element_list, n_lev, ph_lev, q_lev, 
     u(k) = min(max(u(k), umin), umax)
     re_nprof(k) = max(re_nprof(k) * (1.d0 + re_eq_alpha_out * u(k)), 0.d0)
   enddo
+
+  ! history for the next iteration's Broyden correction: the step ACTUALLY
+  ! applied (after clamping and under-relaxation) and the residual it acted on
+  if (.not. allocated(re_eq_s_prev)) allocate(re_eq_s_prev(re_eq_n_l), re_eq_r_prev(n_lev))
+  re_eq_s_prev = re_eq_alpha_out * u
+  re_eq_r_prev = rhs
+  re_eq_have_hist = .true.
 
 end subroutine re_eq_operator_update
 
@@ -1559,9 +1608,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   real*8  :: q_acc(re_eq_n_l), qt_acc(re_eq_n_l)
   real*8  :: cw(re_eq_n_class), cw_sum, ph_beam_cl(re_eq_n_class)
   real*8  :: c_amp, num, den, err, err_ctl, I_now, ph_ctl_max, ph_beam, l_eff, err_cur
-  real*8  :: c_glob, sigma, Ndil(re_eq_n_l), Nold(re_eq_n_l), ddir(re_eq_n_l)
-  real*8  :: dnum, dden, lnsig, slope, dlnsig
-  logical :: dil_active
+  real*8  :: c_glob, q_tilt, phbar, rbar, sxx, sxy
   real*8  :: C(re_eq_n_l), dl, qq
 
   re_eq_outer_iter = re_eq_outer_iter + 1
@@ -1721,18 +1768,33 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   !     err_ctl is kept and reported alongside so the split stays visible.
   err     = 0.d0
   err_ctl = 0.d0
+  phbar = 0.d0;  rbar = 0.d0;  sxx = 0.d0;  sxy = 0.d0
   do i = 1, n_lev
     qq  = q_lev(i) / (c_amp * re_eq_qt_eval(ph_lev(i)))
     err = max(err, abs(qq - 1.d0))
     if (ph_lev(i) .le. ph_ctl_max) err_ctl = max(err_ctl, abs(qq - 1.d0))
+    phbar = phbar + ph_lev(i)
+    rbar  = rbar  + (qq - 1.d0)
   enddo
+  phbar = phbar / dble(n_lev);  rbar = rbar / dble(n_lev)
+  do i = 1, n_lev
+    qq  = q_lev(i) / (c_amp * re_eq_qt_eval(ph_lev(i)))
+    sxx = sxx + (ph_lev(i) - phbar)**2
+    sxy = sxy + (ph_lev(i) - phbar) * ((qq - 1.d0) - rbar)
+  enddo
+  ! Slope of the relative q residual against psihat_n. The residual of a
+  ! stalled high-energy case is a smooth monotonic TILT (q low in the core,
+  ! high at the edge), not the global offset that c_glob measures -- measured
+  ! -1.5e-2 at psihat 0.02 rising to +3.4e-2 at 0.985, with a mean of only
+  ! -4.9e-3. Reporting the tilt makes that visible directly.
+  q_tilt = 0.d0
+  if (sxx .gt. 0.d0) q_tilt = sxy / sxx
   re_eq_q_err = err
 
   ! --- current-matching error, only when a target current is actually being
   !     requested (re_eq_I_RE nonzero). Without it the q error alone is
   !     the criterion, exactly as before.
   cur_active = (re_eq_I_RE .ne. 0.d0)
-  dil_active = cur_active .and. (trim(re_eq_match_mode) .ne. 'q_shape')
   err_cur    = 0.d0
   if (cur_active) err_cur = abs(abs(I_now)/abs(re_eq_I_RE) - 1.d0)
 
@@ -1795,7 +1857,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
       re_nprof(1:re_eq_n_l) = re_eq_best_nprof(1:re_eq_n_l)
       call re_eq_apply_beam_envelope()
       re_eq_reverted = .true.
-      write(RE_EQ_LOG_UNIT,'(I6,I8,7ES16.6)') re_eq_outer_iter, n_inner, err, err_ctl, I_now, err_cur, c_glob, re_eq_sigma_cum, maxval(re_cl_edge_frac)
+      write(RE_EQ_LOG_UNIT,'(I6,I8,7ES16.6)') re_eq_outer_iter, n_inner, err, err_ctl, I_now, err_cur, c_glob, q_tilt, maxval(re_cl_edge_frac)
       call flush_it(RE_EQ_LOG_UNIT)
       return                          ! caller re-converges psi on the best profile
     endif
@@ -1815,7 +1877,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
     ! Nprof is frozen in this branch, so further outer iterations would only
     ! re-converge and re-evaluate the identical state -- stop the loop here.
     re_eq_done = .true.
-    write(RE_EQ_LOG_UNIT,'(I6,I8,7ES16.6)') re_eq_outer_iter, n_inner, err, err_ctl, I_now, err_cur, c_glob, re_eq_sigma_cum, maxval(re_cl_edge_frac)
+    write(RE_EQ_LOG_UNIT,'(I6,I8,7ES16.6)') re_eq_outer_iter, n_inner, err, err_ctl, I_now, err_cur, c_glob, q_tilt, maxval(re_cl_edge_frac)
     call flush_it(RE_EQ_LOG_UNIT)
     return
   endif
@@ -1848,14 +1910,14 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   if (cur_active) &
     write(*,'(A,ES11.3,A,ES12.4,A)') '                |I_RE/target - 1| = ', err_cur, &
       '   (target ', re_eq_I_RE, ' A)'
-  write(*,'(A,F10.5,A,F10.5)') '                q amplitude (achieved/target) = ', c_glob, &
-    '   cumulative dilation = ', re_eq_sigma_cum
+  write(*,'(A,F10.5,A,ES11.3)') '                q amplitude (achieved/target) = ', c_glob, &
+    '   residual tilt d(q/q_t)/dpsihat = ', q_tilt
   if (maxval(re_cl_edge_frac) .gt. 2.d-1) &
     write(*,'(A,ES10.2,A)') ' WARNING: re_eq: ', maxval(re_cl_edge_frac), &
       ' of the current of the worst class is carried on the outermost 5% of'  // &
       ' the label range: the beam edge is hard against the loss boundary'
 
-  write(RE_EQ_LOG_UNIT,'(I6,I8,7ES16.6)') re_eq_outer_iter, n_inner, err, err_ctl, I_now, err_cur, c_glob, re_eq_sigma_cum, maxval(re_cl_edge_frac)
+  write(RE_EQ_LOG_UNIT,'(I6,I8,7ES16.6)') re_eq_outer_iter, n_inner, err, err_ctl, I_now, err_cur, c_glob, q_tilt, maxval(re_cl_edge_frac)
   call flush_it(RE_EQ_LOG_UNIT)
 
   if (converged .or. (re_eq_n_stall .ge. 15) .or. (re_eq_outer_iter .ge. re_eq_max_it_out)) then
@@ -1881,8 +1943,6 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   do k = 2, re_eq_n_l - 1
     ratio(k) = exp(0.25d0*lr(k-1) + 0.5d0*lr(k) + 0.25d0*lr(k+1))
   enddo
-
-  Nold(1:re_eq_n_l) = re_nprof(1:re_eq_n_l)
 
   select case (trim(re_eq_transplant))
   case ('pointwise')
@@ -1915,93 +1975,11 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   ! regenerate small current beyond the beam edge when differentiating C)
   call re_eq_apply_beam_envelope()
 
-  ! --- Remove the dilation direction from the transplant's update.
-  !     A dilation IS a shape change, so with the shape already matched the
-  !     next transplant step sees it as an error and restores it: sigma then
-  !     walks steadily while the q amplitude does not move at all (observed).
-  !     The two controls were acting on the same subspace and cancelling.
-  !     The transplant evaluates this one direction WRONGLY -- its Jacobian is
-  !     assembled at fixed psi and so cannot see that dilating moves the LCFS
-  !     -- so removing it costs no information the transplant actually had.
-  !     It keeps the other ~99 shape directions; the amplitude control owns
-  !     this one, exactly as q_shape gives the uniform direction to the
-  !     current rescale.
-  !     d(l) = -l dN/dl is dN(l/sigma)/dsigma at sigma = 1, evaluated on the
-  !     PRE-update profile.
-  if (dil_active) then
-    dl = re_nprof_l(2) - re_nprof_l(1)
-    ddir(1) = 0.d0
-    do k = 2, re_eq_n_l - 1
-      ddir(k) = -re_nprof_l(k) * (Nold(k+1) - Nold(k-1)) / (2.d0*dl)
-    enddo
-    ddir(re_eq_n_l) = -re_nprof_l(re_eq_n_l) * (Nold(re_eq_n_l) - Nold(re_eq_n_l-1)) / dl
-    dden = dot_product(ddir, ddir)
-    if (dden .gt. 0.d0) then
-      dnum = dot_product(re_nprof(1:re_eq_n_l) - Nold, ddir)
-      re_nprof(1:re_eq_n_l) = max(re_nprof(1:re_eq_n_l) - (dnum/dden) * ddir, 0.d0)
-      call re_eq_apply_beam_envelope()
-    endif
-  endif
-
   ! NOTE the total-current control is now the EXACT rescale applied every
   ! inner Picard iteration (equilibrium.f90), not a slow outer relaxation.
   ! re_eq_alpha_current is superseded and ignored; see the warning in
   ! re_eq_init.
 
-  ! --- DILATION CONTROL (full_q with the current pinned).
-  !     With I_RE held exactly, the uniform direction of Nprof is consumed by
-  !     the current constraint, so the outer loop can no longer move the
-  !     ABSOLUTE level of q -- only its shape. The residual is then a single
-  !     number: the whole plasma comes out the wrong SIZE, so r(psihat_n) is
-  !     off by a common factor at every psihat_n and q ~ r^2 / I_enc is off
-  !     globally while the shape is already right.
-  !
-  !     The mechanism that fixes it -- the LCFS moving -- is absent from the
-  !     Jacobian: both the transplant ratio and the operator K are assembled
-  !     at FIXED psi, so every linear step is blind to it and the loop
-  !     converges to the fixed point of an incomplete Jacobian. This supplies
-  !     the missing SEARCH DIRECTION (it adds no constraint): dilating Nprof
-  !     in the label coordinate redistributes the same total current more
-  !     broadly or more narrowly, which moves where psi falls to psi_lim and
-  !     hence the plasma size.
-  !
-  !     Gain law: a ~ sigma and q ~ a^2, so correcting a global mismatch
-  !     c_glob needs sigma ~ c_glob**(-1/2); under-relaxed with re_eq_alpha_out
-  !     (no new namelist parameter) and clamped, since the response is only
-  !     approximately quadratic.
-  if (dil_active .and. (c_glob .gt. 0.d0)) then
-    ! Gain: SECANT on the observed response, falling back to the nominal
-    ! a ~ sigma, q ~ a^2 law until there is history. The fixed law always
-    ! drives the same way while c_glob > 1, so once the response changes sign
-    ! it becomes positive feedback and sigma runs away past its optimum --
-    ! observed: sigma_cum fell monotonically for 50 outer iterations while the
-    ! amplitude bottomed out around iteration 23 and then crept back up. The
-    ! secant changes sign with the response and turns around instead.
-    lnsig = log(max(re_eq_sigma_cum, 1.d-30))
-    slope = 0.d0
-    if (re_eq_c_prev .lt. 1.d90) then
-      if (abs(lnsig - re_eq_lnsig_prev) .gt. 1.d-8) &
-        slope = (c_glob - re_eq_c_prev) / (lnsig - re_eq_lnsig_prev)
-    endif
-    if (abs(slope) .gt. 1.d-3) then
-      dlnsig = -(c_glob - 1.d0) / slope          ! Newton on c_glob(ln sigma)
-    else
-      dlnsig = -0.5d0 * log(c_glob)              ! nominal quadratic law
-    endif
-    dlnsig = re_eq_alpha_out * dlnsig
-    dlnsig = min(max(dlnsig, log(0.9d0)), log(1.1d0))
-    re_eq_c_prev     = c_glob
-    re_eq_lnsig_prev = lnsig
-    sigma = exp(dlnsig)
-    if (abs(sigma - 1.d0) .gt. 1.d-12) then
-      do k = 1, re_eq_n_l
-        Ndil(k) = re_eq_nprof_eval(re_nprof_l(k) / sigma)
-      enddo
-      re_nprof(1:re_eq_n_l) = Ndil
-      re_eq_sigma_cum = re_eq_sigma_cum * sigma
-      call re_eq_apply_beam_envelope()
-    endif
-  endif
 
 end subroutine re_eq_outer_update
 
