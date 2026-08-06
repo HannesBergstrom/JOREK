@@ -1552,7 +1552,9 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   real*8  :: q_acc(re_eq_n_l), qt_acc(re_eq_n_l)
   real*8  :: cw(re_eq_n_class), cw_sum, ph_beam_cl(re_eq_n_class)
   real*8  :: c_amp, num, den, err, err_ctl, I_now, ph_ctl_max, ph_beam, l_eff, err_cur
-  real*8  :: c_glob, sigma, Ndil(re_eq_n_l)
+  real*8  :: c_glob, sigma, Ndil(re_eq_n_l), Nold(re_eq_n_l), ddir(re_eq_n_l)
+  real*8  :: dnum, dden
+  logical :: dil_active
   real*8  :: C(re_eq_n_l), dl, qq
 
   re_eq_outer_iter = re_eq_outer_iter + 1
@@ -1714,6 +1716,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   !     requested (re_eq_I_RE nonzero). Without it the q error alone is
   !     the criterion, exactly as before.
   cur_active = (re_eq_I_RE .ne. 0.d0)
+  dil_active = cur_active .and. (trim(re_eq_match_mode) .ne. 'q_shape')
   err_cur    = 0.d0
   if (cur_active) err_cur = abs(abs(I_now)/abs(re_eq_I_RE) - 1.d0)
 
@@ -1863,6 +1866,8 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
     ratio(k) = exp(0.25d0*lr(k-1) + 0.5d0*lr(k) + 0.25d0*lr(k+1))
   enddo
 
+  Nold(1:re_eq_n_l) = re_nprof(1:re_eq_n_l)
+
   select case (trim(re_eq_transplant))
   case ('pointwise')
     do k = 1, re_eq_n_l
@@ -1894,6 +1899,34 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   ! regenerate small current beyond the beam edge when differentiating C)
   call re_eq_apply_beam_envelope()
 
+  ! --- Remove the dilation direction from the transplant's update.
+  !     A dilation IS a shape change, so with the shape already matched the
+  !     next transplant step sees it as an error and restores it: sigma then
+  !     walks steadily while the q amplitude does not move at all (observed).
+  !     The two controls were acting on the same subspace and cancelling.
+  !     The transplant evaluates this one direction WRONGLY -- its Jacobian is
+  !     assembled at fixed psi and so cannot see that dilating moves the LCFS
+  !     -- so removing it costs no information the transplant actually had.
+  !     It keeps the other ~99 shape directions; the amplitude control owns
+  !     this one, exactly as q_shape gives the uniform direction to the
+  !     current rescale.
+  !     d(l) = -l dN/dl is dN(l/sigma)/dsigma at sigma = 1, evaluated on the
+  !     PRE-update profile.
+  if (dil_active) then
+    dl = re_nprof_l(2) - re_nprof_l(1)
+    ddir(1) = 0.d0
+    do k = 2, re_eq_n_l - 1
+      ddir(k) = -re_nprof_l(k) * (Nold(k+1) - Nold(k-1)) / (2.d0*dl)
+    enddo
+    ddir(re_eq_n_l) = -re_nprof_l(re_eq_n_l) * (Nold(re_eq_n_l) - Nold(re_eq_n_l-1)) / dl
+    dden = dot_product(ddir, ddir)
+    if (dden .gt. 0.d0) then
+      dnum = dot_product(re_nprof(1:re_eq_n_l) - Nold, ddir)
+      re_nprof(1:re_eq_n_l) = max(re_nprof(1:re_eq_n_l) - (dnum/dden) * ddir, 0.d0)
+      call re_eq_apply_beam_envelope()
+    endif
+  endif
+
   ! NOTE the total-current control is now the EXACT rescale applied every
   ! inner Picard iteration (equilibrium.f90), not a slow outer relaxation.
   ! re_eq_alpha_current is superseded and ignored; see the warning in
@@ -1920,8 +1953,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   !     c_glob needs sigma ~ c_glob**(-1/2); under-relaxed with re_eq_alpha_out
   !     (no new namelist parameter) and clamped, since the response is only
   !     approximately quadratic.
-  if ((trim(re_eq_match_mode) .ne. 'q_shape') .and. (re_eq_I_RE .ne. 0.d0) .and. &
-      (c_glob .gt. 0.d0)) then
+  if (dil_active .and. (c_glob .gt. 0.d0)) then
     sigma = c_glob**(-0.5d0 * re_eq_alpha_out)
     sigma = min(max(sigma, 0.9d0), 1.1d0)
     if (abs(sigma - 1.d0) .gt. 1.d-12) then
