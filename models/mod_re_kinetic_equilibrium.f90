@@ -51,7 +51,7 @@ public :: re_kinetic_equilibrium, re_eq_dist_file, re_eq_dist_format,          &
           re_eq_xi_min, re_eq_alpha_out, re_eq_tol_q, re_eq_tol_q_soft,        &
           re_eq_edge_taper, re_eq_l_beam, re_eq_l_beam_width,                  &
           re_eq_ratio_clamp, re_eq_absorbing_edge, re_eq_op_lambda,             &
-          re_eq_w_current,                                                     &
+          re_eq_alpha_current,                                                 &
           re_eq_max_it_out, re_eq_n_l, re_eq_n_q_levels, re_eq_n_midplane,     &
           re_eq_finite_pitch
 ! --- driver interface (used by equilibrium.f90 and the GS element assembly)
@@ -80,7 +80,7 @@ character(len=16)  :: re_eq_map_mode    = 'midplane'  !< label map Ahat<->psihat
                                                       !< achievable q match)
 real*8             :: re_eq_I_RE        = 0.d0        !< prescribed RE current [A]: held exactly in
                                                       !< q_shape mode, and the target of the optional
-                                                      !< total-current constraint (re_eq_w_current) in
+                                                      !< total-current control (re_eq_alpha_current) in
                                                       !< full_q mode
 real*8             :: re_eq_xi_min      = 0.9d0       !< minimum |pitch|; abort below (trapped REs out of scope)
 real*8             :: re_eq_alpha_out   = 0.3d0       !< under-relaxation of the outer transplant update
@@ -121,25 +121,29 @@ logical            :: re_eq_absorbing_edge = .false.  !< force Nprof(Ahat = 1) =
                                                       !< only acts for lraw > 1, and re_eq_nprof_eval
                                                       !< clips to [0,1], so once Nprof(1) = 0 the source
                                                       !< already vanishes at and beyond Ahat = 1.
-real*8             :: re_eq_w_current   = 0.d0        !< weight of the total-current constraint in the
-                                                      !< 'operator' update. 0 (default) = OFF, the row is
-                                                      !< not added at all; > 0 drives I_RE towards
-                                                      !< re_eq_I_RE while q is still matched in amplitude.
-                                                      !< WHY: q_t is prescribed on the NORMALIZED flux
-                                                      !< coordinate, so it is invariant under the joint
-                                                      !< rescaling q_a ~ a^2/I -- matching q_t constrains
-                                                      !< the RELATION between plasma size and current, not
-                                                      !< either separately. q_shape does not fix this: it
-                                                      !< adds I_RE but drops the absolute q, leaving the
-                                                      !< same degenerate direction (so its reported q
-                                                      !< amplitude barely responds to the prescribed
-                                                      !< I_RE). Constraining absolute q AND I_RE together
-                                                      !< pins the size, since q_a and I fix a.
-                                                      !< Only meaningful where the LCFS can actually move,
-                                                      !< i.e. a domain larger than the plasma. Where the
-                                                      !< boundary IS the LCFS (n_open = 0, the circular
-                                                      !< regression cases) the area cannot change, the row
-                                                      !< is redundant and only fights the q match.
+real*8             :: re_eq_alpha_current = 0.d0      !< under-relaxation of the total-current control:
+                                                      !< after each outer update Nprof is scaled by
+                                                      !< (|re_eq_I_RE| / |I_RE|)**re_eq_alpha_current.
+                                                      !< 0 (default) = OFF; ~0.2 is a sensible start.
+                                                      !< WHY a slow rescale and NOT a row in the operator
+                                                      !< least squares: at FIXED psi the flux surfaces do
+                                                      !< not move, so q ~ 1/I_enc rigidly -- a current row
+                                                      !< is then the SAME equation as the outermost q row
+                                                      !< with a different right-hand side, and the solve
+                                                      !< just splits the difference (tried: it degrades
+                                                      !< both criteria at every weight).
+                                                      !< The size/current degeneracy q_a ~ a^2/I lives
+                                                      !< ACROSS outer iterations, where psi re-solves and
+                                                      !< the LCFS moves. Rescaling between iterations lets
+                                                      !< the equilibrium slide ALONG that direction: the
+                                                      !< GS solve expands the LCFS and q(psihat_n)
+                                                      !< recovers, so the q match and the current control
+                                                      !< separate instead of competing.
+                                                      !< Only meaningful where the LCFS can move (a domain
+                                                      !< larger than the plasma). Where the boundary IS
+                                                      !< the LCFS (n_open = 0) the area cannot change,
+                                                      !< there is no degenerate direction to slide along,
+                                                      !< and this will simply fight the q match.
 real*8             :: re_eq_op_lambda   = 1.d-2       !< smoothness regularization of the 'operator'
                                                       !< transplant variant (damped least squares on the
                                                       !< relative Nprof correction); unused otherwise
@@ -264,16 +268,16 @@ subroutine re_eq_init(my_id)
     stop 1
   endif
 
-  if ((re_eq_w_current .gt. 0.d0) .and. (re_eq_I_RE .eq. 0.d0)) then
-    write(*,*) 'ERROR: re_eq: re_eq_w_current > 0 requires a nonzero re_eq_I_RE'
-    write(*,*) '       (the target of the total-current constraint).'
+  if ((re_eq_alpha_current .gt. 0.d0) .and. (re_eq_I_RE .eq. 0.d0)) then
+    write(*,*) 'ERROR: re_eq: re_eq_alpha_current > 0 requires a nonzero re_eq_I_RE'
+    write(*,*) '       (the target of the total-current control).'
     stop 1
   endif
-  if ((re_eq_w_current .gt. 0.d0) .and. (trim(re_eq_transplant) .ne. 'operator')) then
-    write(*,*) 'ERROR: re_eq: the total-current constraint (re_eq_w_current > 0) is'
-    write(*,*) '       implemented only for re_eq_transplant = ''operator''. In the'
-    write(*,*) '       explicit transplants it could only be a post-hoc rescale of'
-    write(*,*) '       Nprof, which undoes the amplitude just matched.'
+  if ((re_eq_alpha_current .gt. 0.d0) .and. (trim(re_eq_match_mode) .eq. 'q_shape')) then
+    write(*,*) 'ERROR: re_eq: re_eq_alpha_current is for full_q. In q_shape the'
+    write(*,*) '       current is already held exactly by re_eq_rescale_current,'
+    write(*,*) '       and the q amplitude is free -- so the size/current'
+    write(*,*) '       degeneracy returns and the control has nothing to pin.'
     stop 1
   endif
 
@@ -291,9 +295,9 @@ subroutine re_eq_init(my_id)
   write(*,'(A,A)')      '   match mode           : ', trim(re_eq_match_mode)
   write(*,'(A,A)')      '   transplant variant   : ', trim(re_eq_transplant)
   write(*,'(A,A)')      '   label map            : ', trim(re_eq_map_mode)
-  if (re_eq_w_current .gt. 0.d0) &
-    write(*,'(A,ES12.4,A,F8.3,A)') '   current constraint   : I_RE -> ', re_eq_I_RE, &
-      ' A  (weight ', re_eq_w_current, ')'
+  if (re_eq_alpha_current .gt. 0.d0) &
+    write(*,'(A,ES12.4,A,F8.3,A)') '   current control      : I_RE -> ', re_eq_I_RE, &
+      ' A  (alpha ', re_eq_alpha_current, ')'
   if (re_eq_absorbing_edge) then
     write(*,'(A)')      '   absorbing edge       : ON  (Nprof(Ahat=1) = 0;'
     write(*,'(A)')      '                          re_eq_edge_taper has no effect)'
@@ -1479,7 +1483,7 @@ subroutine re_eq_operator_update(node_list, element_list, n_lev, ph_lev, q_lev, 
 
   integer :: i, k, n_good, info, ipiv(re_eq_n_l)
   real*8  :: Kop(n_lev, re_eq_n_l), M(n_lev, re_eq_n_l), Ivec(n_lev), rhs(n_lev)
-  real*8  :: Ktot(re_eq_n_l), vcur(re_eq_n_l), I_tot, rhs_cur
+  real*8  :: Ktot(re_eq_n_l)
   real*8  :: L(re_eq_n_l, re_eq_n_l), AtA(re_eq_n_l, re_eq_n_l), Atb(re_eq_n_l)
   real*8  :: u(re_eq_n_l), qt_at, wcon, umin, umax
 
@@ -1506,25 +1510,6 @@ subroutine re_eq_operator_update(node_list, element_list, n_lev, ph_lev, q_lev, 
 
   AtA = matmul(transpose(M), M) + re_eq_op_lambda * matmul(transpose(L), L)
   Atb = matmul(transpose(M), rhs)
-
-  ! --- optional total-current constraint (see re_eq_w_current). One extra
-  !     row of the SAME system: I_tot = Ktot . N is linear in N exactly as
-  !     I(psihat) is, so it needs no separate machinery. Matching q_t alone
-  !     leaves the size/current degeneracy q_a ~ a^2/I unresolved; adding
-  !     this row fixes it, PROVIDED absolute q is still being matched (i.e.
-  !     full_q -- in q_shape the amplitude is free and the degeneracy comes
-  !     straight back).
-  if (re_eq_w_current .gt. 0.d0) then
-    I_tot = dot_product(Ktot, re_nprof(1:re_eq_n_l))
-    if (abs(I_tot) .gt. 0.d0) then
-      vcur    = re_eq_w_current * Ktot * re_nprof(1:re_eq_n_l) / I_tot
-      rhs_cur = re_eq_w_current * (abs(re_eq_I_RE) / max(abs(I_tot), 1.d-30) - 1.d0)
-      do k = 1, re_eq_n_l
-        AtA(k,:) = AtA(k,:) + vcur(k) * vcur(:)
-        Atb(k)   = Atb(k)   + vcur(k) * rhs_cur
-      enddo
-    endif
-  endif
 
   if (re_eq_absorbing_edge) then
     wcon = 1.d3 * max(maxval(abs(M)), 1.d0)
@@ -1583,7 +1568,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   real*8  :: phm(re_eq_n_l), phe, q_at, qt_at, ratio(re_eq_n_l), lr(re_eq_n_l)
   real*8  :: q_acc(re_eq_n_l), qt_acc(re_eq_n_l)
   real*8  :: cw(re_eq_n_class), cw_sum, ph_beam_cl(re_eq_n_class)
-  real*8  :: c_amp, num, den, err, err_ctl, I_now, ph_ctl_max, ph_beam, l_eff
+  real*8  :: c_amp, num, den, err, err_ctl, I_now, ph_ctl_max, ph_beam, l_eff, f_cur
   real*8  :: C(re_eq_n_l), dl, qq
 
   re_eq_outer_iter = re_eq_outer_iter + 1
@@ -1891,6 +1876,17 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   ! confine the updated profile to the beam (the cumulative update can
   ! regenerate small current beyond the beam edge when differentiating C)
   call re_eq_apply_beam_envelope()
+
+  ! --- total-current control: a SLOW uniform rescale towards re_eq_I_RE,
+  !     deliberately outside the q solve (see re_eq_alpha_current). I_now is
+  !     the current of the state just evaluated; the same per-iteration bound
+  !     as the transplant ratio keeps it from lurching.
+  if ((re_eq_alpha_current .gt. 0.d0) .and. (abs(I_now) .gt. 0.d0)) then
+    f_cur = (abs(re_eq_I_RE) / abs(I_now))**re_eq_alpha_current
+    f_cur = min(max(f_cur, 1.d0/re_eq_ratio_clamp), re_eq_ratio_clamp)
+    re_nprof(1:re_eq_n_l) = re_nprof(1:re_eq_n_l) * f_cur
+    call re_eq_apply_beam_envelope()
+  endif
 
 end subroutine re_eq_outer_update
 
