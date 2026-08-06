@@ -191,6 +191,8 @@ real*8  :: re_eq_psi_bnd = 0.d0         !< boundary psi used in the labels
 real*8  :: re_eq_q_err   = 1.d99        !< latest max|q/q_t - 1|
 real*8  :: re_eq_I_now   = 0.d0         !< latest RE current [A]
 !> best-iterate tracking / stagnation handling of the outer loop
+real*8              :: re_eq_best_err_cur = 1.d99 !< best |I_RE/target - 1| so far; only used when the
+                                                   !< total-current control is active
 real*8              :: re_eq_best_err = 1.d99   !< best IN-BEAM max|q/q_t - 1| so far
                                                  !< (the controllable objective; the verdict
                                                  !<  uses the full-range error, see below)
@@ -631,6 +633,7 @@ subroutine re_eq_init_nprof(my_id)
     re_nprof_l(k) = dble(k-1) / dble(re_eq_n_l - 1)
   enddo
   re_eq_best_err      = 1.d99
+  re_eq_best_err_cur  = 1.d99
   re_eq_n_stall       = 0
   re_eq_finishing     = .false.
   re_eq_soft_accepted = .false.
@@ -1565,10 +1568,11 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   logical,                  intent(out) :: converged
 
   integer :: k, i, s
+  logical :: cur_active, improved
   real*8  :: phm(re_eq_n_l), phe, q_at, qt_at, ratio(re_eq_n_l), lr(re_eq_n_l)
   real*8  :: q_acc(re_eq_n_l), qt_acc(re_eq_n_l)
   real*8  :: cw(re_eq_n_class), cw_sum, ph_beam_cl(re_eq_n_class)
-  real*8  :: c_amp, num, den, err, err_ctl, I_now, ph_ctl_max, ph_beam, l_eff, f_cur
+  real*8  :: c_amp, num, den, err, err_ctl, I_now, ph_ctl_max, ph_beam, l_eff, f_cur, err_cur
   real*8  :: C(re_eq_n_l), dl, qq
 
   re_eq_outer_iter = re_eq_outer_iter + 1
@@ -1720,7 +1724,19 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
     if (ph_lev(i) .le. ph_ctl_max) err_ctl = max(err_ctl, abs(qq - 1.d0))
   enddo
   re_eq_q_err = err
+
+  ! --- current-matching error, only when a target current is actually being
+  !     enforced (re_eq_alpha_current > 0). Without it the q error alone is
+  !     the criterion, exactly as before.
+  cur_active = (re_eq_alpha_current .gt. 0.d0) .and. (re_eq_I_RE .ne. 0.d0)
+  err_cur    = 0.d0
+  if (cur_active) err_cur = abs(abs(I_now)/abs(re_eq_I_RE) - 1.d0)
+
+  ! Both criteria must be met: a run that matched q but is still far from the
+  ! requested current has not finished the job. Reuses re_eq_tol_q rather than
+  ! introducing a second tolerance.
   converged   = (err .lt. re_eq_tol_q)
+  if (cur_active) converged = converged .and. (err_cur .lt. re_eq_tol_q)
 
   ! --- The two errors have DIFFERENT roles and must not be conflated:
   !       err     (full range)  -> the VERDICT: convergence and the soft
@@ -1780,7 +1796,8 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
       return                          ! caller re-converges psi on the best profile
     endif
     if (.not. converged) then
-      if (err .lt. re_eq_tol_q_soft) then
+      if ((err .lt. re_eq_tol_q_soft) .and. &
+          ((.not. cur_active) .or. (err_cur .lt. re_eq_tol_q_soft))) then
         write(*,'(A)')        ' WARNING: re_eq: q matching stagnated above re_eq_tol_q;'
         write(*,'(A,ES10.2)') '          accepted at the soft tolerance with max|q/q_t-1| = ', err
         write(*,'(A)')        '          (a drift surface spans a RANGE of psihat, so Nprof cannot'
@@ -1798,9 +1815,21 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
     call flush_it(RE_EQ_LOG_UNIT)
     return
   endif
-  if (err_ctl .lt. 0.98d0 * re_eq_best_err) then
+  ! Best-iterate tracking stays on the q error alone, so the finishing pass
+  ! still restores the best q match. Stagnation, however, must not fire while
+  ! the CURRENT is still improving: with the total-current control on, the
+  ! early phase legitimately trades q error for current progress, and a
+  ! q-only counter would abort the run in the middle of it.
+  improved = (err_ctl .lt. 0.98d0 * re_eq_best_err)
+  if (improved) then
     re_eq_best_err = err_ctl
     re_eq_best_nprof(1:re_eq_n_l) = re_nprof(1:re_eq_n_l)
+  endif
+  if (cur_active) then
+    if (err_cur .lt. 0.98d0 * re_eq_best_err_cur) improved = .true.
+    re_eq_best_err_cur = min(re_eq_best_err_cur, err_cur)
+  endif
+  if (improved) then
     re_eq_n_stall = 0
   else
     re_eq_n_stall = re_eq_n_stall + 1
@@ -1812,6 +1841,9 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   write(*,'(A,ES11.3,A,F7.4,A)') &
     '                (within the beam-edge label range: ', err_ctl, &
     ', i.e. psihat_n <= ', ph_ctl_max, ')'
+  if (cur_active) &
+    write(*,'(A,ES11.3,A,ES12.4,A)') '                |I_RE/target - 1| = ', err_cur, &
+      '   (target ', re_eq_I_RE, ' A)'
   if (trim(re_eq_match_mode) .eq. 'q_shape') &
     write(*,'(A,F10.5)') '                q amplitude (achieved/target) = ', c_amp
   if (maxval(re_cl_edge_frac) .gt. 2.d-1) &
