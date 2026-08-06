@@ -1550,6 +1550,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   real*8  :: q_acc(re_eq_n_l), qt_acc(re_eq_n_l)
   real*8  :: cw(re_eq_n_class), cw_sum, ph_beam_cl(re_eq_n_class)
   real*8  :: c_amp, num, den, err, err_ctl, I_now, ph_ctl_max, ph_beam, l_eff, err_cur
+  real*8  :: c_glob, sigma, Ndil(re_eq_n_l)
   real*8  :: C(re_eq_n_l), dl, qq
 
   re_eq_outer_iter = re_eq_outer_iter + 1
@@ -1653,11 +1654,16 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   ! --- amplitude factor: 1 in full_q mode; least-squares shape amplitude in
   !     q_shape mode (the current is prescribed there, so only the shape of
   !     q can be matched; the achieved amplitude is reported)
+  ! least-squares global amplitude of q against q_t. Needed in BOTH modes now:
+  ! q_shape divides it out of the update, full_q uses it to drive the dilation
+  ! control below.
+  num    = sum(q_acc * qt_acc)
+  den    = sum(qt_acc * qt_acc)
+  c_glob = 1.d0
+  if (abs(den) .gt. 0.d0) c_glob = num / den
   c_amp = 1.d0
   if (trim(re_eq_match_mode) .eq. 'q_shape') then
-    num = sum(q_acc * qt_acc)
-    den = sum(qt_acc * qt_acc)
-    c_amp = num / den
+    c_amp = c_glob
     lr = lr - log(c_amp)
   endif
 
@@ -1821,8 +1827,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   if (cur_active) &
     write(*,'(A,ES11.3,A,ES12.4,A)') '                |I_RE/target - 1| = ', err_cur, &
       '   (target ', re_eq_I_RE, ' A)'
-  if (trim(re_eq_match_mode) .eq. 'q_shape') &
-    write(*,'(A,F10.5)') '                q amplitude (achieved/target) = ', c_amp
+  write(*,'(A,F10.5)') '                q amplitude (achieved/target) = ', c_glob
   if (maxval(re_cl_edge_frac) .gt. 2.d-1) &
     write(*,'(A,ES10.2,A)') ' WARNING: re_eq: ', maxval(re_cl_edge_frac), &
       ' of the current of the worst class is carried on the outermost 5% of'  // &
@@ -1890,6 +1895,40 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   ! inner Picard iteration (equilibrium.f90), not a slow outer relaxation.
   ! re_eq_alpha_current is superseded and ignored; see the warning in
   ! re_eq_init.
+
+  ! --- DILATION CONTROL (full_q with the current pinned).
+  !     With I_RE held exactly, the uniform direction of Nprof is consumed by
+  !     the current constraint, so the outer loop can no longer move the
+  !     ABSOLUTE level of q -- only its shape. The residual is then a single
+  !     number: the whole plasma comes out the wrong SIZE, so r(psihat_n) is
+  !     off by a common factor at every psihat_n and q ~ r^2 / I_enc is off
+  !     globally while the shape is already right.
+  !
+  !     The mechanism that fixes it -- the LCFS moving -- is absent from the
+  !     Jacobian: both the transplant ratio and the operator K are assembled
+  !     at FIXED psi, so every linear step is blind to it and the loop
+  !     converges to the fixed point of an incomplete Jacobian. This supplies
+  !     the missing SEARCH DIRECTION (it adds no constraint): dilating Nprof
+  !     in the label coordinate redistributes the same total current more
+  !     broadly or more narrowly, which moves where psi falls to psi_lim and
+  !     hence the plasma size.
+  !
+  !     Gain law: a ~ sigma and q ~ a^2, so correcting a global mismatch
+  !     c_glob needs sigma ~ c_glob**(-1/2); under-relaxed with re_eq_alpha_out
+  !     (no new namelist parameter) and clamped, since the response is only
+  !     approximately quadratic.
+  if ((trim(re_eq_match_mode) .ne. 'q_shape') .and. (re_eq_I_RE .ne. 0.d0) .and. &
+      (c_glob .gt. 0.d0)) then
+    sigma = c_glob**(-0.5d0 * re_eq_alpha_out)
+    sigma = min(max(sigma, 0.9d0), 1.1d0)
+    if (abs(sigma - 1.d0) .gt. 1.d-12) then
+      do k = 1, re_eq_n_l
+        Ndil(k) = re_eq_nprof_eval(re_nprof_l(k) / sigma)
+      enddo
+      re_nprof(1:re_eq_n_l) = Ndil
+      call re_eq_apply_beam_envelope()
+    endif
+  endif
 
 end subroutine re_eq_outer_update
 
