@@ -121,29 +121,13 @@ logical            :: re_eq_absorbing_edge = .false.  !< force Nprof(Ahat = 1) =
                                                       !< only acts for lraw > 1, and re_eq_nprof_eval
                                                       !< clips to [0,1], so once Nprof(1) = 0 the source
                                                       !< already vanishes at and beyond Ahat = 1.
-real*8             :: re_eq_alpha_current = 0.d0      !< under-relaxation of the total-current control:
-                                                      !< after each outer update Nprof is scaled by
-                                                      !< (|re_eq_I_RE| / |I_RE|)**re_eq_alpha_current.
-                                                      !< 0 (default) = OFF; ~0.2 is a sensible start.
-                                                      !< WHY a slow rescale and NOT a row in the operator
-                                                      !< least squares: at FIXED psi the flux surfaces do
-                                                      !< not move, so q ~ 1/I_enc rigidly -- a current row
-                                                      !< is then the SAME equation as the outermost q row
-                                                      !< with a different right-hand side, and the solve
-                                                      !< just splits the difference (tried: it degrades
-                                                      !< both criteria at every weight).
-                                                      !< The size/current degeneracy q_a ~ a^2/I lives
-                                                      !< ACROSS outer iterations, where psi re-solves and
-                                                      !< the LCFS moves. Rescaling between iterations lets
-                                                      !< the equilibrium slide ALONG that direction: the
-                                                      !< GS solve expands the LCFS and q(psihat_n)
-                                                      !< recovers, so the q match and the current control
-                                                      !< separate instead of competing.
-                                                      !< Only meaningful where the LCFS can move (a domain
-                                                      !< larger than the plasma). Where the boundary IS
-                                                      !< the LCFS (n_open = 0) the area cannot change,
-                                                      !< there is no degenerate direction to slide along,
-                                                      !< and this will simply fight the q match.
+real*8             :: re_eq_alpha_current = 0.d0      !< SUPERSEDED and ignored (kept only so existing
+                                                      !< input files still read). The requested current
+                                                      !< is now held EXACTLY at every inner Picard
+                                                      !< iteration whenever re_eq_I_RE is nonzero, which
+                                                      !< removes the Nprof amplitude from the outer
+                                                      !< optimization instead of relaxing towards the
+                                                      !< target across outer iterations.
 real*8             :: re_eq_op_lambda   = 1.d-2       !< smoothness regularization of the 'operator'
                                                       !< transplant variant (damped least squares on the
                                                       !< relative Nprof correction); unused otherwise
@@ -270,17 +254,11 @@ subroutine re_eq_init(my_id)
     stop 1
   endif
 
-  if ((re_eq_alpha_current .gt. 0.d0) .and. (re_eq_I_RE .eq. 0.d0)) then
-    write(*,*) 'ERROR: re_eq: re_eq_alpha_current > 0 requires a nonzero re_eq_I_RE'
-    write(*,*) '       (the target of the total-current control).'
-    stop 1
-  endif
-  if ((re_eq_alpha_current .gt. 0.d0) .and. (trim(re_eq_match_mode) .eq. 'q_shape')) then
-    write(*,*) 'ERROR: re_eq: re_eq_alpha_current is for full_q. In q_shape the'
-    write(*,*) '       current is already held exactly by re_eq_rescale_current,'
-    write(*,*) '       and the q amplitude is free -- so the size/current'
-    write(*,*) '       degeneracy returns and the control has nothing to pin.'
-    stop 1
+  if (re_eq_alpha_current .gt. 0.d0) then
+    write(*,*) 'WARNING: re_eq: re_eq_alpha_current is superseded and IGNORED.'
+    write(*,*) '         The requested current is now held exactly at every inner'
+    write(*,*) '         Picard iteration (set re_eq_I_RE); the slow outer rescale'
+    write(*,*) '         it controlled has been removed.'
   endif
 
   call re_eq_read_distribution(my_id)
@@ -297,9 +275,8 @@ subroutine re_eq_init(my_id)
   write(*,'(A,A)')      '   match mode           : ', trim(re_eq_match_mode)
   write(*,'(A,A)')      '   transplant variant   : ', trim(re_eq_transplant)
   write(*,'(A,A)')      '   label map            : ', trim(re_eq_map_mode)
-  if (re_eq_alpha_current .gt. 0.d0) &
-    write(*,'(A,ES12.4,A,F8.3,A)') '   current control      : I_RE -> ', re_eq_I_RE, &
-      ' A  (alpha ', re_eq_alpha_current, ')'
+  if (re_eq_I_RE .ne. 0.d0) &
+    write(*,'(A,ES12.4,A)') '   current held at      : ', re_eq_I_RE, ' A (exact, every inner iteration)'
   if (re_eq_absorbing_edge) then
     write(*,'(A)')      '   absorbing edge       : ON  (Nprof(Ahat=1) = 0;'
     write(*,'(A)')      '                          re_eq_edge_taper has no effect)'
@@ -1572,7 +1549,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   real*8  :: phm(re_eq_n_l), phe, q_at, qt_at, ratio(re_eq_n_l), lr(re_eq_n_l)
   real*8  :: q_acc(re_eq_n_l), qt_acc(re_eq_n_l)
   real*8  :: cw(re_eq_n_class), cw_sum, ph_beam_cl(re_eq_n_class)
-  real*8  :: c_amp, num, den, err, err_ctl, I_now, ph_ctl_max, ph_beam, l_eff, f_cur, err_cur
+  real*8  :: c_amp, num, den, err, err_ctl, I_now, ph_ctl_max, ph_beam, l_eff, err_cur
   real*8  :: C(re_eq_n_l), dl, qq
 
   re_eq_outer_iter = re_eq_outer_iter + 1
@@ -1726,9 +1703,9 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   re_eq_q_err = err
 
   ! --- current-matching error, only when a target current is actually being
-  !     enforced (re_eq_alpha_current > 0). Without it the q error alone is
+  !     requested (re_eq_I_RE nonzero). Without it the q error alone is
   !     the criterion, exactly as before.
-  cur_active = (re_eq_alpha_current .gt. 0.d0) .and. (re_eq_I_RE .ne. 0.d0)
+  cur_active = (re_eq_I_RE .ne. 0.d0)
   err_cur    = 0.d0
   if (cur_active) err_cur = abs(abs(I_now)/abs(re_eq_I_RE) - 1.d0)
 
@@ -1909,16 +1886,10 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   ! regenerate small current beyond the beam edge when differentiating C)
   call re_eq_apply_beam_envelope()
 
-  ! --- total-current control: a SLOW uniform rescale towards re_eq_I_RE,
-  !     deliberately outside the q solve (see re_eq_alpha_current). I_now is
-  !     the current of the state just evaluated; the same per-iteration bound
-  !     as the transplant ratio keeps it from lurching.
-  if ((re_eq_alpha_current .gt. 0.d0) .and. (abs(I_now) .gt. 0.d0)) then
-    f_cur = (abs(re_eq_I_RE) / abs(I_now))**re_eq_alpha_current
-    f_cur = min(max(f_cur, 1.d0/re_eq_ratio_clamp), re_eq_ratio_clamp)
-    re_nprof(1:re_eq_n_l) = re_nprof(1:re_eq_n_l) * f_cur
-    call re_eq_apply_beam_envelope()
-  endif
+  ! NOTE the total-current control is now the EXACT rescale applied every
+  ! inner Picard iteration (equilibrium.f90), not a slow outer relaxation.
+  ! re_eq_alpha_current is superseded and ignored; see the warning in
+  ! re_eq_init.
 
 end subroutine re_eq_outer_update
 

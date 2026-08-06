@@ -150,10 +150,19 @@ if (my_id == 0) then
 
     ! --- refresh the per-class drift-surface labels for the present psi
     ! --- (the per-class drift axes move while psi converges), and hold the
-    ! --- prescribed RE current in q_shape mode
+    ! --- prescribed RE current whenever one is requested.
+    ! --- Gated on re_eq_I_RE rather than on the match mode: holding the
+    ! --- current EXACTLY here removes the Nprof amplitude from the outer
+    ! --- optimization entirely, leaving it only the shape to work with. That
+    ! --- is why q_shape converges so easily -- a uniform rescale changes no
+    ! --- shape, and the shape match changes no current, so the two never
+    ! --- compete. In full_q the amplitude is otherwise pulled by BOTH the q
+    ! --- amplitude and the current target, which is badly conditioned; with
+    ! --- the current pinned here, absolute q is still matched, but through
+    ! --- the shape (which moves the LCFS, hence q_a ~ a^2 B0 / I).
     if (re_kinetic_equilibrium) then
       call re_eq_update_labels(my_id, node_list, element_list, bnd_node_list)
-      if (trim(re_eq_match_mode) .eq. 'q_shape') &
+      if ((trim(re_eq_match_mode) .eq. 'q_shape') .or. (re_eq_I_RE .ne. 0.d0)) &
         call re_eq_rescale_current(my_id, node_list, element_list)
     endif
 
