@@ -51,8 +51,7 @@ public :: re_kinetic_equilibrium, re_eq_dist_file, re_eq_dist_format,          &
           re_eq_xi_min, re_eq_alpha_out, re_eq_tol_q, re_eq_tol_q_soft,        &
           re_eq_edge_taper, re_eq_l_beam, re_eq_l_beam_width,                  &
           re_eq_ratio_clamp, re_eq_absorbing_edge, re_eq_op_lambda,             &
-          re_eq_alpha_current,                                                 &
-          re_eq_max_it_out, re_eq_n_l, re_eq_n_q_levels, re_eq_n_midplane,     &
+          re_eq_max_it_out, re_eq_n_l, re_eq_n_q_levels,                       &
           re_eq_finite_pitch
 ! --- driver interface (used by equilibrium.f90 and the GS element assembly)
 public :: re_eq_init, re_eq_update_labels, re_eq_rescale_current,              &
@@ -70,7 +69,12 @@ character(len=32)  :: re_eq_dist_format = 'ekin_xi_w' !< table format (see re_eq
 character(len=256) :: re_eq_q_file      = 'none'      !< target q profile table: psihat_n, q_t
 character(len=16)  :: re_eq_match_mode  = 'full_q'    !< 'full_q': match q_t incl. amplitude, I_RE is an output;
                                                       !< 'q_shape': match the shape at prescribed re_eq_I_RE
-character(len=16)  :: re_eq_transplant  = 'cumulative'!< outer update variant: 'cumulative' (default) or 'pointwise'
+character(len=16)  :: re_eq_transplant  = 'operator'  !< outer update variant. 'operator' (default): damped
+                                                      !< least squares against the exact fixed-psi response
+                                                      !< operator K, with a Broyden correction for the
+                                                      !< geometry term K cannot contain. 'cumulative' /
+                                                      !< 'pointwise': the older label-map transplants, which
+                                                      !< place the update through a single psihat per label
 character(len=16)  :: re_eq_map_mode    = 'midplane'  !< label map Ahat<->psihat: 'midplane' (default, the
                                                       !< 2-point midplane average, Eq. 8 of the doc) or
                                                       !< 'contour' (average psihat_n over the WHOLE drift
@@ -80,8 +84,9 @@ character(len=16)  :: re_eq_map_mode    = 'midplane'  !< label map Ahat<->psihat
                                                       !< achievable q match)
 real*8             :: re_eq_I_RE        = 0.d0        !< prescribed RE current [A]: held exactly in
                                                       !< q_shape mode, and the target of the optional
-                                                      !< total-current control (re_eq_alpha_current) in
-                                                      !< full_q mode
+                                                      !< total-current constraint in full_q mode: when
+                                                      !< nonzero it is held EXACTLY at every inner Picard
+                                                      !< iteration by re_eq_rescale_current
 real*8             :: re_eq_xi_min      = 0.9d0       !< minimum |pitch|; abort below (trapped REs out of scope)
 real*8             :: re_eq_alpha_out   = 0.3d0       !< under-relaxation of the outer transplant update
 real*8             :: re_eq_tol_q       = 1.d-3       !< outer convergence: max|q/q_t - 1|
@@ -89,7 +94,7 @@ real*8             :: re_eq_tol_q_soft  = 1.d-2       !< soft tolerance: a stagn
                                                       !< below this is accepted with a warning (with one common
                                                       !< Nprof and strongly different class drift shifts, exactly
                                                       !< matching q_t can be outside the range of the ansatz)
-real*8             :: re_eq_edge_taper  = 0.2d0       !< label width of the linear taper that removes the current
+real*8             :: re_eq_edge_taper  = 0.d0        !< label width of the linear taper that removes the current
                                                       !< of drift surfaces leaving the domain (Ahat > 1): RE
                                                       !< orbits crossing the wall are lost. A hard clamp instead
                                                       !< (keeping Nprof(1) outside) creates an uncontrollable
@@ -121,13 +126,6 @@ logical            :: re_eq_absorbing_edge = .false.  !< force Nprof(Ahat = 1) =
                                                       !< only acts for lraw > 1, and re_eq_nprof_eval
                                                       !< clips to [0,1], so once Nprof(1) = 0 the source
                                                       !< already vanishes at and beyond Ahat = 1.
-real*8             :: re_eq_alpha_current = 0.d0      !< SUPERSEDED and ignored (kept only so existing
-                                                      !< input files still read). The requested current
-                                                      !< is now held EXACTLY at every inner Picard
-                                                      !< iteration whenever re_eq_I_RE is nonzero, which
-                                                      !< removes the Nprof amplitude from the outer
-                                                      !< optimization instead of relaxing towards the
-                                                      !< target across outer iterations.
 real*8             :: re_eq_op_lambda   = 1.d-2       !< smoothness regularization of the 'operator'
                                                       !< transplant variant (damped least squares on the
                                                       !< relative Nprof correction); unused otherwise
@@ -135,7 +133,6 @@ real*8             :: re_eq_ratio_clamp = 2.d0        !< per-iteration clamp of 
 integer            :: re_eq_max_it_out  = 50          !< maximum outer iterations
 integer            :: re_eq_n_l         = 101         !< number of points of the Nprof(l) table
 integer            :: re_eq_n_q_levels  = 80          !< number of psihat levels of the q evaluation
-integer            :: re_eq_n_midplane  = 400         !< number of midplane points of the label map
 logical            :: re_eq_finite_pitch = .false.    !< use A_s with R*B_phi/B and mu-conserving v_par (not
                                                       !< yet implemented; the small-pitch default neglects
                                                       !< O((p_perp/p_par)^2 * dB/B))
@@ -263,13 +260,6 @@ subroutine re_eq_init(my_id)
     stop 1
   endif
 
-  if (re_eq_alpha_current .gt. 0.d0) then
-    write(*,*) 'WARNING: re_eq: re_eq_alpha_current is superseded and IGNORED.'
-    write(*,*) '         The requested current is now held exactly at every inner'
-    write(*,*) '         Picard iteration (set re_eq_I_RE); the slow outer rescale'
-    write(*,*) '         it controlled has been removed.'
-  endif
-
   call re_eq_read_distribution(my_id)
   call re_eq_read_q_target(my_id)
   call re_eq_init_nprof(my_id)
@@ -298,7 +288,7 @@ subroutine re_eq_init(my_id)
   enddo
 
   open(RE_EQ_LOG_UNIT, file='re_eq_convergence.log', action='write', status='replace')
-  write(RE_EQ_LOG_UNIT,'(A)') '# outer  inner_iters  max|q/qt-1|   q_err_in_beam   I_RE[A]        I_err          q_amplitude    q_tilt         max_edge_fraction'
+  write(RE_EQ_LOG_UNIT,'(A)') '# outer  #inner   max|q/qt-1|    I_RE[A]        max_edge_fraction'
 
   re_eq_outer_iter  = 0
   re_eq_initialized = .true.
@@ -1262,7 +1252,8 @@ subroutine re_eq_label_map(my_id, node_list, element_list, alpha, A_edge_in, &
   endif
 
   ! === Midplane-average label map (default, Eq. 8) ===========================
-  np = re_eq_n_midplane
+  np = 400            ! midplane scan resolution (was re_eq_n_midplane;
+                      ! a pure resolution knob that was never tuned)
   allocate(Rg(np), psig(np), lhatg(np), phg(np))
 
   ! --- midplane scan at the Z of the effective drift axis. Point location
@@ -1477,6 +1468,10 @@ subroutine re_eq_operator_update(node_list, element_list, n_lev, ph_lev, q_lev, 
   real*8  :: L(re_eq_n_l, re_eq_n_l), AtA(re_eq_n_l, re_eq_n_l), Atb(re_eq_n_l)
   real*8  :: u(re_eq_n_l), qt_at, wcon, umin, umax
   real*8  :: sts, bfac, Ms(n_lev), yv(n_lev), s_real(re_eq_n_l)
+  ! A/B switch for the Broyden correction below. Set .false. to solve with the
+  ! raw fixed-psi operator and measure what the correction is actually worth
+  ! (compare the shape residual: the full q residual with its mean removed).
+  logical, parameter :: USE_BROYDEN = .true.
 
   ! --- Realised change of Nprof since the previous residual measurement.
   !     NOT the step the previous solve intended: re_eq_rescale_current runs
@@ -1545,7 +1540,7 @@ subroutine re_eq_operator_update(node_list, element_list, n_lev, ph_lev, q_lev, 
   !     from K and Nprof every iteration, so a stale accumulated correction
   !     would not transfer. Damped so a small step cannot produce a huge
   !     correction.
-  if (re_eq_have_hist) then
+  if (re_eq_have_hist .and. USE_BROYDEN) then
     sts = dot_product(s_real, s_real)
     if (sts .gt. 1.d-30) then
       Ms  = matmul(M, s_real)
@@ -1627,7 +1622,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   real*8  :: q_acc(re_eq_n_l), qt_acc(re_eq_n_l)
   real*8  :: cw(re_eq_n_class), cw_sum, ph_beam_cl(re_eq_n_class)
   real*8  :: c_amp, num, den, err, err_ctl, I_now, ph_ctl_max, ph_beam, l_eff, err_cur
-  real*8  :: c_glob, q_tilt, phbar, rbar, sxx, sxy
+  real*8  :: c_glob
   real*8  :: C(re_eq_n_l), dl, qq
 
   re_eq_outer_iter = re_eq_outer_iter + 1
@@ -1787,27 +1782,12 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   !     err_ctl is kept and reported alongside so the split stays visible.
   err     = 0.d0
   err_ctl = 0.d0
-  phbar = 0.d0;  rbar = 0.d0;  sxx = 0.d0;  sxy = 0.d0
   do i = 1, n_lev
     qq  = q_lev(i) / (c_amp * re_eq_qt_eval(ph_lev(i)))
     err = max(err, abs(qq - 1.d0))
     if (ph_lev(i) .le. ph_ctl_max) err_ctl = max(err_ctl, abs(qq - 1.d0))
-    phbar = phbar + ph_lev(i)
-    rbar  = rbar  + (qq - 1.d0)
   enddo
-  phbar = phbar / dble(n_lev);  rbar = rbar / dble(n_lev)
-  do i = 1, n_lev
-    qq  = q_lev(i) / (c_amp * re_eq_qt_eval(ph_lev(i)))
-    sxx = sxx + (ph_lev(i) - phbar)**2
-    sxy = sxy + (ph_lev(i) - phbar) * ((qq - 1.d0) - rbar)
-  enddo
-  ! Slope of the relative q residual against psihat_n. The residual of a
-  ! stalled high-energy case is a smooth monotonic TILT (q low in the core,
-  ! high at the edge), not the global offset that c_glob measures -- measured
-  ! -1.5e-2 at psihat 0.02 rising to +3.4e-2 at 0.985, with a mean of only
-  ! -4.9e-3. Reporting the tilt makes that visible directly.
-  q_tilt = 0.d0
-  if (sxx .gt. 0.d0) q_tilt = sxy / sxx
+
   re_eq_q_err = err
 
   ! --- current-matching error, only when a target current is actually being
@@ -1876,7 +1856,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
       re_nprof(1:re_eq_n_l) = re_eq_best_nprof(1:re_eq_n_l)
       call re_eq_apply_beam_envelope()
       re_eq_reverted = .true.
-      write(RE_EQ_LOG_UNIT,'(I6,I8,7ES16.6)') re_eq_outer_iter, n_inner, err, err_ctl, I_now, err_cur, c_glob, q_tilt, maxval(re_cl_edge_frac)
+      write(RE_EQ_LOG_UNIT,'(I6,I8,3ES16.6)') re_eq_outer_iter, n_inner, err, I_now, maxval(re_cl_edge_frac)
       call flush_it(RE_EQ_LOG_UNIT)
       return                          ! caller re-converges psi on the best profile
     endif
@@ -1896,7 +1876,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
     ! Nprof is frozen in this branch, so further outer iterations would only
     ! re-converge and re-evaluate the identical state -- stop the loop here.
     re_eq_done = .true.
-    write(RE_EQ_LOG_UNIT,'(I6,I8,7ES16.6)') re_eq_outer_iter, n_inner, err, err_ctl, I_now, err_cur, c_glob, q_tilt, maxval(re_cl_edge_frac)
+    write(RE_EQ_LOG_UNIT,'(I6,I8,3ES16.6)') re_eq_outer_iter, n_inner, err, I_now, maxval(re_cl_edge_frac)
     call flush_it(RE_EQ_LOG_UNIT)
     return
   endif
@@ -1929,14 +1909,13 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   if (cur_active) &
     write(*,'(A,ES11.3,A,ES12.4,A)') '                |I_RE/target - 1| = ', err_cur, &
       '   (target ', re_eq_I_RE, ' A)'
-  write(*,'(A,F10.5,A,ES11.3)') '                q amplitude (achieved/target) = ', c_glob, &
-    '   residual tilt d(q/q_t)/dpsihat = ', q_tilt
+  write(*,'(A,F10.5)') '                q amplitude (achieved/target) = ', c_glob
   if (maxval(re_cl_edge_frac) .gt. 2.d-1) &
     write(*,'(A,ES10.2,A)') ' WARNING: re_eq: ', maxval(re_cl_edge_frac), &
       ' of the current of the worst class is carried on the outermost 5% of'  // &
       ' the label range: the beam edge is hard against the loss boundary'
 
-  write(RE_EQ_LOG_UNIT,'(I6,I8,7ES16.6)') re_eq_outer_iter, n_inner, err, err_ctl, I_now, err_cur, c_glob, q_tilt, maxval(re_cl_edge_frac)
+  write(RE_EQ_LOG_UNIT,'(I6,I8,3ES16.6)') re_eq_outer_iter, n_inner, err, I_now, maxval(re_cl_edge_frac)
   call flush_it(RE_EQ_LOG_UNIT)
 
   if (converged .or. (re_eq_n_stall .ge. 15) .or. (re_eq_outer_iter .ge. re_eq_max_it_out)) then
@@ -1994,10 +1973,6 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   ! regenerate small current beyond the beam edge when differentiating C)
   call re_eq_apply_beam_envelope()
 
-  ! NOTE the total-current control is now the EXACT rescale applied every
-  ! inner Picard iteration (equilibrium.f90), not a slow outer relaxation.
-  ! re_eq_alpha_current is superseded and ignored; see the warning in
-  ! re_eq_init.
 
 
 end subroutine re_eq_outer_update

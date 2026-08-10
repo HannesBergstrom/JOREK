@@ -24,8 +24,8 @@ use mod_re_kinetic_equilibrium, only: re_kinetic_equilibrium, re_eq_dist_file,  
       re_eq_map_mode,                                                             &
       re_eq_I_RE, re_eq_xi_min, re_eq_alpha_out, re_eq_tol_q, re_eq_tol_q_soft,    &
       re_eq_edge_taper, re_eq_l_beam, re_eq_l_beam_width, re_eq_ratio_clamp,       &
-      re_eq_absorbing_edge, re_eq_op_lambda, re_eq_alpha_current,                  &
-      re_eq_max_it_out, re_eq_n_l, re_eq_n_q_levels, re_eq_n_midplane,             &
+      re_eq_absorbing_edge, re_eq_op_lambda,                                       &
+      re_eq_max_it_out, re_eq_n_l, re_eq_n_q_levels,             &
       re_eq_finite_pitch
 
 implicit none
@@ -838,13 +838,12 @@ if (my_id .eq. 0) then
   call MPI_PACK(re_eq_l_beam,           1,MPI_REAL8,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(re_eq_absorbing_edge,  1,MPI_LOGICAL,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(re_eq_op_lambda,       1,MPI_REAL8,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
-  call MPI_PACK(re_eq_alpha_current,   1,MPI_REAL8,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(re_eq_l_beam_width,     1,MPI_REAL8,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(re_eq_ratio_clamp,      1,MPI_REAL8,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(re_eq_max_it_out,       1,MPI_INTEGER,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(re_eq_n_l,              1,MPI_INTEGER,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(re_eq_n_q_levels,       1,MPI_INTEGER,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
-  call MPI_PACK(re_eq_n_midplane,       1,MPI_INTEGER,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
+  call MPI_PACK(      1,MPI_INTEGER,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
 
   n_tmp = 2*(n_coord_tor+1)*(l_pol_domm+1)
   call MPI_PACK(dcoef,              n_tmp,MPI_REAL8,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
@@ -1856,13 +1855,12 @@ if (my_id .ne. 0) then
   call MPI_UNPACK(buffer,bufsize,position,re_eq_l_beam,           1,MPI_REAL8,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,re_eq_absorbing_edge,  1,MPI_LOGICAL,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,re_eq_op_lambda,       1,MPI_REAL8,MPI_COMM_WORLD,ierr)
-  call MPI_UNPACK(buffer,bufsize,position,re_eq_alpha_current,   1,MPI_REAL8,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,re_eq_l_beam_width,     1,MPI_REAL8,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,re_eq_ratio_clamp,      1,MPI_REAL8,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,re_eq_max_it_out,       1,MPI_INTEGER,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,re_eq_n_l,              1,MPI_INTEGER,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,re_eq_n_q_levels,       1,MPI_INTEGER,MPI_COMM_WORLD,ierr)
-  call MPI_UNPACK(buffer,bufsize,position,re_eq_n_midplane,       1,MPI_INTEGER,MPI_COMM_WORLD,ierr)
+  call MPI_UNPACK(buffer,bufsize,position,      1,MPI_INTEGER,MPI_COMM_WORLD,ierr)
 
   n_tmp = 2*(n_coord_tor+1)*(l_pol_domm+1)
   call MPI_UNPACK(buffer,bufsize,position,dcoef,              n_tmp,MPI_REAL8,MPI_COMM_WORLD,ierr)
