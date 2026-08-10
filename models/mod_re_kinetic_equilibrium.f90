@@ -71,8 +71,7 @@ character(len=16)  :: re_eq_match_mode  = 'full_q'    !< 'full_q': match q_t inc
                                                       !< 'q_shape': match the shape at prescribed re_eq_I_RE
 character(len=16)  :: re_eq_transplant  = 'operator'  !< outer update variant. 'operator' (default): damped
                                                       !< least squares against the exact fixed-psi response
-                                                      !< operator K, with a Broyden correction for the
-                                                      !< geometry term K cannot contain. 'cumulative' /
+                                                      !< operator K. 'cumulative' /
                                                       !< 'pointwise': the older label-map transplants, which
                                                       !< place the update through a single psihat per label
 character(len=16)  :: re_eq_map_mode    = 'midplane'  !< label map Ahat<->psihat: 'midplane' (default, the
@@ -112,9 +111,18 @@ real*8             :: re_eq_l_beam      = 1.d0        !< beam-edge label: the RE
                                                       !< the beam; q in the vacuum annulus is an output.
 real*8             :: re_eq_l_beam_width = 0.1d0      !< label width of the smoothstep roll-off of the beam
                                                       !< current inside [l_beam - width, l_beam]
-logical            :: re_eq_absorbing_edge = .false.  !< force Nprof(Ahat = 1) = 0, i.e. treat the last
+logical            :: re_eq_absorbing_edge = .true.   !< force Nprof(Ahat = 1) = 0, i.e. treat the last
                                                       !< confined drift surface as an ABSORBING boundary
-                                                      !< for the RE density. Off by default. Intended for
+                                                      !< for the RE density. ON by default: with
+                                                      !< re_eq_edge_taper = 0 the profile would otherwise be
+                                                      !< cut by a STEP of size Nprof(1), which the finite
+                                                      !< elements render as an element-scale ripple with a
+                                                      !< Gibbs undershoot -- an artificial current gradient
+                                                      !< in an equilibrium whose purpose is marker loading.
+                                                      !< Note the justification is numerical, not a kinetic
+                                                      !< boundary condition: this model has no transport
+                                                      !< operator, so nothing physically forces the density
+                                                      !< to vanish at the last confined orbit. Intended for
                                                       !< cases whose domain extends past the LCFS, where
                                                       !< Ahat = 1 lies in the open-field-line region and
                                                       !< the constraint therefore costs nothing where q_t
@@ -175,12 +183,6 @@ real*8  :: re_eq_I_now   = 0.d0         !< latest RE current [A]
 integer             :: re_eq_n_qlast   = 0      !< last evaluated q profile, kept so it can be
 real*8, allocatable :: re_eq_ph_last(:)         !< written out even when the run does NOT converge
 real*8, allocatable :: re_eq_q_last(:)
-!> Broyden history for the operator update: the previous applied step (in
-!> relative-Nprof space) and the residual it acted on. Used to correct the
-!> response matrix for the part of the true Jacobian that K cannot contain.
-real*8, allocatable :: re_eq_N_prev(:)      !< Nprof at the START of the previous outer update
-real*8, allocatable :: re_eq_r_prev(:)      !< previous residual, size n_lev
-logical             :: re_eq_have_hist = .false.
 real*8              :: re_eq_best_err_cur = 1.d99 !< best |I_RE/target - 1| so far; only used when the
                                                    !< total-current control is active
 real*8              :: re_eq_best_err = 1.d99   !< best IN-BEAM max|q/q_t - 1| so far
@@ -610,7 +612,6 @@ subroutine re_eq_init_nprof(my_id)
   enddo
   re_eq_best_err      = 1.d99
   re_eq_best_err_cur  = 1.d99
-  re_eq_have_hist     = .false.
   re_eq_n_stall       = 0
   re_eq_finishing     = .false.
   re_eq_soft_accepted = .false.
@@ -1467,32 +1468,6 @@ subroutine re_eq_operator_update(node_list, element_list, n_lev, ph_lev, q_lev, 
   real*8  :: Ktot(re_eq_n_l)
   real*8  :: L(re_eq_n_l, re_eq_n_l), AtA(re_eq_n_l, re_eq_n_l), Atb(re_eq_n_l)
   real*8  :: u(re_eq_n_l), qt_at, wcon, umin, umax
-  real*8  :: sts, bfac, Ms(n_lev), yv(n_lev), s_real(re_eq_n_l)
-  ! A/B switch for the Broyden correction below. Set .false. to solve with the
-  ! raw fixed-psi operator and measure what the correction is actually worth
-  ! (compare the shape residual: the full q residual with its mean removed).
-  logical, parameter :: USE_BROYDEN = .true.
-
-  ! --- Realised change of Nprof since the previous residual measurement.
-  !     NOT the step the previous solve intended: re_eq_rescale_current runs
-  !     every inner Picard iteration and renormalises Nprof to hold I_RE,
-  !     which strips the UNIFORM component out of whatever the outer update
-  !     proposed. Feeding the intended step to the secant therefore claims a
-  !     motion that never happened, and the error is entirely in the uniform
-  !     direction -- precisely where the residual sits once the shape is
-  !     matched. Measuring the realised change instead makes the secant
-  !     equation true by construction.
-  !     Stored at the START of each call, so the interval spanned matches the
-  !     interval between the two residual measurements exactly.
-  if (.not. allocated(re_eq_N_prev)) allocate(re_eq_N_prev(re_eq_n_l), re_eq_r_prev(n_lev))
-  s_real = 0.d0
-  if (re_eq_have_hist) then
-    do k = 1, re_eq_n_l
-      if (re_eq_N_prev(k) .gt. 0.d0) &
-        s_real(k) = re_nprof(k) / re_eq_N_prev(k) - 1.d0
-    enddo
-  endif
-  re_eq_N_prev = re_nprof(1:re_eq_n_l)
 
   call re_eq_response_operator(node_list, element_list, n_lev, ph_lev, Kop, Ktot)
 
@@ -1514,46 +1489,6 @@ subroutine re_eq_operator_update(node_list, element_list, n_lev, ph_lev, q_lev, 
   enddo
   L(1,1) = -1.d0;  L(1,2) = 1.d0
   L(re_eq_n_l,re_eq_n_l-1) = 1.d0;  L(re_eq_n_l,re_eq_n_l) = -1.d0
-
-  ! --- Broyden correction to the response matrix.
-  !
-  !     M is assembled at FIXED psi, so it contains dI(psihat)/dN with the
-  !     flux surfaces frozen. The true outer-loop response also includes the
-  !     LCFS MOVING when the profile changes -- redistributing the same total
-  !     current alters where psi falls to psi_lim, hence r(psihat), hence
-  !     q ~ r^2/I_enc. That term is absent from M by construction, and it is
-  !     what leaves a stalled case with a smooth monotonic tilt in the
-  !     residual that the solve cannot remove (measured: -1.5e-2 in the core
-  !     to +3.4e-2 at the edge, while the global amplitude was only -0.5%).
-  !
-  !     Rather than adding a control for that mode -- which turns the problem
-  !     multivariate and lets the search settle on spurious optima -- correct
-  !     the DERIVATIVE from what the iteration already reveals. Applying step
-  !     s changed the residual by dr, whereas the model predicted -M s. The
-  !     rank-1 (memoryless "good Broyden") update
-  !         M_eff = M + (-dr - M s) s^T / (s^T s)
-  !     satisfies M_eff s = -dr exactly, i.e. it reproduces the TRUE observed
-  !     response along the direction just explored, geometry included. It adds
-  !     no free parameter and no search dimension.
-  !
-  !     Memoryless (one step, not accumulated) on purpose: M itself is rebuilt
-  !     from K and Nprof every iteration, so a stale accumulated correction
-  !     would not transfer. Damped so a small step cannot produce a huge
-  !     correction.
-  if (re_eq_have_hist .and. USE_BROYDEN) then
-    sts = dot_product(s_real, s_real)
-    if (sts .gt. 1.d-30) then
-      Ms  = matmul(M, s_real)
-      yv  = -(rhs - re_eq_r_prev) - Ms
-      ! limit the correction to the scale of M itself
-      bfac = 1.d0
-      if (sqrt(dot_product(yv,yv)*sts) .gt. maxval(abs(M))*sts) &
-        bfac = maxval(abs(M))*sts / max(sqrt(dot_product(yv,yv)*sts), 1.d-30)
-      do i = 1, n_lev
-        M(i,:) = M(i,:) + bfac * yv(i) * s_real / sts
-      enddo
-    endif
-  endif
 
   AtA = matmul(transpose(M), M) + re_eq_op_lambda * matmul(transpose(L), L)
   Atb = matmul(transpose(M), rhs)
@@ -1580,10 +1515,6 @@ subroutine re_eq_operator_update(node_list, element_list, n_lev, ph_lev, q_lev, 
     re_nprof(k) = max(re_nprof(k) * (1.d0 + re_eq_alpha_out * u(k)), 0.d0)
   enddo
 
-  ! history for the next iteration's Broyden correction (the profile snapshot
-  ! is taken at the top of this routine, not here -- see the note there)
-  re_eq_r_prev    = rhs
-  re_eq_have_hist = .true.
 
 end subroutine re_eq_operator_update
 

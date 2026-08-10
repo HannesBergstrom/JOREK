@@ -343,8 +343,9 @@ class REEquilibrium:
                  match_mode='full_q', I_RE=None,
                  alpha_in=0.5, tol_in=1e-10, max_it_in=200,
                  alpha_out=0.3, tol_q=1e-3, max_it_out=50,
-                 transplant='cumulative', edge_taper=0.2,
+                 transplant='operator', edge_taper=0.0,
                  l_beam=1.0, l_beam_width=0.1, label_map='midplane',
+                 absorbing_edge=True,
                  n_l=101, n_theta_q=256, verbose=True):
         self.cl = classes
         self.gs = solver
@@ -385,6 +386,12 @@ class REEquilibrium:
         # l_beam equals the normalized poloidal flux of the beam edge.
         self.l_beam = l_beam
         self.l_beam_width = l_beam_width
+        # Absorbing edge: force Nprof(Ahat=1) = 0. ON by default, mirroring
+        # the Fortran -- with edge_taper = 0 the profile would otherwise be cut
+        # by a step of size Nprof(1). The justification is numerical (no
+        # element-scale ripple in an equilibrium used for marker loading), not
+        # a kinetic boundary condition: there is no transport operator here.
+        self.absorbing_edge = absorbing_edge
         self.n_theta_q = n_theta_q
         self.verbose = verbose
 
@@ -466,8 +473,10 @@ class REEquilibrium:
                         / self.l_beam_width, 0.0, 1.0)
             f = f * (1.0 - t*t*(3.0 - 2.0*t))
         if self.edge_taper is not None:
-            t = np.clip((np.maximum(l_raw, 1.0) - 1.0) / self.edge_taper,
-                        0.0, 1.0)
+            # max(taper, tiny) so edge_taper = 0 is a HARD cut at Ahat = 1
+            # rather than a division by zero (mirrors the Fortran guard)
+            t = np.clip((np.maximum(l_raw, 1.0) - 1.0)
+                        / max(self.edge_taper, 1e-12), 0.0, 1.0)
             f = f * (1.0 - t*t*(3.0 - 2.0*t))
         return f
 
@@ -542,9 +551,7 @@ class REEquilibrium:
         Surfaces are traced by 1D root finding along rays from the psi axis
         (valid for the nested surfaces of this fixed-boundary prototype)."""
         if psihat_levels is None:
-            # q_lev_max lets a caller restrict the demanded range (the gap-scan
-            # experiment: how far inside the loss boundary q_t is asked for)
-            psihat_levels = np.linspace(0.02, getattr(self, 'q_lev_max', 0.985), 80)
+            psihat_levels = np.linspace(0.02, 0.985, 80)
         R_ax, Z_ax, psi_ax = self.psi_axis()
         dpsi = self.gs.psi_b - psi_ax
         gR, gZ = self.gs.grad(self.psi)
@@ -795,35 +802,6 @@ class REEquilibrium:
         # one (the density cannot keep rising onto orbits that are about to
         # be lost). Unlike Nprof(1) = 0 this needs no assumption about where
         # the loss boundary sits relative to the LCFS.
-        # NOTE the leverage must be measured on K, NOT on M. M[i,k] =
-        # K[i,k] N_k / I_i is proportional to N_k, so scoring leverage with it
-        # marks any label where Nprof happens to be SMALL as uncontrolled and
-        # shrinks it further -- positive feedback that hollows out the tail
-        # while protecting the spike (which, having large N, scores as high
-        # leverage). Measured: it crushed l = 0.80..0.98 to <0.05 and left
-        # N(1)/Nmax = 1.000 untouched. ||K[:,k]|| is the current per unit N
-        # that label k puts inside the demanded surfaces: purely geometric,
-        # independent of the profile being solved for.
-        mu = getattr(self, 'op_mu', 0.0)
-        if mu > 0.0:
-            lev = np.linalg.norm(K[good], axis=0)
-            lev = lev / max(lev.max(), 1e-300)
-            # (1-lev)^2 is too blunt: 0.46 at l=0.70 vs 0.84 at l=1.00, under 2x
-            # contrast, so it shrinks the whole outer half instead of the
-            # uncontrolled tail. The penalty has to DIVERGE as the leverage
-            # vanishes, so that it dominates exactly where the data does not.
-            w = mu * (1.0 / np.maximum(lev, 1e-3) - 1.0)
-            rows.append(np.diag(w))
-            rhs_rows.append(-w)
-        if absorbing:
-            # N_new[-1] = 0  <=>  u[-1] = -1, imposed as a heavily weighted row
-            # INSIDE the solve so the neighbouring labels adapt to it. Stamping
-            # N[-1] = 0 on afterwards does not work: the next iteration simply
-            # refills the last point and the neighbours never learn, leaving a
-            # one-interval cliff instead of a roll-off.
-            w = 1.0e3 * max(np.abs(M).max(), 1.0)
-            e = np.zeros((1, n_l)); e[0, -1] = w
-            rows.append(e); rhs_rows.append(np.array([-w]))
         A = np.vstack(rows)
         b = np.concatenate(rhs_rows)
         u, *_ = np.linalg.lstsq(A, b, rcond=None)
@@ -1032,7 +1010,7 @@ class REEquilibrium:
                 # evaluated, but ONLY for the ph_ctl / err_ctl diagnostic --
                 # it no longer places the update.
                 u = self._operator_update(ph, q_now, c, self.op_lambda,
-                                          absorbing=getattr(self, 'absorbing_edge', False))
+                                          absorbing=self.absorbing_edge)
                 u = np.clip(u, 1.0 / self.RATIO_CLAMP - 1.0,
                             self.RATIO_CLAMP - 1.0)
                 self.nprof.N = np.clip(self.nprof.N * (1.0 + self.alpha_out * u),
@@ -1057,7 +1035,7 @@ class REEquilibrium:
                 C *= factor
                 N_new = np.gradient(C, l, edge_order=2)
                 self.nprof.N = np.clip(N_new, 0.0, None)
-            if getattr(self, 'absorbing_edge', False):
+            if self.absorbing_edge:
                 self.nprof.N[-1] = 0.0
             self._apply_beam_envelope()
         if best_N is not None and best_err < np.inf:
