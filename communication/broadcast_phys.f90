@@ -843,7 +843,6 @@ if (my_id .eq. 0) then
   call MPI_PACK(re_eq_max_it_out,       1,MPI_INTEGER,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(re_eq_n_l,              1,MPI_INTEGER,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(re_eq_n_q_levels,       1,MPI_INTEGER,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
-  call MPI_PACK(      1,MPI_INTEGER,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
 
   n_tmp = 2*(n_coord_tor+1)*(l_pol_domm+1)
   call MPI_PACK(dcoef,              n_tmp,MPI_REAL8,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
@@ -1860,7 +1859,6 @@ if (my_id .ne. 0) then
   call MPI_UNPACK(buffer,bufsize,position,re_eq_max_it_out,       1,MPI_INTEGER,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,re_eq_n_l,              1,MPI_INTEGER,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,re_eq_n_q_levels,       1,MPI_INTEGER,MPI_COMM_WORLD,ierr)
-  call MPI_UNPACK(buffer,bufsize,position,      1,MPI_INTEGER,MPI_COMM_WORLD,ierr)
 
   n_tmp = 2*(n_coord_tor+1)*(l_pol_domm+1)
   call MPI_UNPACK(buffer,bufsize,position,dcoef,              n_tmp,MPI_REAL8,MPI_COMM_WORLD,ierr)
