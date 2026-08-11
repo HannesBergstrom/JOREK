@@ -116,15 +116,25 @@ current_tot  = 0.
 n_outer_eq      = 1
 re_eq_converged = .true.
 if (re_kinetic_equilibrium) then
-  if (freeboundary_equil .or. newton_GS_fixbnd) then
+  if (newton_GS_fixbnd .or. newton_GS_freebnd) then
     if (my_id == 0) then
-      write(*,*) 'ERROR: re_kinetic_equilibrium currently requires a fixed-boundary'
-      write(*,*) '       equilibrium with Picard iterations'
-      write(*,*) '       (freeboundary_equil=.f., newton_GS_fixbnd=.f.).'
-      write(*,*) '       Diverted (X-point) fixed-boundary cases ARE supported;'
-      write(*,*) '       free-boundary is not yet.'
+      write(*,*) 'ERROR: re_kinetic_equilibrium requires PICARD iterations'
+      write(*,*) '       (newton_GS_fixbnd=.f., newton_GS_freebnd=.f.).'
+      write(*,*) '       The Newton branches would need the Jacobian of the RE'
+      write(*,*) '       source, which is not implemented.'
+      write(*,*) '       Fixed-boundary (limiter and diverted) and free-boundary'
+      write(*,*) '       Picard equilibria ARE supported.'
     endif
     stop 1
+  endif
+  if (freeboundary_equil .and. (my_id == 0)) then
+    write(*,*) ' re_eq: FREE-BOUNDARY equilibrium. The RE labels are refreshed and'
+    write(*,*) '        the prescribed current held inside the free-boundary loop;'
+    write(*,*) '        the FF''/p'' current feedback is bypassed (it scales FF_0 and'
+    write(*,*) '        T_0, which are zero for a pure-RE equilibrium, so it cannot'
+    write(*,*) '        control I_RE). The plasma SIZE is then set by the coils --'
+    write(*,*) '        see the doc: q_t and I_RE can only both be matched if the'
+    write(*,*) '        external field is free to adjust.'
   endif
   if (xpoint2 .and. (my_id == 0)) then
     write(*,*) ' re_eq: DIVERTED (X-point) equilibrium: labels normalized against'
@@ -301,7 +311,6 @@ if (my_id == 0) then
   enddo ! iter_outer
 
   if (re_kinetic_equilibrium) then
-    call re_eq_write_output(my_id)
     if (allocated(surface_list_q%psi_values)) &
       call tr_deallocate(surface_list_q%psi_values,"surface_list_q%psi_values",CAT_GRID)
     if (allocated(ph_lev)) then
@@ -309,7 +318,27 @@ if (my_id == 0) then
       call tr_deallocate(q_lev,  "q_lev",  CAT_GRID)
       call tr_deallocate(rad_lev,"rad_lev",CAT_GRID)
     endif
-    call re_eq_finalize(re_eq_converged)
+    ! Hand-off (re_equilibrium.dat) and the final verdict are DEFERRED when a
+    ! free-boundary solve follows: that solve moves the plasma boundary, so the
+    ! per-class labels (A_axis, A_edge, R_axis) and I_RE all change. Writing
+    ! here would describe the fixed-boundary equilibrium while the restart
+    ! holds the free-boundary one, and the marker loader would sample on stale
+    ! labels. re_eq_finalize also closes the convergence log, which we still
+    ! want open through the free-boundary iterations.
+    if (.not. freeboundary_equil2) then
+      call re_eq_write_output(my_id)
+      call re_eq_finalize(re_eq_converged)
+    else
+      write(*,'(A)') ' re_eq: fixed-boundary phase done; hand-off deferred until'
+      write(*,'(A)') '        after the free-boundary solve (the labels move with'
+      write(*,'(A)') '        the boundary).'
+      if (.not. re_eq_converged) then
+        write(*,*) 'ERROR: re_eq: the fixed-boundary q matching did NOT converge;'
+        write(*,*) '       it provides the Nprof the free-boundary solve starts'
+        write(*,*) '       from, so there is no point continuing.'
+        call re_eq_finalize(re_eq_converged)
+      endif
+    endif
   endif
 
 end if ! my_id == 0
@@ -412,13 +441,32 @@ if (freeboundary_equil) then
       endif
       
       write(*,'(A,1f8.3)') ' Psi_bnd = ', ES%psi_bnd   
-      
+
+      ! --- Kinetic RE drift-surface equilibrium: the per-class labels must be
+      ! --- refreshed here for the same reason as in the fixed-boundary Picard
+      ! --- (the drift axes and the loss-boundary A_edge move as psi and the
+      ! --- plasma boundary converge), and the prescribed current held exactly
+      ! --- when one is requested. Analogue of the fixed-boundary block above.
+      if (re_kinetic_equilibrium) then
+        call re_eq_update_labels(my_id, node_list, element_list, bnd_node_list)
+        if ((trim(re_eq_match_mode) .eq. 'q_shape') .or. (re_eq_I_RE .ne. 0.d0)) &
+          call re_eq_rescale_current(my_id, node_list, element_list)
+      endif
+
       ! Calculate current feedback
       call integral_current(node_list,element_list,ES%psi_axis, ES%psi_bnd, xpoint2, xcase2, ES%Z_xpoint, current_tot)
   
       current_int = current_int + (current_tot-current_ref)
       
-      if ((mod(iter,n_feedback_current) .eq. 0) .and. (.not. newton_GS_freebnd)) then
+      ! The feedback below controls the total current by scaling FF' and p'.
+      ! For a pure-RE equilibrium FF_0 = FF_1 = 0 and T_0 ~ 0, so it is a NO-OP
+      ! that cannot control I_RE -- the current comes from Nprof and is held by
+      ! re_eq_rescale_current above. Freeze the factor rather than let it wind
+      ! up on a current error it has no authority over.
+      if (re_kinetic_equilibrium) then
+        current_FB_fact = 1.d0
+        current_int     = 0.d0
+      else if ((mod(iter,n_feedback_current) .eq. 0) .and. (.not. newton_GS_freebnd)) then
         current_FB_fact  = current_FB_fact * (1. - FB_Ip_position * (current_tot-current_ref)/current_ref &
                                                  - FB_Ip_integral *  current_int/current_ref   )
       else if ( cte_current_FB_fact > -1.d90 ) then
@@ -502,6 +550,16 @@ else
   
   psi_offset_freeb = 0.d0
   
+endif
+
+! --- Kinetic RE: deferred hand-off. Written now that the plasma boundary has
+!     settled, so re_equilibrium.dat describes the equilibrium actually in the
+!     restart. re_eq_q_err still reports the FIXED-boundary q match: the outer
+!     q-matching does not yet wrap the free-boundary loop (Stage B).
+if (re_kinetic_equilibrium .and. freeboundary_equil .and. (my_id == 0)) then
+  call re_eq_update_labels(my_id, node_list, element_list, bnd_node_list)
+  call re_eq_write_output(my_id)
+  call re_eq_finalize(re_eq_converged)
 endif
 
 if (my_id == 0) then
