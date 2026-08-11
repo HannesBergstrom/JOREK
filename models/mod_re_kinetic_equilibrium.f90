@@ -72,7 +72,8 @@ character(len=16)  :: re_eq_match_mode  = 'full_q'    !< 'full_q': match q_t inc
                                                       !< 'q_shape': match the shape at prescribed re_eq_I_RE
 character(len=16)  :: re_eq_transplant  = 'operator'  !< outer update variant. 'operator' (default): damped
                                                       !< least squares against the exact fixed-psi response
-                                                      !< operator K. 'cumulative' /
+                                                      !< operator K, with a Broyden correction for the
+                                                      !< geometry term K cannot contain. 'cumulative' /
                                                       !< 'pointwise': the older label-map transplants, which
                                                       !< place the update through a single psihat per label
 character(len=16)  :: re_eq_map_mode    = 'midplane'  !< label map Ahat<->psihat: 'midplane' (default, the
@@ -184,6 +185,17 @@ real*8  :: re_eq_I_now   = 0.d0         !< latest RE current [A]
 integer             :: re_eq_n_qlast   = 0      !< last evaluated q profile, kept so it can be
 real*8, allocatable :: re_eq_ph_last(:)         !< written out even when the run does NOT converge
 real*8, allocatable :: re_eq_q_last(:)
+!> Broyden history for the operator update. The step fed to the secant must be
+!> the REALISED change of Nprof, not the one the solve intended:
+!> re_eq_rescale_current runs every inner Picard iteration and strips the
+!> UNIFORM component out of whatever the outer update proposed, so the intended
+!> step claims a motion that never happened -- and the error is entirely in the
+!> uniform direction. re_eq_N_prev is therefore snapshotted at the START of each
+!> outer update, so the interval spanned matches the interval between the two
+!> residual measurements.
+real*8, allocatable :: re_eq_N_prev(:)      !< Nprof at the START of the previous outer update
+real*8, allocatable :: re_eq_r_prev(:)      !< the residual it acted on, size n_lev
+logical             :: re_eq_have_hist = .false.
 real*8              :: re_eq_best_err_cur = 1.d99 !< best |I_RE/target - 1| so far; only used when the
                                                    !< total-current control is active
 real*8              :: re_eq_best_err = 1.d99   !< best IN-BEAM max|q/q_t - 1| so far
@@ -613,6 +625,7 @@ subroutine re_eq_init_nprof(my_id)
   enddo
   re_eq_best_err      = 1.d99
   re_eq_best_err_cur  = 1.d99
+  re_eq_have_hist     = .false.
   re_eq_n_stall       = 0
   re_eq_finishing     = .false.
   re_eq_soft_accepted = .false.
@@ -1495,7 +1508,19 @@ subroutine re_eq_operator_update(node_list, element_list, n_lev, ph_lev, q_lev, 
   real*8  :: Kop(n_lev, re_eq_n_l), M(n_lev, re_eq_n_l), Ivec(n_lev), rhs(n_lev)
   real*8  :: Ktot(re_eq_n_l)
   real*8  :: L(re_eq_n_l, re_eq_n_l), AtA(re_eq_n_l, re_eq_n_l), Atb(re_eq_n_l)
+  real*8  :: sts, bfac, Ms(n_lev), yv(n_lev), s_real(re_eq_n_l)
   real*8  :: u(re_eq_n_l), qt_at, wcon, umin, umax
+
+  ! --- realised change of Nprof since the previous residual measurement
+  if (.not. allocated(re_eq_N_prev)) allocate(re_eq_N_prev(re_eq_n_l), re_eq_r_prev(n_lev))
+  s_real = 0.d0
+  if (re_eq_have_hist) then
+    do k = 1, re_eq_n_l
+      if (re_eq_N_prev(k) .gt. 0.d0) &
+        s_real(k) = re_nprof(k) / re_eq_N_prev(k) - 1.d0
+    enddo
+  endif
+  re_eq_N_prev = re_nprof(1:re_eq_n_l)
 
   call re_eq_response_operator(node_list, element_list, n_lev, ph_lev, Kop, Ktot)
 
@@ -1517,6 +1542,35 @@ subroutine re_eq_operator_update(node_list, element_list, n_lev, ph_lev, q_lev, 
   enddo
   L(1,1) = -1.d0;  L(1,2) = 1.d0
   L(re_eq_n_l,re_eq_n_l-1) = 1.d0;  L(re_eq_n_l,re_eq_n_l) = -1.d0
+
+  ! --- Broyden correction to the response matrix.
+  !     M is assembled at FIXED psi, so it lacks the LCFS-moving term of the
+  !     true outer-loop response. Applying step s changed the residual by dr
+  !     where the model predicted -M s; the rank-1 (memoryless "good Broyden")
+  !     update  M_eff = M + (-dr - M s) s^T / (s^T s)  satisfies M_eff s = -dr
+  !     exactly, reproducing the observed response along the direction just
+  !     explored, geometry included. No free parameter, no search dimension.
+  !     Memoryless on purpose: M is rebuilt from K and Nprof every iteration,
+  !     so an accumulated correction would not transfer. Damped so a small step
+  !     cannot produce a huge correction.
+  !     Its real value is NOT the ~10% in q error: without it the edge
+  !     null-space polish in the finishing pass WORSENS the match, is reverted,
+  !     and the rippled Nprof ships. With it the polish survives and the
+  !     delivered profile is smooth -- which is what the edge current density
+  !     actually depends on.
+  if (re_eq_have_hist) then
+    sts = dot_product(s_real, s_real)
+    if (sts .gt. 1.d-30) then
+      Ms  = matmul(M, s_real)
+      yv  = -(rhs - re_eq_r_prev) - Ms
+      bfac = 1.d0
+      if (sqrt(dot_product(yv,yv)*sts) .gt. maxval(abs(M))*sts) &
+        bfac = maxval(abs(M))*sts / max(sqrt(dot_product(yv,yv)*sts), 1.d-30)
+      do i = 1, n_lev
+        M(i,:) = M(i,:) + bfac * yv(i) * s_real / sts
+      enddo
+    endif
+  endif
 
   AtA = matmul(transpose(M), M) + re_eq_op_lambda * matmul(transpose(L), L)
   Atb = matmul(transpose(M), rhs)
@@ -1542,6 +1596,11 @@ subroutine re_eq_operator_update(node_list, element_list, n_lev, ph_lev, q_lev, 
     u(k) = min(max(u(k), umin), umax)
     re_nprof(k) = max(re_nprof(k) * (1.d0 + re_eq_alpha_out * u(k)), 0.d0)
   enddo
+
+  ! history for the next iteration (the profile snapshot is taken at the top of
+  ! this routine, not here -- see the note on re_eq_N_prev)
+  re_eq_r_prev    = rhs
+  re_eq_have_hist = .true.
 
 
 end subroutine re_eq_operator_update
