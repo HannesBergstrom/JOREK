@@ -552,16 +552,6 @@ else
   
 endif
 
-! --- Kinetic RE: deferred hand-off. Written now that the plasma boundary has
-!     settled, so re_equilibrium.dat describes the equilibrium actually in the
-!     restart. re_eq_q_err still reports the FIXED-boundary q match: the outer
-!     q-matching does not yet wrap the free-boundary loop (Stage B).
-if (re_kinetic_equilibrium .and. freeboundary_equil .and. (my_id == 0)) then
-  call re_eq_update_labels(my_id, node_list, element_list, bnd_node_list)
-  call re_eq_write_output(my_id)
-  call re_eq_finalize(re_eq_converged)
-endif
-
 if (my_id == 0) then
   ! Update psi axis and boundary with new values from the last iteration of equilibrium solvers 
   call find_axis(my_id,node_list,element_list,psi_axis,R_axis,Z_axis,i_elm_axis,s_axis,t_axis,ifail)
@@ -610,6 +600,23 @@ if (my_id == 0) then
   !------------------------------- end of equilibrium, start filling data
   psi_axis = psi_axis - psi_offset_freeb
   psi_bnd  = psi_bnd  - psi_offset_freeb
+
+  ! --- Kinetic RE: the labels must follow that shift. A = alpha R - psi, so
+  !     psi -> psi - offset maps A -> A + offset exactly; without this the zj
+  !     fill below (which shifts each node's psi and then evaluates the source)
+  !     and the marker hand-off would both combine the new psi with the old
+  !     labels, landing at Ahat + offset/(A_edge - A_axis) -- clipped past the
+  !     beam edge, so no RE current at all. The shift is zero in the
+  !     fixed-boundary branch, which is why this only appears in free boundary.
+  if (re_kinetic_equilibrium) then
+    if (psi_offset_freeb .ne. 0.d0) call re_eq_shift_labels(psi_offset_freeb)
+    ! Hand-off written HERE: psi is now in its final form, the same one the
+    ! restart carries, so re_equilibrium.dat and the restart agree.
+    if (freeboundary_equil) then
+      call re_eq_write_output(my_id)
+      call re_eq_finalize(re_eq_converged)
+    endif
+  endif
 
   ! --- This fills in the data for the current variable "zj" (for R-MHD only)
 #ifndef fullmhd

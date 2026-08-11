@@ -55,6 +55,7 @@ public :: re_kinetic_equilibrium, re_eq_dist_file, re_eq_dist_format,          &
           re_eq_finite_pitch
 ! --- driver interface (used by equilibrium.f90 and the GS element assembly)
 public :: re_eq_init, re_eq_update_labels, re_eq_rescale_current,              &
+          re_eq_shift_labels,                                                  &
           re_eq_source, re_eq_source_derivs, re_eq_outer_update,               &
           re_eq_write_output, re_eq_finalize, re_eq_done
 ! --- exposed for the standalone unit test (util/re_equilibrium_prototype)
@@ -677,6 +678,33 @@ subroutine re_eq_init_nprof(my_id)
   call re_eq_apply_beam_envelope()
 
 end subroutine re_eq_init_nprof
+
+
+!=======================================================================
+!> Shift the per-class labels to follow a uniform shift of psi.
+!>
+!> A_s/e = alpha_s R - psi, so psi -> psi - dpsi maps A -> A + dpsi for every
+!> point, axis and loss boundary alike; the normalization denominator
+!> A_edge - A_axis is unchanged and Ahat is invariant. Applying the shift
+!> analytically is exact and avoids re-running the drift-axis search.
+!>
+!> Needed because the free-boundary solve shifts psi at every node by
+!> psi_offset_freeb at the very end (equilibrium.f90; the shift is zero in the
+!> fixed-boundary branch, which is why this never arose before). Anything that
+!> evaluates the source AFTER that shift -- the zj fill and the marker hand-off
+!> -- would otherwise combine the new psi with the old labels and land at
+!> Ahat + psi_offset_freeb/(A_edge - A_axis), i.e. clipped past the beam edge.
+subroutine re_eq_shift_labels(dpsi)
+  implicit none
+  real*8, intent(in) :: dpsi
+  integer :: s
+  if (.not. re_eq_labels_ready) return
+  do s = 1, re_eq_n_class
+    re_cl_A_axis(s) = re_cl_A_axis(s) + dpsi
+    re_cl_A_edge(s) = re_cl_A_edge(s) + dpsi
+  enddo
+  re_eq_psi_bnd = re_eq_psi_bnd - dpsi
+end subroutine re_eq_shift_labels
 
 
 !=======================================================================
