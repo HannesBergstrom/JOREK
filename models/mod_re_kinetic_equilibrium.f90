@@ -665,8 +665,19 @@ subroutine re_eq_init_nprof(my_id)
   dq_dr(nr) = dq_dr(nr-1)
   do i = 1, nr
     j(i) = B0 / (MU_ZERO * R_geo) * (2.d0/q(i) - r(i)*dq_dr(i)/q(i)**2)
-    j(i) = max(j(i), 0.d0)
   enddo
+  ! Floor at a small POSITIVE fraction of the peak, not at zero. The
+  ! cylindrical estimate j ~ 2/q - r q'/q^2 goes negative wherever q rises
+  ! steeply, which a hollow target does by construction near the edge
+  ! (measured: negative over psihat = 0.93..0.98 for the JET-like hollow q_t).
+  ! A hard clip to zero is unrecoverable: the outer update is MULTIPLICATIVE,
+  ! N -> N(1 + alpha u), so a label at exactly zero has a zero column in the
+  ! response operator, no leverage, and stays dead for the whole run.
+  ! That is invisible at high energy -- K smears over ~0.2 in psihat, so
+  ! neighbouring labels cover the gap -- but at low energy K is nearly
+  ! diagonal, each label owns its flux surface, and a dead label is a hole in
+  ! the current profile that nothing can fill.
+  j = max(j, 1.d-3 * maxval(j))
 
   ! --- Nprof^0(l) ~ R0 j(r(l)) / (e vbar), l approximated by psihat(r)
   vbar = abs(sum(re_cl_w(1:re_eq_n_class) * re_cl_vpar(1:re_eq_n_class)))

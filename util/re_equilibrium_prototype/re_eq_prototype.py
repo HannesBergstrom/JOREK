@@ -1035,8 +1035,6 @@ class REEquilibrium:
                 C *= factor
                 N_new = np.gradient(C, l, edge_order=2)
                 self.nprof.N = np.clip(N_new, 0.0, None)
-            if self.absorbing_edge:
-                self.nprof.N[-1] = 0.0
             self._apply_beam_envelope()
         if best_N is not None and best_err < np.inf:
             self.nprof.N = best_N
@@ -1072,7 +1070,16 @@ class REEquilibrium:
         """Table hygiene only: zero the RAW table strictly beyond the beam
         edge (where the edge factor vanishes anyway) so the cumulative
         transplant carries no phantom current there. Idempotent; the
-        smoothstep envelope itself lives in _taper (evaluation time)."""
+        smoothstep envelope itself lives in _taper (evaluation time).
+
+        The absorbing edge is applied HERE, before the l_beam early return,
+        mirroring re_eq_apply_beam_envelope in the Fortran: this is the one
+        point every profile-modifying path passes through, so it is what
+        actually enforces Nprof(Ahat=1) = 0 (the weighted row inside the
+        operator solve only pulls towards it, and is then clamped by
+        RATIO_CLAMP and under-relaxed)."""
+        if self.absorbing_edge:
+            self.nprof.N[-1] = 0.0
         if self.l_beam >= 1.0:
             return
         self.nprof.N = np.where(self.nprof.l > self.l_beam, 0.0,
@@ -1137,7 +1144,15 @@ class REEquilibrium:
         # finite-difference I'/r evaluation)
         dq_dr = np.gradient(q, r, edge_order=2)
         j = B0 / (MU_ZERO * R0) * (2.0 / q - r * dq_dr / q**2)
-        j = np.clip(j, 0.0, None)
+        # Floor at a small POSITIVE fraction of the peak, not at zero. The
+        # estimate goes negative wherever q rises steeply -- which a hollow
+        # target does near the edge -- and a hard clip to zero is
+        # unrecoverable: the outer update is multiplicative, so a label at
+        # exactly zero has a zero column in the response operator, no
+        # leverage, and stays dead for the whole run. Invisible at high energy
+        # (K smears over neighbouring labels) but fatal at low energy, where K
+        # is nearly diagonal and each label owns its own flux surface.
+        j = np.clip(j, 1e-3 * j.max(), None)
         l_grid = np.linspace(0.0, 1.0, n_l)
         N0 = np.interp(l_grid, self._ph_cyl, j)
         vbar = np.abs(np.sum(self.cl.w * self.cl.v_par))
