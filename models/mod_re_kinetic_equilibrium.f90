@@ -57,7 +57,8 @@ public :: re_kinetic_equilibrium, re_eq_dist_file, re_eq_dist_format,          &
 public :: re_eq_init, re_eq_update_labels, re_eq_rescale_current,              &
           re_eq_shift_labels,                                                  &
           re_eq_source, re_eq_source_derivs, re_eq_outer_update,               &
-          re_eq_write_output, re_eq_finalize, re_eq_done
+          re_eq_write_output, re_eq_finalize, re_eq_done,                      &
+          re_eq_ph_beam_max
 ! --- exposed for the standalone unit test (util/re_equilibrium_prototype)
 public :: re_cl_alpha, re_cl_A_edge
 
