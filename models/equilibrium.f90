@@ -59,7 +59,7 @@ integer    :: nj
 real*8     :: rr,ww, drr_dR, drr_dZ, drr_dR2, drr_dZ2, drr_dRdZ
 
 ! --- Kinetic RE drift-surface equilibrium (re_kinetic_equilibrium)
-integer    :: iter_outer, n_outer_eq, i_lev, n_lev_q
+integer    :: iter_outer, n_outer_eq, n_outer_fb, i_lev, n_lev_q
 logical    :: re_eq_converged
 real*8     :: S_re, dS_re_dpsi, dS_re_dR, ph_top
 type (type_surface_list) :: surface_list_q
@@ -266,49 +266,8 @@ if (my_id == 0) then
   ! --- integration (the standard machinery), then transplant-update Nprof.
   if (re_kinetic_equilibrium) then
 
-    call update_equil_state(my_id,node_list, element_list, bnd_elm_list, xpoint, xcase)
-    call re_eq_update_labels(my_id, node_list, element_list, bnd_node_list)
+    call re_eq_q_transplant(iter)
 
-    n_lev_q = re_eq_n_q_levels
-    surface_list_q%n_psi = n_lev_q + 1     ! entry 1 (magnetic axis) is skipped by determine_q_profile
-    if (allocated(surface_list_q%psi_values)) call tr_deallocate(surface_list_q%psi_values,"surface_list_q%psi_values",CAT_GRID)
-    call tr_allocate(surface_list_q%psi_values,1,surface_list_q%n_psi,"surface_list_q%psi_values",CAT_GRID)
-    if (.not. allocated(ph_lev)) then
-      call tr_allocate(ph_lev, 1,n_lev_q,               "ph_lev", CAT_GRID)
-      call tr_allocate(q_lev,  1,surface_list_q%n_psi,  "q_lev",  CAT_GRID)
-      call tr_allocate(rad_lev,1,surface_list_q%n_psi,  "rad_lev",CAT_GRID)
-    endif
-    ! q evaluation levels in psihat. For a diverted (X-point) case the top
-    ! level is pulled in from 0.985 to 0.95: q -> infinity at the separatrix
-    ! and the flux-surface tracer should not be asked to follow surfaces
-    ! hugging it. The controllable range is well below this anyway (the beam
-    ! edge, and with l_beam<1 the vacuum annulus), so nothing matchable is
-    ! lost -- q between the beam edge and the separatrix is an outcome.
-    !
-    ! Limiter case: the top level must REACH the outermost controllable label,
-    ! otherwise re_eq_outer_update clamps every label beyond it to the same
-    ! argument and that whole band receives one identical, psihat-unresolved
-    ! push -- which, with the absorbing edge pinning the last label to zero,
-    ! is the edge current bump seen on the 100 keV hollow-q case (labels ran
-    ! to psihat_n = 0.9888 against a top level of 0.985). re_eq_ph_beam_max is
-    ! the previous iteration's value and is 0 before the first outer update,
-    ! hence the 0.985 floor; the 0.995 cap keeps the flux-surface tracer off
-    ! the boundary.
-    ph_top = merge(0.95d0, min(max(0.985d0, re_eq_ph_beam_max), 0.995d0), xpoint2)
-    do i_lev = 1, n_lev_q
-      ph_lev(i_lev) = 0.02d0 + (ph_top - 0.02d0) &
-                              * dble(i_lev-1) / dble(n_lev_q-1)
-      surface_list_q%psi_values(i_lev+1) = ES%psi_axis + ph_lev(i_lev) * (ES%psi_bnd - ES%psi_axis)
-    enddo
-    surface_list_q%psi_values(1) = ES%psi_axis + 0.01d0 * (ES%psi_bnd - ES%psi_axis)
-
-    call find_flux_surfaces(my_id,xpoint2,xcase2,node_list,element_list,surface_list_q)
-    call determine_q_profile(node_list,element_list,surface_list_q,ES%psi_axis,ES%psi_xpoint,ES%Z_xpoint, &
-                             q_lev,rad_lev)
-    if (allocated(surface_list_q%flux_surfaces)) deallocate(surface_list_q%flux_surfaces)
-
-    call re_eq_outer_update(my_id, node_list, element_list, n_lev_q, ph_lev, q_lev(2:n_lev_q+1), &
-                            iter, re_eq_converged)
     if (re_eq_converged) then
       write(*,'(A,I4,A)') ' re_eq: q-profile matching converged after ', iter_outer, ' outer iterations'
     else if (re_eq_done) then
@@ -397,10 +356,40 @@ if (freeboundary_equil) then
   
   end if ! my_id == 0
 
+  ! === Stage B: outer q-matching loop AROUND the free-boundary Picard =====
+  ! The free-boundary solve replaces the fixed-boundary one as the "inner"
+  ! solve; the transplant update is otherwise identical, so the same
+  ! re_eq_q_transplant runs at the end of each pass.
+  n_outer_fb = 1
+  if (re_kinetic_equilibrium) then
+    n_outer_fb = re_eq_max_it_out + 1   ! +1: final evaluation pass, as in phase 1
+    if (my_id == 0) then
+      ! Re-arm the outer loop. The fixed-boundary phase has already run to a
+      ! verdict, so without this re_eq_done is set and the loop below would
+      ! exit on its first pass having done nothing. See re_eq_restart_outer
+      ! for why the best-iterate records and the Broyden history must go too.
+      call re_eq_restart_outer()
+      re_eq_converged = .false.
+      write(*,*)
+      write(*,'(A,I4,A)') ' re_eq: free-boundary q matching enabled, up to ', &
+        re_eq_max_it_out, ' outer iterations around the free-boundary solve.'
+      write(*,'(A)')      '        Nprof starts from the converged fixed-boundary profile.'
+      if (freeb_equil_iterate_area .and. (.not. xpoint2)) then
+        write(*,'(A)') ' WARNING: re_eq: freeb_equil_iterate_area forces the plasma area back'
+        write(*,'(A)') '          to its FIXED-boundary value every iteration, which removes'
+        write(*,'(A)') '          exactly the freedom this loop needs -- the plasma size is'
+        write(*,'(A)') '          how the coils reconcile q_t with I_RE. Expect the q'
+        write(*,'(A)') '          amplitude to stall. Turn it off for RE free-boundary runs.'
+      endif
+    endif
+  endif
+
+  do iter_outer = 1, n_outer_fb
+
   do iter=1, n_iter_freeb
 
     if (my_id == 0) then
-      
+
       write(*,*)
       write(*,'(1x,a,i5,a)') '>>> ITERATION', iter, ' <<<'
  
@@ -550,8 +539,31 @@ if (freeboundary_equil) then
       exit
     end if
   
-  enddo
-  
+  enddo ! iter (free-boundary Picard)
+
+  ! --- outer q-matching update on the converged free-boundary equilibrium.
+  !     Rank 0 owns Nprof and the GS assembly, so only the VERDICT has to be
+  !     broadcast -- the loop below encloses poisson, whose vacuum_equil call
+  !     is collective, so every rank must leave it on the same iteration.
+  if (re_kinetic_equilibrium) then
+    if (my_id == 0) then
+      call re_eq_q_transplant(iter)
+      if (re_eq_converged) then
+        write(*,'(A,I4,A)') ' re_eq: free-boundary q-profile matching converged after ', &
+          iter_outer, ' outer iterations'
+      else if (re_eq_done) then
+        write(*,'(A)') ' re_eq: free-boundary q-profile matching stopped without reaching the tolerance'
+      endif
+    endif
+    call MPI_bcast(re_eq_converged, 1, MPI_LOGICAL, 0, MPI_COMM_WORLD, ierr)
+    call MPI_bcast(re_eq_done,      1, MPI_LOGICAL, 0, MPI_COMM_WORLD, ierr)
+    if (re_eq_converged .or. re_eq_done) exit
+  else
+    exit                        ! no q matching: one free-boundary solve only
+  endif
+
+  enddo ! iter_outer (free-boundary q matching)
+
   if (freeb_equil_iterate_area .and. (.not. xpoint2)) then
     n_limiter = 1  ! set found limiter (defined inside iterate2area)
   endif
@@ -625,6 +637,15 @@ if (my_id == 0) then
     if (freeboundary_equil) then
       call re_eq_write_output(my_id)
       call re_eq_finalize(re_eq_converged)
+      ! q-evaluation workspace, re-allocated by re_eq_q_transplant during the
+      ! free-boundary outer loop after the fixed-boundary phase released it
+      if (allocated(surface_list_q%psi_values)) &
+        call tr_deallocate(surface_list_q%psi_values,"surface_list_q%psi_values",CAT_GRID)
+      if (allocated(ph_lev)) then
+        call tr_deallocate(ph_lev, "ph_lev", CAT_GRID)
+        call tr_deallocate(q_lev,  "q_lev",  CAT_GRID)
+        call tr_deallocate(rad_lev,"rad_lev",CAT_GRID)
+      endif
     endif
   endif
 
@@ -972,4 +993,74 @@ endif
 equil_initialized = .true.
 
 return
+
+contains
+
+!-----------------------------------------------------------------------
+!> One outer q-matching update for the kinetic RE equilibrium: evaluate
+!> q(psihat_n) on the present psi by flux-surface integration (the standard
+!> machinery), then transplant-update Nprof.
+!>
+!> Shared by the fixed-boundary phase and the free-boundary phase. Kept as
+!> ONE copy deliberately: the two phases differ only in what has moved the
+!> boundary beforehand, and a duplicated version would silently drift --
+!> in particular the ph_top rule below, whose absence caused the edge
+!> current bump on the 100 keV case and would be far harder to spot on top
+!> of a moving free boundary.
+!>
+!> Rank 0 only. The GS assembly that consumes Nprof is rank-0 too
+!> (poisson sets a_mat%comm = MPI_COMM_SELF and does the whole assembly and
+!> solve inside my_id == 0), so the module state never has to leave task 0;
+!> only the loop VERDICT has to be broadcast, or the ranks would disagree
+!> about when to leave a loop containing the collective vacuum_equil call.
+subroutine re_eq_q_transplant(n_inner)
+  implicit none
+  integer, intent(in) :: n_inner
+
+  call update_equil_state(my_id,node_list, element_list, bnd_elm_list, xpoint, xcase)
+  call re_eq_update_labels(my_id, node_list, element_list, bnd_node_list)
+
+  n_lev_q = re_eq_n_q_levels
+  surface_list_q%n_psi = n_lev_q + 1     ! entry 1 (magnetic axis) is skipped by determine_q_profile
+  if (allocated(surface_list_q%psi_values)) call tr_deallocate(surface_list_q%psi_values,"surface_list_q%psi_values",CAT_GRID)
+  call tr_allocate(surface_list_q%psi_values,1,surface_list_q%n_psi,"surface_list_q%psi_values",CAT_GRID)
+  if (.not. allocated(ph_lev)) then
+    call tr_allocate(ph_lev, 1,n_lev_q,               "ph_lev", CAT_GRID)
+    call tr_allocate(q_lev,  1,surface_list_q%n_psi,  "q_lev",  CAT_GRID)
+    call tr_allocate(rad_lev,1,surface_list_q%n_psi,  "rad_lev",CAT_GRID)
+  endif
+  ! q evaluation levels in psihat. For a diverted (X-point) case the top
+  ! level is pulled in from 0.985 to 0.95: q -> infinity at the separatrix
+  ! and the flux-surface tracer should not be asked to follow surfaces
+  ! hugging it. The controllable range is well below this anyway (the beam
+  ! edge, and with l_beam<1 the vacuum annulus), so nothing matchable is
+  ! lost -- q between the beam edge and the separatrix is an outcome.
+  !
+  ! Limiter case: the top level must REACH the outermost controllable label,
+  ! otherwise re_eq_outer_update clamps every label beyond it to the same
+  ! argument and that whole band receives one identical, psihat-unresolved
+  ! push -- which, with the absorbing edge pinning the last label to zero,
+  ! is the edge current bump seen on the 100 keV hollow-q case (labels ran
+  ! to psihat_n = 0.9888 against a top level of 0.985). re_eq_ph_beam_max is
+  ! the previous iteration's value and is 0 before the first outer update,
+  ! hence the 0.985 floor; the 0.995 cap keeps the flux-surface tracer off
+  ! the boundary.
+  ph_top = merge(0.95d0, min(max(0.985d0, re_eq_ph_beam_max), 0.995d0), xpoint2)
+  do i_lev = 1, n_lev_q
+    ph_lev(i_lev) = 0.02d0 + (ph_top - 0.02d0) &
+                            * dble(i_lev-1) / dble(n_lev_q-1)
+    surface_list_q%psi_values(i_lev+1) = ES%psi_axis + ph_lev(i_lev) * (ES%psi_bnd - ES%psi_axis)
+  enddo
+  surface_list_q%psi_values(1) = ES%psi_axis + 0.01d0 * (ES%psi_bnd - ES%psi_axis)
+
+  call find_flux_surfaces(my_id,xpoint2,xcase2,node_list,element_list,surface_list_q)
+  call determine_q_profile(node_list,element_list,surface_list_q,ES%psi_axis,ES%psi_xpoint,ES%Z_xpoint, &
+                           q_lev,rad_lev)
+  if (allocated(surface_list_q%flux_surfaces)) deallocate(surface_list_q%flux_surfaces)
+
+  call re_eq_outer_update(my_id, node_list, element_list, n_lev_q, ph_lev, q_lev(2:n_lev_q+1), &
+                          n_inner, re_eq_converged)
+
+end subroutine re_eq_q_transplant
+
 end subroutine equilibrium

@@ -58,7 +58,7 @@ public :: re_eq_init, re_eq_update_labels, re_eq_rescale_current,              &
           re_eq_shift_labels,                                                  &
           re_eq_source, re_eq_source_derivs, re_eq_outer_update,               &
           re_eq_write_output, re_eq_finalize, re_eq_done,                      &
-          re_eq_ph_beam_max
+          re_eq_ph_beam_max, re_eq_restart_outer
 ! --- exposed for the standalone unit test (util/re_equilibrium_prototype)
 public :: re_cl_alpha, re_cl_A_edge
 
@@ -2041,6 +2041,41 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
 
 
 end subroutine re_eq_outer_update
+
+
+!=======================================================================
+!> Re-arm the outer q-matching loop for a NEW equilibrium phase, keeping the
+!> Nprof reached so far as the starting profile.
+!>
+!> Needed when the free-boundary solve is wrapped in its own outer loop: by
+!> then the fixed-boundary phase has run to a verdict, so re_eq_done and
+!> re_eq_finishing are set and a second loop would exit on its first pass
+!> without doing anything. Everything reset here is a judgement about a
+!> residual measured against the OLD plasma boundary, and the free-boundary
+!> solve moves it:
+!>   - the best-iterate records (re_eq_best_err, re_eq_best_err_cur) would
+!>     otherwise be compared against errors from a different equilibrium, so
+!>     the stagnation counter would fire immediately;
+!>   - the Broyden secant pair relates a step in Nprof to a residual change
+!>     at the old boundary, which is exactly the correlation that no longer
+!>     holds; the memoryless update rebuilds it after one iteration;
+!>   - re_eq_best_nprof is deliberately NOT cleared -- re_nprof already holds
+!>     the profile this phase starts from, and the record is rewritten as
+!>     soon as the first iterate improves on 1.d99.
+!> The iteration BUDGET is restarted too, so re_eq_max_it_out means the same
+!> thing in each phase rather than being shared between them.
+subroutine re_eq_restart_outer()
+  implicit none
+  re_eq_outer_iter    = 0
+  re_eq_best_err      = 1.d99
+  re_eq_best_err_cur  = 1.d99
+  re_eq_n_stall       = 0
+  re_eq_have_hist     = .false.
+  re_eq_finishing     = .false.
+  re_eq_reverted      = .false.
+  re_eq_done          = .false.
+  re_eq_soft_accepted = .false.
+end subroutine re_eq_restart_outer
 
 
 !=======================================================================
