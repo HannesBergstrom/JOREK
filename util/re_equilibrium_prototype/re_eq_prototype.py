@@ -155,7 +155,19 @@ class QTarget:
         self._interp = PchipInterpolator(self.psihat, self.q)
 
     def __call__(self, psihat):
-        return self._interp(np.clip(psihat, self.psihat[0], self.psihat[-1]))
+        # Outside the table: extrapolate LINEARLY on the end slope, mirroring
+        # re_eq_qt_eval. Clamping pins q_t to its endpoint value, and for a
+        # target still rising steeply at the last point that reads as a
+        # spurious positive residual just inside the edge -- the solver then
+        # adds current the target never asked for.
+        x = np.asarray(psihat, dtype=float)
+        lo, hi = self.psihat[0], self.psihat[-1]
+        out = self._interp(np.clip(x, lo, hi))
+        s_lo = (self.q[1] - self.q[0]) / (self.psihat[1] - self.psihat[0])
+        s_hi = (self.q[-1] - self.q[-2]) / (self.psihat[-1] - self.psihat[-2])
+        out = np.where(x < lo, self.q[0] + s_lo * (x - lo), out)
+        out = np.where(x > hi, self.q[-1] + s_hi * (x - hi), out)
+        return out[()] if out.ndim == 0 else out
 
 
 # ===========================================================================
@@ -338,6 +350,11 @@ class Nprof:
 
 class REEquilibrium:
     """Multi-class RE drift-surface equilibrium with q-profile matching."""
+
+    #: psihat_n of the outermost controllable label, from the previous outer
+    #: iteration; sizes the q evaluation grid (see q_profile). Zero until the
+    #: first outer update has run.
+    _ph_beam_max = 0.0
 
     def __init__(self, classes, solver, F0, q_target=None,
                  match_mode='full_q', I_RE=None,
@@ -551,7 +568,15 @@ class REEquilibrium:
         Surfaces are traced by 1D root finding along rays from the psi axis
         (valid for the nested surfaces of this fixed-boundary prototype)."""
         if psihat_levels is None:
-            psihat_levels = np.linspace(0.02, 0.985, 80)
+            # The top level must REACH the outermost controllable label,
+            # otherwise every label beyond it is clamped to the same argument
+            # in the outer update and that whole band gets one identical,
+            # psihat-unresolved push -- which the absorbing edge then turns
+            # into a current bump at the plasma edge. _ph_beam_max is the
+            # previous outer iteration's value (0 before the first), hence the
+            # 0.985 floor; the 0.995 cap keeps the tracer off the boundary.
+            top = min(max(0.985, self._ph_beam_max), 0.995)
+            psihat_levels = np.linspace(0.02, top, 80)
         R_ax, Z_ax, psi_ax = self.psi_axis()
         dpsi = self.gs.psi_b - psi_ax
         gR, gZ = self.gs.grad(self.psi)
@@ -860,6 +885,7 @@ class REEquilibrium:
             q_at = np.zeros(len(self.nprof.l))
             qt_at = np.zeros(len(self.nprof.l))
             ph_ctl = ph[0]
+            ph_beam_max = 0.0
             for s in range(self.cl.n_s):
                 phm_s = self.label_to_psihat(self.nprof.l,
                                              alpha=self.cl.alpha[s])
@@ -880,6 +906,10 @@ class REEquilibrium:
                 q_at += cw[s] * q_i(pe)
                 qt_at += cw[s] * self.qt(pe)
                 ph_ctl = max(ph_ctl, min(ph_beam, ph[-1]))
+                ph_beam_max = max(ph_beam_max, ph_beam)
+
+            # publish for the NEXT iteration's q grid (see q_profile)
+            self._ph_beam_max = ph_beam_max
 
             # sign-consistency guard: q and q_t must share a sign (the
             # transplant matches only |q|). sign(q) = sign(current)*sign(F0),

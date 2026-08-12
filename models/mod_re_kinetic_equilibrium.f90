@@ -182,6 +182,11 @@ real*8  :: re_eq_psi_bnd = 0.d0         !< boundary psi used in the labels
 real*8  :: re_eq_q_err   = 1.d99        !< latest max|q/q_t - 1|
 real*8  :: re_eq_I_now   = 0.d0         !< latest RE current [A]
 !> best-iterate tracking / stagnation handling of the outer loop
+!> psihat_n of the outermost CONTROLLABLE label (max over classes of the
+!> Ahat = l_beam surface), published so equilibrium.f90 can size the q
+!> evaluation grid to the label range instead of a hard-wired top level.
+!> Zero until the first outer update has run; the caller falls back then.
+real*8              :: re_eq_ph_beam_max = 0.d0
 integer             :: re_eq_n_qlast   = 0      !< last evaluated q profile, kept so it can be
 real*8, allocatable :: re_eq_ph_last(:)         !< written out even when the run does NOT converge
 real*8, allocatable :: re_eq_q_last(:)
@@ -490,14 +495,33 @@ end subroutine re_eq_read_q_target
 
 
 !=======================================================================
-!> Monotone-cubic (Hermite) evaluation of the target q at psihat, clipped
-!> to the table range.
+!> Monotone-cubic (Hermite) evaluation of the target q at psihat, with
+!> linear extrapolation on the end slopes outside the table range.
 function re_eq_qt_eval(psihat) result(qval)
   implicit none
   real*8, intent(in) :: psihat
   real*8             :: qval, x, h, t, h00, h10, h01, h11
   integer            :: k
-  x = min(max(psihat, re_qt_psihat(1)), re_qt_psihat(re_eq_n_qt))
+  ! --- outside the table: extrapolate LINEARLY on the end slope, do not
+  !     clamp. Clamping pins q_t to its endpoint value, which for a target
+  !     still rising steeply at the last point (dq/dpsihat ~ 7 on the
+  !     JET-like hollow case, table ending at psihat = 0.99) is a spurious
+  !     kink: the achieved q keeps climbing while the target goes flat, so
+  !     the transplant reads a positive residual there and asks for edge
+  !     current the target never demanded. The Hermite basis itself must NOT
+  !     be used outside t in [0,1] -- it grows cubically -- hence the
+  !     explicit branch. Intended for the marginal extrapolation implied by
+  !     a table that stops just short of psihat = 1, not for long throws.
+  if (psihat .le. re_qt_psihat(1)) then
+    qval = re_qt_q(1) + re_qt_slope(1) * (psihat - re_qt_psihat(1))
+    return
+  endif
+  if (psihat .ge. re_qt_psihat(re_eq_n_qt)) then
+    qval = re_qt_q(re_eq_n_qt) &
+         + re_qt_slope(re_eq_n_qt) * (psihat - re_qt_psihat(re_eq_n_qt))
+    return
+  endif
+  x = psihat
   do k = 2, re_eq_n_qt
     if (x .le. re_qt_psihat(k)) exit
   enddo
@@ -1715,6 +1739,17 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
     enddo
     ph_ctl_max = max(ph_ctl_max, min(ph_beam, ph_lev(n_lev)))
   enddo
+
+  ! Publish the outermost controllable psihat so the NEXT outer iteration can
+  ! build a q grid that reaches it. Without this the top q level sits at a
+  ! fixed 0.985 while the labels run out to the Ahat = 1 surface (0.9888 on
+  ! the 100 keV JET-like case): every label beyond the top level is evaluated
+  ! at the SAME clamped argument above, so a band of outermost labels gets one
+  ! identical, psihat-unresolved push, and with the absorbing edge pinning the
+  ! last of them to zero that band shows up as a current bump at the plasma
+  ! edge. One iteration of lag is harmless -- the labels move slowly and the
+  ! grid is rebuilt every outer iteration.
+  re_eq_ph_beam_max = maxval(ph_beam_cl(1:re_eq_n_class))
 
   ! --- sign-consistency guard: the equilibrium q and the target q_t must
   !     share a sign. The transplant can only match the MAGNITUDE |q| (the

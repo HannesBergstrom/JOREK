@@ -61,7 +61,7 @@ real*8     :: rr,ww, drr_dR, drr_dZ, drr_dR2, drr_dZ2, drr_dRdZ
 ! --- Kinetic RE drift-surface equilibrium (re_kinetic_equilibrium)
 integer    :: iter_outer, n_outer_eq, i_lev, n_lev_q
 logical    :: re_eq_converged
-real*8     :: S_re, dS_re_dpsi, dS_re_dR
+real*8     :: S_re, dS_re_dpsi, dS_re_dR, ph_top
 type (type_surface_list) :: surface_list_q
 real*8, allocatable      :: q_lev(:), rad_lev(:), ph_lev(:)
 
@@ -283,10 +283,20 @@ if (my_id == 0) then
     ! and the flux-surface tracer should not be asked to follow surfaces
     ! hugging it. The controllable range is well below this anyway (the beam
     ! edge, and with l_beam<1 the vacuum annulus), so nothing matchable is
-    ! lost -- q between the beam edge and the separatrix is an outcome. The
-    ! non-X-point path keeps 0.985 exactly (bit-identical).
+    ! lost -- q between the beam edge and the separatrix is an outcome.
+    !
+    ! Limiter case: the top level must REACH the outermost controllable label,
+    ! otherwise re_eq_outer_update clamps every label beyond it to the same
+    ! argument and that whole band receives one identical, psihat-unresolved
+    ! push -- which, with the absorbing edge pinning the last label to zero,
+    ! is the edge current bump seen on the 100 keV hollow-q case (labels ran
+    ! to psihat_n = 0.9888 against a top level of 0.985). re_eq_ph_beam_max is
+    ! the previous iteration's value and is 0 before the first outer update,
+    ! hence the 0.985 floor; the 0.995 cap keeps the flux-surface tracer off
+    ! the boundary.
+    ph_top = merge(0.95d0, min(max(0.985d0, re_eq_ph_beam_max), 0.995d0), xpoint2)
     do i_lev = 1, n_lev_q
-      ph_lev(i_lev) = 0.02d0 + (merge(0.95d0, 0.985d0, xpoint2) - 0.02d0) &
+      ph_lev(i_lev) = 0.02d0 + (ph_top - 0.02d0) &
                               * dble(i_lev-1) / dble(n_lev_q-1)
       surface_list_q%psi_values(i_lev+1) = ES%psi_axis + ph_lev(i_lev) * (ES%psi_bnd - ES%psi_axis)
     enddo
