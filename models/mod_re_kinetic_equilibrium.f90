@@ -51,6 +51,7 @@ public :: re_kinetic_equilibrium, re_eq_dist_file, re_eq_dist_format,          &
           re_eq_xi_min, re_eq_alpha_out, re_eq_tol_q, re_eq_tol_q_soft,        &
           re_eq_edge_taper, re_eq_l_beam, re_eq_l_beam_width,                  &
           re_eq_ratio_clamp, re_eq_absorbing_edge, re_eq_op_lambda,             &
+          re_eq_coil_control,                                                  &
           re_eq_max_it_out, re_eq_n_l, re_eq_n_q_levels,                       &
           re_eq_finite_pitch
 ! --- driver interface (used by equilibrium.f90 and the GS element assembly)
@@ -58,7 +59,7 @@ public :: re_eq_init, re_eq_update_labels, re_eq_rescale_current,              &
           re_eq_shift_labels,                                                  &
           re_eq_source, re_eq_source_derivs, re_eq_outer_update,               &
           re_eq_write_output, re_eq_finalize, re_eq_done,                      &
-          re_eq_ph_beam_max, re_eq_restart_outer
+          re_eq_ph_beam_max, re_eq_restart_outer, re_eq_coil_update
 ! --- exposed for the standalone unit test (util/re_equilibrium_prototype)
 public :: re_cl_alpha, re_cl_A_edge
 
@@ -137,6 +138,24 @@ logical            :: re_eq_absorbing_edge = .true.   !< force Nprof(Ahat = 1) =
                                                       !< only acts for lraw > 1, and re_eq_nprof_eval
                                                       !< clips to [0,1], so once Nprof(1) = 0 the source
                                                       !< already vanishes at and beyond Ahat = 1.
+logical            :: re_eq_coil_control = .false.    !< FREE BOUNDARY ONLY: let the outer loop drive a
+                                                      !< global multiplier on every PF coil current so that
+                                                      !< the achieved q AMPLITUDE reaches the target. This
+                                                      !< is the degree of freedom that makes q_t and I_RE
+                                                      !< simultaneously satisfiable -- with the external
+                                                      !< field fixed, Nprof determines BOTH, so one of them
+                                                      !< is always missed (measured: c_glob pinned at
+                                                      !< 0.9783 for 20 outer iterations while the shape
+                                                      !< residual was already 3.7e-3). A UNIFORM scale is
+                                                      !< used so it composes with the vertical/radial
+                                                      !< position feedbacks rather than competing with them
+                                                      !< for coils, and so it stays realizable on machines
+                                                      !< whose coils are wired into circuits. Secant on the
+                                                      !< measured dc_glob/d(scale), clamped to +/-25% of the
+                                                      !< input currents. Requires freeb_equil_iterate_area
+                                                      !< OFF -- that pins the plasma size, which is exactly
+                                                      !< the freedom being controlled. Default off: existing
+                                                      !< runs are bit-identical.
 real*8             :: re_eq_op_lambda   = 1.d-2       !< smoothness regularization of the 'operator'
                                                       !< transplant variant (damped least squares on the
                                                       !< relative Nprof correction); unused otherwise
@@ -188,6 +207,17 @@ real*8  :: re_eq_I_now   = 0.d0         !< latest RE current [A]
 !> evaluation grid to the label range instead of a hard-wired top level.
 !> Zero until the first outer update has run; the caller falls back then.
 real*8              :: re_eq_ph_beam_max = 0.d0
+!> Achieved/target q amplitude from the last outer update, published for the
+!> coil-scale control. This is the residual the coils have to close: with the
+!> external field fixed, Nprof alone determines BOTH q and I_RE, so a uniform
+!> q offset is not in the transplant's reach (measured: it sat at 0.9783 for
+!> 20 outer iterations on the 100 keV free-boundary case).
+real*8              :: re_eq_c_glob = 1.d0
+!> Coil-scale secant state: the previous (scale, c_glob) pair and whether one
+!> exists yet. The fixed-gain law was shown to run past its optimum, so the
+!> step is taken from the MEASURED dc_glob/d(scale).
+real*8              :: re_eq_cs_prev = 0.d0, re_eq_cg_prev = 0.d0
+logical             :: re_eq_cs_have = .false.
 integer             :: re_eq_n_qlast   = 0      !< last evaluated q profile, kept so it can be
 real*8, allocatable :: re_eq_ph_last(:)         !< written out even when the run does NOT converge
 real*8, allocatable :: re_eq_q_last(:)
@@ -1807,6 +1837,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   den    = sum(qt_acc * qt_acc)
   c_glob = 1.d0
   if (abs(den) .gt. 0.d0) c_glob = num / den
+  re_eq_c_glob = c_glob            ! published for the coil-scale control
   c_amp = 1.d0
   if (trim(re_eq_match_mode) .eq. 'q_shape') then
     c_amp = c_glob
@@ -2064,6 +2095,92 @@ end subroutine re_eq_outer_update
 !>     soon as the first iterate improves on 1.d99.
 !> The iteration BUDGET is restarted too, so re_eq_max_it_out means the same
 !> thing in each phase rather than being shared between them.
+!=======================================================================
+!> Stage C: drive the global PF coil-current scale so that the achieved q
+!> AMPLITUDE matches the target, i.e. re_eq_c_glob -> 1.
+!>
+!> Why this is the missing degree of freedom, not a convenience: with the
+!> external field fixed, Nprof alone determines BOTH q(psihat) and I_RE, so
+!> prescribing the full q profile AND the current is one constraint too many.
+!> Free boundary does not by itself help -- the boundary responds to Nprof but
+!> is still a FUNCTION of it, so the count is unchanged. Only letting the
+!> external field move adds the DOF. Confirmed twice: scaling the variation of
+!> Psi_boundary by mu = 1.05 gave a 10 MeV equilibrium matching both, and the
+!> free-boundary 100 keV case stalls with c_glob pinned at 0.9783 while the
+!> shape residual is already 3.7e-3.
+!>
+!> Controls act on disjoint subspaces, which is the property that has made
+!> every working configuration here converge and whose violation broke the
+!> dilation control:  shape <- transplant,  amplitude <- THIS,
+!> current <- re_eq_rescale_current.
+!>
+!> Secant, not fixed gain: the fixed-gain law was shown to run past its
+!> optimum. The first call takes a blind probe step, every later call uses the
+!> measured dc_glob/d(scale).
+subroutine re_eq_coil_update(scale)
+  implicit none
+  real*8, intent(inout) :: scale
+  real*8            :: err, slope, step, new
+  real*8, parameter :: PROBE  = 1.d-2    ! blind first step, 1% of the coil set
+  real*8, parameter :: CLAMP  = 0.25d0   ! max fractional excursion from the input currents
+  real*8, parameter :: MAXSTP = 5.d-2    ! max change per outer iteration
+
+  err = re_eq_c_glob - 1.d0
+
+  ! Converged in amplitude: freeze. Nudging a satisfied scalar only injects
+  ! noise into the shape match, which then has to work it back out.
+  if (abs(err) .lt. re_eq_tol_q) then
+    write(*,'(A,ES10.2,A)') ' re_eq: coil control satisfied (|c_glob-1| = ', &
+      abs(err), '); scale frozen'
+    return
+  endif
+
+  if (.not. re_eq_cs_have) then
+    ! No slope yet. Probe DOWNHILL in the physically expected sense: a
+    ! stronger external field compresses the plasma, and q ~ a^2 B0/(R0 I) at
+    ! pinned current, so more coil current lowers q. c_glob too low therefore
+    ! wants LESS coil current. If that sign is wrong for this coil set the
+    ! secant inverts it on the very next call -- the probe only has to move.
+    step = -sign(PROBE, err)
+  else
+    slope = (re_eq_c_glob - re_eq_cg_prev) / max(abs(scale - re_eq_cs_prev), 1.d-12) &
+            * sign(1.d0, scale - re_eq_cs_prev)
+    if (abs(slope) .lt. 1.d-8) then
+      ! No measurable response: the coils cannot move the q amplitude (wrong
+      ! set, or the area iteration is holding the size). Say so rather than
+      ! dividing by ~0 and throwing the scale to a rail.
+      write(*,'(A)') ' WARNING: re_eq: the coil scale has no measurable effect on the q'
+      write(*,'(A)') '          amplitude (dc_glob/dscale ~ 0). Check that'
+      write(*,'(A)') '          freeb_equil_iterate_area is off and that the coil set can'
+      write(*,'(A)') '          actually change the plasma size; the control is doing nothing.'
+      return
+    endif
+    step = -err / slope
+  endif
+
+  step = sign(min(abs(step), MAXSTP), step)
+  new  = scale + step
+  new  = min(max(new, 1.d0 - CLAMP), 1.d0 + CLAMP)
+  if (new .eq. scale) then
+    write(*,'(A,F8.4,A)') ' WARNING: re_eq: coil scale is against its limit (', new, &
+      '); the q amplitude cannot be reached within +/-25% of the input currents'
+    return
+  endif
+
+  ! record BEFORE overwriting, so the next call differences the pair that
+  ! actually bracketed this residual measurement
+  re_eq_cs_prev = scale
+  re_eq_cg_prev = re_eq_c_glob
+  re_eq_cs_have = .true.
+
+  write(*,'(A,F10.5,A,F9.5,A,F9.5)') ' re_eq: coil control: c_glob = ', re_eq_c_glob, &
+    '   coil scale ', scale, ' -> ', new
+  scale = new
+
+end subroutine re_eq_coil_update
+
+
+!=======================================================================
 subroutine re_eq_restart_outer()
   implicit none
   re_eq_outer_iter    = 0
@@ -2075,6 +2192,10 @@ subroutine re_eq_restart_outer()
   re_eq_reverted      = .false.
   re_eq_done          = .false.
   re_eq_soft_accepted = .false.
+  ! the coil-scale secant relates a scale to a c_glob measured on the OLD
+  ! boundary; keep the scale itself (it is a real coil setting) but drop the
+  ! stale pair so the next call re-probes
+  re_eq_cs_have       = .false.
 end subroutine re_eq_restart_outer
 
 

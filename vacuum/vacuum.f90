@@ -53,6 +53,16 @@ module vacuum
   real*8, allocatable :: Y_coils0(:)                     !< imposed STARWALL coil currents source
   real*8              :: vertical_FB                     !< a variable for the feedback control of the plasma's vertical position
   real*8              :: radial_FB                       !< a variable for the feedback control of the plasma's radial position   (during equilibrium)
+  !> Global multiplier on every PF coil current, driven by the kinetic-RE
+  !> q-amplitude control (re_eq_coil_control). 1.0 = untouched, which is the
+  !> value for every run that does not enable that control. Deliberately a
+  !> UNIFORM scale rather than a per-coil channel: it composes with the
+  !> vertical/radial feedbacks instead of competing with them for coils (a
+  !> coil may serve only one feedback channel, see equilibrium_VFB), and
+  !> scaling all coils by one factor is equivalent to scaling all circuits by
+  !> it, so it stays realizable on machines whose coils are wired into
+  !> circuits (e.g. JET's 20 coils / 10 circuits).
+  real*8              :: re_coil_scale = 1.d0
   real*8, allocatable :: bext_tan(:,:)                   !< external tangential field
   real*8, allocatable :: bext_nor(:,:)                   !< external normal field
   real*8, allocatable :: bext_psi(:,:)                   !< external poloidal flux      

@@ -374,6 +374,15 @@ if (freeboundary_equil) then
       write(*,'(A,I4,A)') ' re_eq: free-boundary q matching enabled, up to ', &
         re_eq_max_it_out, ' outer iterations around the free-boundary solve.'
       write(*,'(A)')      '        Nprof starts from the converged fixed-boundary profile.'
+      if (re_eq_coil_control) then
+        write(*,'(A)') '        Coil-scale control ON: the q amplitude is carried by a global'
+        write(*,'(A)') '        multiplier on the PF coil currents (secant, clamped to +/-25%).'
+        if (trim(re_eq_match_mode) .ne. 'full_q') then
+          write(*,'(A)') ' WARNING: re_eq: re_eq_coil_control has nothing to do in q_shape mode --'
+          write(*,'(A)') '          that mode divides the amplitude out of the residual, so c_glob'
+          write(*,'(A)') '          is an OUTPUT, not something to be driven to 1. Use full_q.'
+        endif
+      endif
       if (freeb_equil_iterate_area .and. (.not. xpoint2)) then
         write(*,'(A)') ' WARNING: re_eq: freeb_equil_iterate_area forces the plasma area back'
         write(*,'(A)') '          to its FIXED-boundary value every iteration, which removes'
@@ -548,6 +557,14 @@ if (freeboundary_equil) then
   if (re_kinetic_equilibrium) then
     if (my_id == 0) then
       call re_eq_q_transplant(iter)
+      ! Stage C: the coils carry the q AMPLITUDE, the transplant carries the
+      ! shape, re_eq_rescale_current carries the current -- three controls on
+      ! disjoint subspaces. Updated AFTER the transplant so it acts on the
+      ! c_glob just measured, and only while the loop is still running: once
+      ! the verdict is in, Nprof is frozen and moving the coils would
+      ! invalidate it.
+      if (re_eq_coil_control .and. (.not. re_eq_converged) .and. (.not. re_eq_done)) &
+        call re_eq_coil_update(re_coil_scale)
       if (re_eq_converged) then
         write(*,'(A,I4,A)') ' re_eq: free-boundary q-profile matching converged after ', &
           iter_outer, ' outer iterations'
@@ -557,6 +574,7 @@ if (freeboundary_equil) then
     endif
     call MPI_bcast(re_eq_converged, 1, MPI_LOGICAL, 0, MPI_COMM_WORLD, ierr)
     call MPI_bcast(re_eq_done,      1, MPI_LOGICAL, 0, MPI_COMM_WORLD, ierr)
+    call MPI_bcast(re_coil_scale,   1, MPI_DOUBLE_PRECISION, 0, MPI_COMM_WORLD, ierr)
     if (re_eq_converged .or. re_eq_done) exit
   else
     exit                        ! no q matching: one free-boundary solve only

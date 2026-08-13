@@ -351,13 +351,21 @@ module vacuum_equilibrium
    if (my_id == 0) write(*,*) ' vertical_FB = ', vertical_FB
    if (my_id == 0) write(*,*) ' radial_FB = ', radial_FB
    
+   if ((my_id == 0) .and. (re_coil_scale .ne. 1.d0)) &
+     write(*,*) ' re_coil_scale = ', re_coil_scale
+
    do i=1, n_pf_coils
+     ! Kinetic-RE q-amplitude control: scale the BASE current of every PF
+     ! coil, including those carrying no position feedback (those are set
+     ! once at allocation and never revisited below). Guarded on /= 1 so a
+     ! run without the control is bit-identical to before.
+     if (re_coil_scale .ne. 1.d0) I_coils(i) = pf_coils(i)%current * re_coil_scale
      if( abs(vert_FB_amp(i)) .gt. 1.d-6 ) then
-       I_coils(i) =  pf_coils(i)%current * (1 + vert_FB_amp(i) * vertical_FB ) 
+       I_coils(i) =  pf_coils(i)%current * re_coil_scale * (1 + vert_FB_amp(i) * vertical_FB )
        if (my_id == 0) write(*,'(a,I7,a,1es12.4)') 'FB coil ==> I_coil(', i, ') = ', I_coils(i)
      endif
      if( abs(rad_FB_amp(i)) .gt. 1.d-6 ) then
-       I_coils(i) =  pf_coils(i)%current * (1 + rad_FB_amp(i) * radial_FB ) 
+       I_coils(i) =  pf_coils(i)%current * re_coil_scale * (1 + rad_FB_amp(i) * radial_FB )
        if (my_id == 0) write(*,'(a,I7,a,1es12.4)') 'FB coil ==> I_coil(', i, ') = ', I_coils(i)
      endif
      if (( abs(vert_FB_amp(i)) .gt. 1.d-6 ) .and. (abs(rad_FB_amp(i)) .gt. 1.d-6 ))  then
