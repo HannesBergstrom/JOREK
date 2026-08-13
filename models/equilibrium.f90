@@ -12,6 +12,7 @@ use mod_iterate2area
 use mod_plasma_response
 use equil_info
 use vacuum
+use vacuum_equilibrium, only: re_coil_shaping_direction
 use mpi_mod
 use mod_interp, only: interp
 use mod_F_profile
@@ -62,6 +63,7 @@ real*8     :: rr,ww, drr_dR, drr_dZ, drr_dR2, drr_dZ2, drr_dRdZ
 integer    :: iter_outer, n_outer_eq, n_outer_fb, i_lev, n_lev_q
 logical    :: re_eq_converged
 real*8     :: S_re, dS_re_dpsi, dS_re_dR, ph_top
+real*8     :: coil_dI_shape(MAX_COILS), coil_shape_res
 type (type_surface_list) :: surface_list_q
 real*8, allocatable      :: q_lev(:), rad_lev(:), ph_lev(:)
 
@@ -648,6 +650,18 @@ if (my_id == 0) then
   !     labels, landing at Ahat + offset/(A_edge - A_axis) -- clipped past the
   !     beam edge, so no RE current at all. The shift is zero in the
   !     fixed-boundary branch, which is why this only appears in free boundary.
+  ! --- Kinetic RE: which coil combination reproduces a SHAPING perturbation of
+  !     the boundary flux, i.e. the mu-direction that was shown in fixed
+  !     boundary to make q_t and I_RE simultaneously reachable. Diagnostic
+  !     only -- it changes no state, just measures whether this coil set spans
+  !     that direction, which is what the uniform scale demonstrably does not
+  !     (40% of every coil bought 2.6% of q amplitude at 10 MeV). Computed on
+  !     the CONVERGED boundary flux, so it must sit after the solve.
+  if (re_kinetic_equilibrium .and. freeboundary_equil) then
+    call re_coil_shaping_direction(my_id, node_list, bnd_node_list, 1.d-6, &
+                                   coil_dI_shape, coil_shape_res, ifail)
+  endif
+
   if (re_kinetic_equilibrium) then
     if (psi_offset_freeb .ne. 0.d0) call re_eq_shift_labels(psi_offset_freeb)
     ! Hand-off written HERE: psi is now in its final form, the same one the

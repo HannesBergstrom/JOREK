@@ -383,6 +383,194 @@ module vacuum_equilibrium
   !* routines borrowed from EQUAL (WZ)                                  *
   !**********************************************************************
   
+  !> Find the PF coil-current combination that best reproduces a SHAPING
+  !> perturbation of the boundary flux, i.e. the direction that scales the
+  !> variation of psi over the boundary about its mean.
+  !>
+  !> Why this direction. In fixed boundary, scaling the variation of
+  !> Psi_boundary about its mean by mu = 1.05 produced a 10 MeV equilibrium
+  !> matching BOTH the target q profile and the prescribed current -- it is the
+  !> one perturbation known to supply the missing degree of freedom, with an
+  !> effective gain dc_glob/d(mu-1) ~ 0.64. A UNIFORM scale of all coil
+  !> currents is a different and far weaker knob: measured on the 10 MeV
+  !> free-boundary case, a 40% swing of every coil bought 2.6% of q amplitude
+  !> (gain ~0.053, and saturating), so c_glob = 1 sat at a coil scale of ~2.0.
+  !> The mean of psi over the boundary is pure gauge -- adding a constant to
+  !> psi everywhere changes nothing, which is exactly why psi_offset_freeb is
+  !> free to exist -- so it is removed from the target here.
+  !>
+  !> The solve. Each coil contributes bext_psi(j,i) to the boundary flux at
+  !> response DOF j per unit current, so the least-squares problem is
+  !>
+  !>     min_dI  || A dI - d ||^2 + lambda ||dI||^2,
+  !>     A(j,i) = bext_psi(j,i),   d(j) = psi_b(j) - mean(psi_b)
+  !>
+  !> restricted to the VALUE DOFs (j_dof = 1). The derivative DOFs are
+  !> deliberately excluded: they carry different units from the values, and
+  !> mixing them in one unweighted least squares would silently weight the two
+  !> against each other by whatever the mesh scaling happens to be. For a
+  !> smooth field the value pattern determines the derivative pattern anyway.
+  !>
+  !> Normalization: d is the FULL mean-free flux, i.e. the perturbation for
+  !> mu - 1 = 1. The returned dI_shape is therefore "per unit (mu-1)", directly
+  !> comparable to the mu = 1.05 experiment (which corresponds to 0.05*dI_shape).
+  !>
+  !> rel_residual is the number that decides whether this approach can work at
+  !> all: it is ||A dI - d|| / ||d||, the fraction of the wanted shaping
+  !> perturbation the coil set CANNOT produce. Near 0 means the coils span the
+  !> direction; near 1 means they cannot make this shape and no control built
+  !> on them will supply the missing degree of freedom.
+  subroutine re_coil_shaping_direction(my_id, node_list, bnd_node_list, lambda, &
+                                       dI_shape, rel_residual, ifail)
+    use data_structure
+    implicit none
+
+    integer,                   intent(in)  :: my_id
+    type (type_node_list),     intent(in)  :: node_list
+    type (type_bnd_node_list), intent(in)  :: bnd_node_list
+    real*8,                    intent(in)  :: lambda        !< Tikhonov weight, relative
+    real*8,                    intent(out) :: dI_shape(:)   !< size n_coils
+    real*8,                    intent(out) :: rel_residual
+    integer,                   intent(out) :: ifail
+
+    integer :: n_c, n_p, j_bnd, j_node, j_dir, j_resp, i, k, info
+    integer, allocatable :: ipiv(:)
+    real*8,  allocatable :: A(:,:), d(:), AtA(:,:), Atd(:), r(:)
+    real*8               :: psi_mean, dnorm, rnorm, tr
+
+    ifail = 0
+    dI_shape     = 0.d0
+    rel_residual = 1.d0
+    if (my_id .ne. 0) return
+
+    if (.not. allocated(bext_psi)) then
+      write(*,*) 'ERROR: re_coil_shaping_direction: bext_psi is not allocated;'
+      write(*,*) '       this needs the STARWALL/coil field file (free boundary).'
+      ifail = 1;  return
+    endif
+
+    ! With STARWALL-supplied equilibrium coils the solver does NOT use
+    ! bext_psi -- vacuum_equil takes the coil field through wall_curr and
+    ! sr%a_ey instead, and sets psi_coil_j = 0. Fitting against bext_psi there
+    ! would return a direction unrelated to what the solve actually sees, so
+    ! refuse rather than answer confidently and wrongly.
+    if (starwall_equil_coils) then
+      write(*,*) 'ERROR: re_coil_shaping_direction: starwall_equil_coils = .true.,'
+      write(*,*) '       so the coil field reaches the boundary through the STARWALL'
+      write(*,*) '       response (wall_curr / a_ey), not through bext_psi. This fit'
+      write(*,*) '       would not describe the operative coil-to-boundary map.'
+      ifail = 5;  return
+    endif
+
+    n_c = size(bext_psi, 2)
+    n_p = bnd_node_list%n_bnd_nodes
+    if (size(dI_shape) .lt. n_c) then
+      write(*,*) 'ERROR: re_coil_shaping_direction: dI_shape too small,', &
+                 size(dI_shape), ' <', n_c
+      ifail = 2;  return
+    endif
+    if (n_p .lt. n_c) then
+      write(*,*) 'WARNING: re_coil_shaping_direction: fewer boundary points (', n_p, &
+                 ') than coils (', n_c, '); the fit is underdetermined and only the'
+      write(*,*) '         regularization makes it unique.'
+    endif
+
+    allocate( A(n_p, n_c), d(n_p), AtA(n_c, n_c), Atd(n_c), r(n_p), ipiv(n_c) )
+
+    ! --- assemble on the VALUE dofs of the boundary nodes
+    do j_bnd = 1, n_p
+      j_node = bnd_node_list%bnd_node(j_bnd)%index_jorek
+      j_dir  = bnd_node_list%bnd_node(j_bnd)%direction(1)
+      j_resp = bnd_node_list%bnd_node(j_bnd)%index_starwall(1)
+      d(j_bnd)   = node_list%node(j_node)%values(1, j_dir, 1)
+      A(j_bnd,:) = bext_psi(j_resp, :)
+    enddo
+
+    ! --- strip the gauge (mean) component from BOTH sides: the coils can
+    !     produce a uniform flux offset, and it does nothing, so leaving it in
+    !     would let the fit spend coil current on an unobservable direction
+    psi_mean = sum(d) / dble(n_p)
+    d = d - psi_mean
+    do i = 1, n_c
+      A(:,i) = A(:,i) - sum(A(:,i)) / dble(n_p)
+    enddo
+
+    dnorm = sqrt(sum(d*d))
+    if (dnorm .le. 0.d0) then
+      write(*,*) 'ERROR: re_coil_shaping_direction: the boundary flux has no'
+      write(*,*) '       variation about its mean; nothing to match.'
+      ifail = 3;  deallocate(A,d,AtA,Atd,r,ipiv);  return
+    endif
+
+    ! --- regularized normal equations. n_coils is small (tens), so the cost is
+    !     irrelevant; the regularization is here for CONDITIONING -- coil flux
+    !     patterns at the boundary are smooth and strongly overlapping, so A
+    !     is near rank deficient and an unregularized solve would hand back a
+    !     huge cancelling current set that fits the same shape.
+    AtA = matmul(transpose(A), A)
+    Atd = matmul(transpose(A), d)
+    tr  = 0.d0
+    do i = 1, n_c
+      tr = tr + AtA(i,i)
+    enddo
+    do i = 1, n_c
+      AtA(i,i) = AtA(i,i) + lambda * tr / dble(n_c)
+    enddo
+
+    call dgesv(n_c, 1, AtA, n_c, ipiv, Atd, n_c, info)
+    if (info .ne. 0) then
+      write(*,*) 'ERROR: re_coil_shaping_direction: dgesv failed, info =', info
+      ifail = 4;  deallocate(A,d,AtA,Atd,r,ipiv);  return
+    endif
+    dI_shape(1:n_c) = Atd(1:n_c)
+
+    r     = matmul(A, dI_shape(1:n_c)) - d
+    rnorm = sqrt(sum(r*r))
+    rel_residual = rnorm / dnorm
+
+    write(*,*)
+    write(*,*) '------------------------------------------------------------'
+    write(*,*) ' RE coil shaping direction (per unit mu-1)'
+    write(*,*) '------------------------------------------------------------'
+    write(*,'(A,I6,A,I4)')   '   boundary value dofs = ', n_p, '     coils = ', n_c
+    write(*,'(A,ES12.4)')    '   |mean-free psi_b|   = ', dnorm
+    write(*,'(A,F9.4)')      '   relative residual   = ', rel_residual
+    if (rel_residual .gt. 0.5d0) then
+      write(*,*) '   WARNING: the coil set can reproduce less than half of this'
+      write(*,*) '            shaping perturbation. A control built on it will be'
+      write(*,*) '            weak for the same reason the uniform scale was.'
+    endif
+    ! The number that decides usability: how big a change of the EXISTING coil
+    ! currents does this direction ask for at the amplitude known to work?
+    ! mu = 1.05 closed a 3.2% q offset in fixed boundary, and we need ~6.7% at
+    ! 10 MeV, so read the last column as roughly half the eventual demand.
+    write(*,'(A)') '   coil    dI per unit (mu-1) [A]      at mu=1.05 [A]   as % of present'
+    do i = 1, n_c
+      if ((i .le. n_pf_coils) .and. (abs(pf_coils(min(i,n_pf_coils))%current) .gt. 1.d-30)) then
+        write(*,'(I7,2ES24.6,F16.2)') i, dI_shape(i), 0.05d0*dI_shape(i), &
+          100.d0 * 0.05d0*dI_shape(i) / pf_coils(i)%current
+      else
+        write(*,'(I7,2ES24.6,A16)') i, dI_shape(i), 0.05d0*dI_shape(i), '     n/a'
+      endif
+    enddo
+
+    open(77, file='re_coil_shaping.txt', status='replace', action='write')
+    write(77,'(A)')          '# RE coil shaping direction: dI per unit (mu-1)'
+    write(77,'(A,ES14.6)')   '# relative_residual = ', rel_residual
+    write(77,'(A,I6)')       '# n_coils = ', n_c
+    write(77,'(A)')          '#  coil        dI_per_unit_mu           dI_at_mu_1.05'
+    do i = 1, n_c
+      write(77,'(I7,2ES24.10)') i, dI_shape(i), 0.05d0*dI_shape(i)
+    enddo
+    close(77)
+    write(*,*) '   written to re_coil_shaping.txt'
+    write(*,*) '------------------------------------------------------------'
+
+    deallocate(A, d, AtA, Atd, r, ipiv)
+
+  end subroutine re_coil_shaping_direction
+
+
   subroutine pfcoils(R,Z,br,bz,psi)
   
   implicit none

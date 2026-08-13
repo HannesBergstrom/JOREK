@@ -238,6 +238,13 @@ real*8              :: re_eq_best_err = 1.d99   !< best IN-BEAM max|q/q_t - 1| s
                                                  !< (the controllable objective; the verdict
                                                  !<  uses the full-range error, see below)
 real*8, allocatable :: re_eq_best_nprof(:)      !< Nprof of the best iterate
+!> Coil scale that PRODUCED the best iterate. The equilibrium is a function of
+!> (Nprof, coil currents) jointly, so restoring the profile without the coil
+!> state that went with it hands back a pair that was never solved together --
+!> and since I_coils is derived as pf_coils%current * re_coil_scale * (1+FB)
+!> every iteration, and I_coils is what the restart stores, the mismatch would
+!> be written out as the delivered equilibrium.
+real*8              :: re_eq_best_coil_scale = 1.d0
 integer             :: re_eq_n_stall  = 0       !< outer iterations without improvement
 logical :: re_eq_finishing     = .false.        !< best profile restored; final evaluation pass
 logical :: re_eq_soft_accepted = .false.        !< finished above tol_q but below tol_q_soft
@@ -1690,6 +1697,10 @@ end subroutine re_eq_operator_update
 subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_lev, &
                               n_inner, converged)
   use data_structure
+  ! local, not a module-level dependency: only the best-iterate bookkeeping
+  ! needs the coil scale, and importing it here keeps mod_re_kinetic_equilibrium
+  ! free of vacuum at module scope. No cycle -- vacuum does not use this module.
+  use vacuum, only: re_coil_scale
   implicit none
   integer,                  intent(in)  :: my_id
   type (type_node_list),    intent(in)  :: node_list
@@ -1950,6 +1961,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
         ' re_eq: the edge polish worsened the in-beam max|q/q_t-1| (', re_eq_best_err, &
         ' -> ', err_ctl, '); reverting to the unpolished best profile'
       re_nprof(1:re_eq_n_l) = re_eq_best_nprof(1:re_eq_n_l)
+      re_coil_scale         = re_eq_best_coil_scale
       call re_eq_apply_beam_envelope()
       re_eq_reverted = .true.
       write(RE_EQ_LOG_UNIT,'(I6,I8,3ES16.6)') re_eq_outer_iter, n_inner, err, I_now, maxval(re_cl_edge_frac)
@@ -1985,6 +1997,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   if (improved) then
     re_eq_best_err = err_ctl
     re_eq_best_nprof(1:re_eq_n_l) = re_nprof(1:re_eq_n_l)
+    re_eq_best_coil_scale         = re_coil_scale
   endif
   if (cur_active) then
     if (err_cur .lt. 0.98d0 * re_eq_best_err_cur) improved = .true.
@@ -2020,7 +2033,10 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
     !     invisible to q, but it imprints element-scale-looking oscillations
     !     on the edge current density), re-converge psi once more, and give
     !     the final verdict on that state
-    if (re_eq_best_err .lt. err_ctl) re_nprof(1:re_eq_n_l) = re_eq_best_nprof(1:re_eq_n_l)
+    if (re_eq_best_err .lt. err_ctl) then
+      re_nprof(1:re_eq_n_l) = re_eq_best_nprof(1:re_eq_n_l)
+      re_coil_scale         = re_eq_best_coil_scale
+    endif
     call re_eq_smooth_nprof()          ! includes the beam-edge table hygiene
     write(*,'(A,I4,A,ES10.2)') ' re_eq: finishing after ', re_eq_outer_iter, &
       ' outer iterations (best in-beam max|q/q_t-1| = ', min(re_eq_best_err, err_ctl)
@@ -2124,24 +2140,34 @@ subroutine re_eq_coil_update(scale)
   real*8, parameter :: PROBE  = 1.d-2    ! blind first step, 1% of the coil set
   real*8, parameter :: CLAMP  = 0.25d0   ! max fractional excursion from the input currents
   real*8, parameter :: MAXSTP = 5.d-2    ! max change per outer iteration
+  real*8, parameter :: AMP_FRAC = 0.25d0 ! share of re_eq_tol_q the amplitude may use
 
   err = re_eq_c_glob - 1.d0
 
   ! Converged in amplitude: freeze. Nudging a satisfied scalar only injects
   ! noise into the shape match, which then has to work it back out.
-  if (abs(err) .lt. re_eq_tol_q) then
+  ! The threshold is a FRACTION of re_eq_tol_q, not re_eq_tol_q itself: in
+  ! full_q the total residual carries amplitude AND shape, so parking the
+  ! amplitude at the tolerance guarantees the total never gets below it.
+  ! Measured on the 100 keV free-boundary case -- the amplitude froze at
+  ! 4.0e-3 and the total floored at 4.75e-3, never reaching the tolerance.
+  ! A quarter leaves three quarters of the budget for the shape match.
+  if (abs(err) .lt. AMP_FRAC * re_eq_tol_q) then
     write(*,'(A,ES10.2,A)') ' re_eq: coil control satisfied (|c_glob-1| = ', &
       abs(err), '); scale frozen'
     return
   endif
 
   if (.not. re_eq_cs_have) then
-    ! No slope yet. Probe DOWNHILL in the physically expected sense: a
-    ! stronger external field compresses the plasma, and q ~ a^2 B0/(R0 I) at
-    ! pinned current, so more coil current lowers q. c_glob too low therefore
-    ! wants LESS coil current. If that sign is wrong for this coil set the
-    ! secant inverts it on the very next call -- the probe only has to move.
-    step = -sign(PROBE, err)
+    ! No slope yet. Probe in the physically expected sense: a stronger
+    ! external field compresses the plasma, and q ~ a^2 B0/(R0 I) at pinned
+    ! current, so MORE coil current LOWERS q. Hence err = c_glob - 1 < 0
+    ! (q too low) wants less coil current, i.e. step and err share a sign.
+    ! Verified against both scans: at 100 keV err < 0 and c_glob rose as the
+    ! scale came down; at 10 MeV err > 0 and c_glob fell as it went up. (The
+    ! original form had this inverted, which cost two iterations before the
+    ! secant corrected it.)
+    step = sign(PROBE, err)
   else
     slope = (re_eq_c_glob - re_eq_cg_prev) / max(abs(scale - re_eq_cs_prev), 1.d-12) &
             * sign(1.d0, scale - re_eq_cs_prev)
