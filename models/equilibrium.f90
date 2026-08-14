@@ -376,14 +376,38 @@ if (freeboundary_equil) then
       write(*,'(A,I4,A)') ' re_eq: free-boundary q matching enabled, up to ', &
         re_eq_max_it_out, ' outer iterations around the free-boundary solve.'
       write(*,'(A)')      '        Nprof starts from the converged fixed-boundary profile.'
-      if (re_eq_coil_control) then
-        write(*,'(A)') '        Coil control ON: the q amplitude is carried by an additive'
-        write(*,'(A)') '        shaping current along re_eq_coil_amp (secant, clamped to 50%'
-        write(*,'(A)') '        of the base currents).'
-        if (trim(re_eq_match_mode) .ne. 'full_q') then
-          write(*,'(A)') ' WARNING: re_eq: re_eq_coil_control has nothing to do in q_shape mode --'
-          write(*,'(A)') '          that mode divides the amplitude out of the residual, so c_glob'
-          write(*,'(A)') '          is an OUTPUT, not something to be driven to 1. Use full_q.'
+      if (re_eq_lcfs_a .gt. 0.d0) then
+        re_eq_R_ref_0 = R_axis_ref
+        write(*,*)
+        write(*,'(A,F9.5,A)') '        SIZE CONTROL ON: driving the LCFS minor radius to ', &
+          re_eq_lcfs_a, ' m'
+        write(*,'(A)')       '        NOTE: R_axis_ref from the namelist is only the STARTING value.'
+        write(*,'(A,F9.5,A)') '              It is a controlled variable from here on (start ', &
+          R_axis_ref, ', clamped to +/-25% of the'
+        write(*,'(A)')       '              minor radius about it), and the magnetic axis will'
+        write(*,'(A)')       '              settle wherever the drift shift puts it -- which is the'
+        write(*,'(A)')       '              point: at fixed LCFS the axis SHOULD move with energy.'
+        if (R_axis_ref .le. 0.d0) then
+          write(*,*) 'ERROR: re_eq: the size control trims R_axis_ref, but a negative'
+          write(*,*) '       R_axis_ref switches the radial feedback off entirely'
+          write(*,*) '       (equilibrium.f90: if (R_axis_ref<0) radial_FB=0), so there'
+          write(*,*) '       is no actuator. Set R_axis_ref to a sensible starting value.'
+          stop 1
+        endif
+        if (trim(re_eq_match_mode) .ne. 'q_shape') then
+          write(*,'(A)') ' WARNING: re_eq: the size control fixes the LCFS while re_eq_I_RE fixes'
+          write(*,'(A)') '          the current, and those two together DETERMINE the q amplitude.'
+          write(*,'(A)') '          full_q then asks the transplant to match an amplitude it has no'
+          write(*,'(A)') '          freedom left to change. Use re_eq_match_mode = ''q_shape'' and'
+          write(*,'(A)') '          read the amplitude as a consistency check.'
+        endif
+        if (xpoint2) then
+          write(*,'(A)') ' WARNING: re_eq: the size control is untested for DIVERTED boundaries.'
+          write(*,'(A)') '          It works by compressing the plasma against the inboard'
+          write(*,'(A)') '          limiter, so the size and the radial position are one knob;'
+          write(*,'(A)') '          with an X-point the separatrix moves with the coils instead'
+          write(*,'(A)') '          and the response may be weak or reversed. The secant measures'
+          write(*,'(A)') '          it either way and will report if there is no response.'
         endif
       endif
       if (freeb_equil_iterate_area .and. (.not. xpoint2)) then
@@ -560,14 +584,14 @@ if (freeboundary_equil) then
   if (re_kinetic_equilibrium) then
     if (my_id == 0) then
       call re_eq_q_transplant(iter)
-      ! Stage C: the coils carry the q AMPLITUDE, the transplant carries the
-      ! shape, re_eq_rescale_current carries the current -- three controls on
-      ! disjoint subspaces. Updated AFTER the transplant so it acts on the
-      ! c_glob just measured, and only while the loop is still running: once
-      ! the verdict is in, Nprof is frozen and moving the coils would
+      ! Stage C: the radial setpoint carries the plasma SIZE, the transplant
+      ! carries the q shape, re_eq_rescale_current carries the current -- three
+      ! controls on disjoint subspaces. Updated AFTER the transplant so it acts
+      ! on the LCFS just measured, and only while the loop is still running:
+      ! once the verdict is in, Nprof is frozen and moving the boundary would
       ! invalidate it.
-      if (re_eq_coil_control .and. (.not. re_eq_converged) .and. (.not. re_eq_done)) &
-        call re_eq_coil_update(re_coil_ctl)
+      if ((re_eq_lcfs_a .gt. 0.d0) .and. (.not. re_eq_converged) .and. (.not. re_eq_done)) &
+        call re_eq_lcfs_update(R_axis_ref)
       if (re_eq_converged) then
         write(*,'(A,I4,A)') ' re_eq: free-boundary q-profile matching converged after ', &
           iter_outer, ' outer iterations'
@@ -577,7 +601,7 @@ if (freeboundary_equil) then
     endif
     call MPI_bcast(re_eq_converged, 1, MPI_LOGICAL, 0, MPI_COMM_WORLD, ierr)
     call MPI_bcast(re_eq_done,      1, MPI_LOGICAL, 0, MPI_COMM_WORLD, ierr)
-    call MPI_bcast(re_coil_ctl,     1, MPI_DOUBLE_PRECISION, 0, MPI_COMM_WORLD, ierr)
+    call MPI_bcast(R_axis_ref,      1, MPI_DOUBLE_PRECISION, 0, MPI_COMM_WORLD, ierr)
     if (re_eq_converged .or. re_eq_done) exit
   else
     exit                        ! no q matching: one free-boundary solve only
@@ -1070,6 +1094,13 @@ subroutine re_eq_q_transplant(n_inner)
   call LCFS_shape_parameters(node_list, element_list)
   write(*,'(A,F9.5,A,F9.5,A,F9.5)') ' re_eq: LCFS  R_geo = ', ES%LCFS_Rgeo, &
     '   a = ', ES%LCFS_a, '   kappa = ', ES%LCFS_kappa
+  ! The limiter contact is logged with it because the size control leans on the
+  ! inboard edge being held by the wall: if this point wanders, the mechanism
+  ! is not what we think it is and the response will drift. Measured on the JET
+  ! case it moves ~1 mm in R over a whole solve, i.e. it is a fixed geometric
+  ! feature -- but that is a property of the case, not a guarantee.
+  write(*,'(A,F9.5,A,F9.5,A,F9.5)') '        limiter contact R = ', ES%R_lim, &
+    '   Z = ', ES%Z_lim, '   inboard LCFS edge = ', ES%LCFS_Rgeo - ES%LCFS_a
 
   n_lev_q = re_eq_n_q_levels
   surface_list_q%n_psi = n_lev_q + 1     ! entry 1 (magnetic axis) is skipped by determine_q_profile

@@ -51,7 +51,7 @@ public :: re_kinetic_equilibrium, re_eq_dist_file, re_eq_dist_format,          &
           re_eq_xi_min, re_eq_alpha_out, re_eq_tol_q, re_eq_tol_q_soft,        &
           re_eq_edge_taper, re_eq_l_beam, re_eq_l_beam_width,                  &
           re_eq_ratio_clamp, re_eq_absorbing_edge, re_eq_op_lambda,             &
-          re_eq_coil_control,                                                  &
+          re_eq_lcfs_a,                                                        &
           re_eq_max_it_out, re_eq_n_l, re_eq_n_q_levels,                       &
           re_eq_finite_pitch
 ! --- driver interface (used by equilibrium.f90 and the GS element assembly)
@@ -59,7 +59,7 @@ public :: re_eq_init, re_eq_update_labels, re_eq_rescale_current,              &
           re_eq_shift_labels,                                                  &
           re_eq_source, re_eq_source_derivs, re_eq_outer_update,               &
           re_eq_write_output, re_eq_finalize, re_eq_done,                      &
-          re_eq_ph_beam_max, re_eq_restart_outer, re_eq_coil_update
+          re_eq_ph_beam_max, re_eq_restart_outer, re_eq_lcfs_update
 ! --- exposed for the standalone unit test (util/re_equilibrium_prototype)
 public :: re_cl_alpha, re_cl_A_edge
 
@@ -138,24 +138,26 @@ logical            :: re_eq_absorbing_edge = .true.   !< force Nprof(Ahat = 1) =
                                                       !< only acts for lraw > 1, and re_eq_nprof_eval
                                                       !< clips to [0,1], so once Nprof(1) = 0 the source
                                                       !< already vanishes at and beyond Ahat = 1.
-logical            :: re_eq_coil_control = .false.    !< FREE BOUNDARY ONLY: let the outer loop drive a
-                                                      !< global multiplier on every PF coil current so that
-                                                      !< the achieved q AMPLITUDE reaches the target. This
-                                                      !< is the degree of freedom that makes q_t and I_RE
-                                                      !< simultaneously satisfiable -- with the external
-                                                      !< field fixed, Nprof determines BOTH, so one of them
-                                                      !< is always missed (measured: c_glob pinned at
-                                                      !< 0.9783 for 20 outer iterations while the shape
-                                                      !< residual was already 3.7e-3). A UNIFORM scale is
-                                                      !< used so it composes with the vertical/radial
-                                                      !< position feedbacks rather than competing with them
-                                                      !< for coils, and so it stays realizable on machines
-                                                      !< whose coils are wired into circuits. Secant on the
-                                                      !< measured dc_glob/d(scale), clamped to +/-25% of the
-                                                      !< input currents. Requires freeb_equil_iterate_area
-                                                      !< OFF -- that pins the plasma size, which is exactly
-                                                      !< the freedom being controlled. Default off: existing
-                                                      !< runs are bit-identical.
+real*8             :: re_eq_lcfs_a      = -1.d0       !< FREE BOUNDARY ONLY: target LCFS minor
+                                                      !< radius [m]. When set (> 0) the outer loop
+                                                      !< trims R_axis_ref until the measured LCFS_a
+                                                      !< reaches it, so the beam has the same size
+                                                      !< -- and hence the same q profile -- at any
+                                                      !< RE energy. R_axis_ref in the namelist then
+                                                      !< becomes only the STARTING value.
+                                                      !< Take the target from a low-energy (or the
+                                                      !< original fluid) equilibrium: at 100 keV the
+                                                      !< kinetic model reproduces the fluid RE model
+                                                      !< to 0.13%, so its LCFS is the physical
+                                                      !< reference. It is a size target rather than
+                                                      !< a q-amplitude target because with the LCFS
+                                                      !< and I_RE both fixed the q amplitude is an
+                                                      !< OUTPUT: measured on the two diagnostic
+                                                      !< runs, 100 keV and 10 MeV taken to a common
+                                                      !< LCFS agree in q amplitude to 0.22%.
+                                                      !< Use with re_eq_match_mode = 'q_shape'.
+                                                      !< Negative (default) leaves R_axis_ref and
+                                                      !< all existing behaviour untouched.
 real*8             :: re_eq_op_lambda   = 1.d-2       !< smoothness regularization of the 'operator'
                                                       !< transplant variant (damped least squares on the
                                                       !< relative Nprof correction); unused otherwise
@@ -213,11 +215,14 @@ real*8              :: re_eq_ph_beam_max = 0.d0
 !> q offset is not in the transplant's reach (measured: it sat at 0.9783 for
 !> 20 outer iterations on the 100 keV free-boundary case).
 real*8              :: re_eq_c_glob = 1.d0
-!> Coil-control secant state: the previous (control, c_glob) pair and whether
-!> one exists yet. The fixed-gain law was shown to run past its optimum, so the
-!> step is taken from the MEASURED dc_glob/d(control).
-real*8              :: re_eq_cs_prev = 0.d0, re_eq_cg_prev = 0.d0
-logical             :: re_eq_cs_have = .false.
+!> Size-control secant state: the previous (R_axis_ref, LCFS_a) pair and
+!> whether one exists yet. The response is MEASURED rather than assumed -- it
+!> depends on how the plasma meets the wall, which is a property of the case,
+!> not of the machine. re_eq_R_ref_0 is the setpoint the run started from and
+!> anchors the excursion clamp.
+real*8              :: re_eq_rs_prev = 0.d0, re_eq_a_prev = 0.d0
+real*8              :: re_eq_R_ref_0 = 0.d0
+logical             :: re_eq_rs_have = .false.
 integer             :: re_eq_n_qlast   = 0      !< last evaluated q profile, kept so it can be
 real*8, allocatable :: re_eq_ph_last(:)         !< written out even when the run does NOT converge
 real*8, allocatable :: re_eq_q_last(:)
@@ -238,13 +243,12 @@ real*8              :: re_eq_best_err = 1.d99   !< best IN-BEAM max|q/q_t - 1| s
                                                  !< (the controllable objective; the verdict
                                                  !<  uses the full-range error, see below)
 real*8, allocatable :: re_eq_best_nprof(:)      !< Nprof of the best iterate
-!> Coil control that PRODUCED the best iterate. The equilibrium is a function
-!> of (Nprof, coil currents) jointly, so restoring the profile without the coil
-!> state that went with it hands back a pair that was never solved together --
-!> and since I_coils is rebuilt from pf_coils%current, re_eq_coil_amp and
-!> re_coil_ctl every iteration, and I_coils is what the restart stores, the
-!> mismatch would be written out as the delivered equilibrium.
-real*8              :: re_eq_best_coil_ctl = 0.d0
+!> Radial setpoint that PRODUCED the best iterate. The equilibrium is a
+!> function of (Nprof, external field) jointly, so restoring the profile
+!> without the setpoint that went with it hands back a pair that was never
+!> solved together, and the coil currents the restart stores would not be the
+!> ones that produced the delivered profile.
+real*8              :: re_eq_best_R_ref = 0.d0
 integer             :: re_eq_n_stall  = 0       !< outer iterations without improvement
 logical :: re_eq_finishing     = .false.        !< best profile restored; final evaluation pass
 logical :: re_eq_soft_accepted = .false.        !< finished above tol_q but below tol_q_soft
@@ -1700,7 +1704,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   ! local, not a module-level dependency: only the best-iterate bookkeeping
   ! needs the coil scale, and importing it here keeps mod_re_kinetic_equilibrium
   ! free of vacuum at module scope. No cycle -- vacuum does not use this module.
-  use vacuum, only: re_coil_ctl
+  use vacuum, only: R_axis_ref
   implicit none
   integer,                  intent(in)  :: my_id
   type (type_node_list),    intent(in)  :: node_list
@@ -1961,7 +1965,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
         ' re_eq: the edge polish worsened the in-beam max|q/q_t-1| (', re_eq_best_err, &
         ' -> ', err_ctl, '); reverting to the unpolished best profile'
       re_nprof(1:re_eq_n_l) = re_eq_best_nprof(1:re_eq_n_l)
-      re_coil_ctl           = re_eq_best_coil_ctl
+      if (re_eq_lcfs_a .gt. 0.d0) R_axis_ref = re_eq_best_R_ref
       call re_eq_apply_beam_envelope()
       re_eq_reverted = .true.
       write(RE_EQ_LOG_UNIT,'(I6,I8,3ES16.6)') re_eq_outer_iter, n_inner, err, I_now, maxval(re_cl_edge_frac)
@@ -1997,7 +2001,10 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   if (improved) then
     re_eq_best_err = err_ctl
     re_eq_best_nprof(1:re_eq_n_l) = re_nprof(1:re_eq_n_l)
-    re_eq_best_coil_ctl           = re_coil_ctl
+    ! only meaningful when the size control owns the setpoint; harmless
+    ! otherwise, but recorded under the same guard as the restores so the two
+    ! cannot drift apart
+    if (re_eq_lcfs_a .gt. 0.d0) re_eq_best_R_ref = R_axis_ref
   endif
   if (cur_active) then
     if (err_cur .lt. 0.98d0 * re_eq_best_err_cur) improved = .true.
@@ -2035,7 +2042,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
     !     the final verdict on that state
     if (re_eq_best_err .lt. err_ctl) then
       re_nprof(1:re_eq_n_l) = re_eq_best_nprof(1:re_eq_n_l)
-      re_coil_ctl           = re_eq_best_coil_ctl
+      if (re_eq_lcfs_a .gt. 0.d0) R_axis_ref = re_eq_best_R_ref
     endif
     call re_eq_smooth_nprof()          ! includes the beam-edge table hygiene
     write(*,'(A,I4,A,ES10.2)') ' re_eq: finishing after ', re_eq_outer_iter, &
@@ -2112,122 +2119,107 @@ end subroutine re_eq_outer_update
 !> The iteration BUDGET is restarted too, so re_eq_max_it_out means the same
 !> thing in each phase rather than being shared between them.
 !=======================================================================
-!> Stage C: drive an ADDITIVE shaping current on the PF coils so that the
-!> achieved q AMPLITUDE matches the target, i.e. re_eq_c_glob -> 1.
-!> The direction is re_eq_coil_amp (per coil, A/turn per unit control); this
-!> routine drives only the scalar riding it.
+!> Stage C: hold the PLASMA SIZE by trimming the radial-position setpoint.
 !>
-!> Why this is the missing degree of freedom, not a convenience: with the
-!> external field fixed, Nprof alone determines BOTH q(psihat) and I_RE, so
-!> prescribing the full q profile AND the current is one constraint too many.
-!> Free boundary does not by itself help -- the boundary responds to Nprof but
-!> is still a FUNCTION of it, so the count is unchanged. Only letting the
-!> external field move adds the DOF. Confirmed twice: scaling the variation of
-!> Psi_boundary by mu = 1.05 gave a 10 MeV equilibrium matching both, and the
-!> free-boundary 100 keV case stalls with c_glob pinned at 0.9783 while the
-!> shape residual is already 3.7e-3.
+!> Cascade, not a replacement: the existing radial feedback keeps driving
+!> ES%R_axis -> R_axis_ref every free-boundary Picard iteration on exactly the
+!> metric it always used; this routine only moves that setpoint, once per
+!> outer iteration, so that the measured LCFS minor radius reaches
+!> re_eq_lcfs_a. Fast loop holds the plasma against the hoop force, slow loop
+!> sets how big it is -- separated in TIME, the same disjoint-control property
+!> that has made every working configuration here converge.
 !>
-!> Controls act on disjoint subspaces, which is the property that has made
-!> every working configuration here converge and whose violation broke the
-!> dilation control:  shape <- transplant,  amplitude <- THIS,
-!> current <- re_eq_rescale_current.
+!> Why the radial setpoint is the size actuator. In a wall-limited plasma the
+!> inboard contact is a fixed geometric feature of the vessel, so pushing the
+!> plasma inward cannot translate it -- it compresses against the limiter and
+!> the whole change appears on the outboard side. Measured on the JET 10 MeV
+!> case, for the P4 symmetric circuit (which IS the radial feedback actuator):
+!> dR_in = -0.32 mm against dR_out = +18.18 mm. The plasma size and the radial
+!> position are therefore the same knob, and no separate shaping actuator is
+!> needed. A dedicated coil direction was tried and removed: the best
+!> position-neutral combination was ~4x too weak, and the geometric proxy used
+!> to choose it (dB_z/dR at the axis) picked the weakest of the eight circuits.
 !>
-!> Why an additive SHAPING direction rather than a uniform current scale: a
-!> uniform scale is overwhelmingly a B_z knob, so it moves the plasma and the
-!> radial position feedback cancels it. Measured on JET at 10 MeV: a 40% swing
-!> of every coil bought 2.6% of q amplitude (gain ~0.053, saturating), c_glob=1
-!> extrapolated to a scale of ~2.0, and there the free-boundary iteration no
-!> longer converged. Computing the coil combination that maximises dB_z/dR at
-!> the axis at zero net B_z gives 14.9x that effective gradient -- see
-!> util/re_equilibrium_prototype/coil_circuit_response.py, which solves in
-!> CIRCUIT space so the answer is realizable on a wired machine.
+!> This routine does NOT assume that pinning, though. It needs only that
+!> dLCFS_a/dR_axis_ref is non-zero and locally monotone, and it MEASURES that
+!> by secant rather than assuming a sign or magnitude. Configurations where it
+!> does not hold -- a diverted boundary, or an outboard-limited plasma where
+!> the response reverses sign -- are reported rather than silently mishandled.
 !>
-!> Secant, not fixed gain: the fixed-gain law was shown to run past its
-!> optimum. The first call takes a blind probe step, every later call uses the
-!> measured dc_glob/d(control).
-subroutine re_eq_coil_update(ctl)
-  use vacuum, only: re_eq_coil_amp, pf_coils, n_pf_coils
+!> Why q amplitude is not the control signal: with the LCFS and I_RE both
+!> fixed, q is an OUTPUT, not something to be matched. Confirmed on the two
+!> diagnostic runs -- taken to a common LCFS at fixed I_RE, the 100 keV and
+!> 10 MeV q amplitudes agree to 0.22%. So the amplitude is a consistency check
+!> and the geometry is the constraint. Use re_eq_match_mode = 'q_shape'.
+subroutine re_eq_lcfs_update(R_ref)
+  use equil_info, only: ES
   implicit none
-  real*8, intent(inout) :: ctl
-  real*8            :: err, slope, step, new_ctl, ref
-  integer           :: i
-  real*8, parameter :: PROBE_F = 2.d-2   ! blind first step, fraction of ref
-  real*8, parameter :: CLAMP_F = 5.d-1   ! max |ctl|, fraction of ref
-  real*8, parameter :: MAXST_F = 1.d-1   ! max change per outer iteration
-  real*8, parameter :: AMP_FRAC = 0.25d0 ! share of re_eq_tol_q the amplitude may use
+  real*8, intent(inout) :: R_ref
+  real*8            :: err, slope, step, new_ref, a_now
+  real*8, parameter :: PROBE_F = 2.d-2   ! probe, as a fraction of the minor radius
+  real*8, parameter :: CLAMP_F = 2.5d-1  ! max setpoint excursion, fraction of a
+  real*8, parameter :: MAXST_F = 5.d-2   ! max setpoint step per outer iteration
+  real*8, parameter :: TOL_F   = 0.25d0  ! share of re_eq_tol_q the size may use
+  real*8, parameter :: A_RES   = 1.d-5   ! LCFS_a is reported to 0.01 mm
 
-  err = re_eq_c_glob - 1.d0
+  a_now = ES%LCFS_a
+  if (a_now .le. 0.d0) then
+    write(*,'(A)') ' WARNING: re_eq: LCFS_a is not positive; the size control cannot run.'
+    return
+  endif
+  err = a_now - re_eq_lcfs_a
 
-  ! Converged in amplitude: freeze. Nudging a satisfied scalar only injects
-  ! noise into the shape match, which then has to work it back out.
-  ! The threshold is a FRACTION of re_eq_tol_q, not re_eq_tol_q itself: in
-  ! full_q the total residual carries amplitude AND shape, so parking the
-  ! amplitude at the tolerance guarantees the total never gets below it.
-  ! Measured on the 100 keV free-boundary case -- the amplitude froze at
-  ! 4.0e-3 and the total floored at 4.75e-3, never reaching the tolerance.
-  if (abs(err) .lt. AMP_FRAC * re_eq_tol_q) then
-    write(*,'(A,ES10.2,A)') ' re_eq: coil control satisfied (|c_glob-1| = ', &
-      abs(err), '); control frozen'
+  ! q ~ a^2 B0/(R0 I) at pinned current, so a relative size error maps to
+  ! TWICE that relative q-amplitude error. Converging the size to a quarter of
+  ! re_eq_tol_q therefore leaves the q amplitude well inside tolerance while
+  ! spending only a small part of the error budget.
+  if (abs(err) / re_eq_lcfs_a .lt. TOL_F * re_eq_tol_q) then
+    write(*,'(A,ES10.2,A)') ' re_eq: size control satisfied (|a/a_t - 1| = ', &
+      abs(err) / re_eq_lcfs_a, '); R_axis_ref frozen'
     return
   endif
 
-  ! --- reference current: the largest base current among the coils this
-  !     actuator actually drives. All step sizes are fractions of it, so the
-  !     control is dimensionally sensible on any machine without per-case
-  !     tuning (re_coil_ctl is in A/turn, like pf_coils%current).
-  ref = 0.d0
-  do i = 1, n_pf_coils
-    if (abs(re_eq_coil_amp(i)) .gt. 1.d-12) &
-      ref = max(ref, abs(pf_coils(i)%current))
-  enddo
-  if (ref .le. 0.d0) then
-    write(*,'(A)') ' WARNING: re_eq: re_eq_coil_control is on but re_eq_coil_amp is zero'
-    write(*,'(A)') '          on every coil with a non-zero current -- the control has no'
-    write(*,'(A)') '          actuator. Generate the direction with'
-    write(*,'(A)') '          util/re_equilibrium_prototype/coil_circuit_response.py'
-    return
-  endif
-
-  if (.not. re_eq_cs_have) then
-    ! No slope yet. The sign of dc_glob/d(ctl) depends on how the chosen field
-    ! perturbation maps onto the plasma size for this machine, which is not
-    ! worth predicting -- probe one way and let the secant invert it on the
-    ! next call if it guessed wrong. Costs at most one iteration.
-    step = PROBE_F * ref
+  if (.not. re_eq_rs_have) then
+    ! Probe toward the target in the physically expected sense: pushing the
+    ! plasma inward compresses it against the inboard limiter, so a smaller
+    ! setpoint gives a smaller plasma. If that is inverted for this geometry
+    ! (an outboard-limited plasma, say) the secant corrects it on the next
+    ! call, at a cost of one iteration.
+    step = -sign(PROBE_F * re_eq_lcfs_a, err)
   else
-    slope = (re_eq_c_glob - re_eq_cg_prev) / (ctl - re_eq_cs_prev)
-    if (abs(slope) .lt. 1.d-14) then
-      ! No measurable response: the actuator cannot move the q amplitude.
-      write(*,'(A)') ' WARNING: re_eq: the coil control has no measurable effect on the q'
-      write(*,'(A)') '          amplitude (dc_glob/dctl ~ 0). Check that'
-      write(*,'(A)') '          freeb_equil_iterate_area is off, and that re_eq_coil_amp is'
-      write(*,'(A)') '          the position-neutral SHAPING direction rather than something'
-      write(*,'(A)') '          the position feedbacks simply cancel.'
+    if (abs(a_now - re_eq_a_prev) .lt. A_RES) then
+      write(*,'(A)') ' WARNING: re_eq: moving R_axis_ref did not change LCFS_a by more'
+      write(*,'(A)') '          than the reported resolution. The plasma size is not'
+      write(*,'(A)') '          radial-position-controllable in this configuration --'
+      write(*,'(A)') '          a diverted boundary, or a plasma not in contact with the'
+      write(*,'(A)') '          wall, would both do this. The size control is inactive.'
       return
     endif
-    step = -err / slope
+    slope = (a_now - re_eq_a_prev) / (R_ref - re_eq_rs_prev)
+    step  = -err / slope
   endif
 
-  step    = sign(min(abs(step), MAXST_F * ref), step)
-  new_ctl = ctl + step
-  new_ctl = min(max(new_ctl, -CLAMP_F * ref), CLAMP_F * ref)
-  if (new_ctl .eq. ctl) then
-    write(*,'(A,ES11.3,A)') ' WARNING: re_eq: coil control is against its limit (', new_ctl, &
-      ' A/turn); the q amplitude cannot be reached within 50% of the base currents'
+  step    = sign(min(abs(step), MAXST_F * re_eq_lcfs_a), step)
+  new_ref = R_ref + step
+  new_ref = min(max(new_ref, re_eq_R_ref_0 - CLAMP_F * re_eq_lcfs_a), &
+                             re_eq_R_ref_0 + CLAMP_F * re_eq_lcfs_a)
+  if (new_ref .eq. R_ref) then
+    write(*,'(A,F9.5,A)') ' WARNING: re_eq: R_axis_ref is against its limit (', new_ref, &
+      '); the target LCFS_a cannot be reached within 25% of the minor radius'
     return
   endif
 
   ! record BEFORE overwriting, so the next call differences the pair that
-  ! actually bracketed this residual measurement
-  re_eq_cs_prev = ctl
-  re_eq_cg_prev = re_eq_c_glob
-  re_eq_cs_have = .true.
+  ! actually bracketed this measurement
+  re_eq_rs_prev = R_ref
+  re_eq_a_prev  = a_now
+  re_eq_rs_have = .true.
 
-  write(*,'(A,F10.5,A,ES12.4,A,ES12.4,A)') ' re_eq: coil control: c_glob = ', re_eq_c_glob, &
-    '   ctl ', ctl, ' -> ', new_ctl, ' A/turn'
-  ctl = new_ctl
+  write(*,'(A,F9.5,A,F9.5,A,F9.5,A,F9.5)') ' re_eq: size control: a = ', a_now, &
+    ' (target ', re_eq_lcfs_a, ')   R_axis_ref ', R_ref, ' -> ', new_ref
+  R_ref = new_ref
 
-end subroutine re_eq_coil_update
+end subroutine re_eq_lcfs_update
 
 
 !=======================================================================
@@ -2242,10 +2234,10 @@ subroutine re_eq_restart_outer()
   re_eq_reverted      = .false.
   re_eq_done          = .false.
   re_eq_soft_accepted = .false.
-  ! the coil-scale secant relates a scale to a c_glob measured on the OLD
-  ! boundary; keep the scale itself (it is a real coil setting) but drop the
-  ! stale pair so the next call re-probes
-  re_eq_cs_have       = .false.
+  ! the size secant relates a setpoint to an LCFS_a measured on the OLD
+  ! boundary; keep the setpoint itself (it is a real machine setting) but drop
+  ! the stale pair so the next call re-probes
+  re_eq_rs_have       = .false.
 end subroutine re_eq_restart_outer
 
 
