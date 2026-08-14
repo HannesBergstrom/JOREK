@@ -377,6 +377,11 @@ if (freeboundary_equil) then
         re_eq_max_it_out, ' outer iterations around the free-boundary solve.'
       write(*,'(A)')      '        Nprof starts from the converged fixed-boundary profile.'
       if (re_eq_lcfs_a .gt. 0.d0) then
+        ! Arm it HERE, not from re_eq_lcfs_a alone: the fixed-boundary phase
+        ! above has its boundary frozen, so the LCFS is prescribed and nothing
+        ! can move it. Including the size in the convergence test there would
+        ! give Phase 1 a criterion it cannot meet.
+        re_eq_size_active = .true.
         write(*,*)
         write(*,'(A,F9.5,A)') '        SIZE CONTROL ON: driving the LCFS minor radius to ', &
           re_eq_lcfs_a, ' m'
@@ -599,7 +604,7 @@ if (freeboundary_equil) then
       ! finished at the size it started with. The size control must have
       ! finished its work before the endgame begins -- which it will, now that
       ! the size error is part of the convergence test.
-      if ((re_eq_lcfs_a .gt. 0.d0) .and. (.not. re_eq_converged) &
+      if (re_eq_size_active .and. (.not. re_eq_converged) &
           .and. (.not. re_eq_done) .and. (.not. re_eq_finishing)) &
         call re_eq_lcfs_update(R_axis_ref)
       if (re_eq_converged) then

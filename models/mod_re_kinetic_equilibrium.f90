@@ -60,7 +60,7 @@ public :: re_eq_init, re_eq_update_labels, re_eq_rescale_current,              &
           re_eq_source, re_eq_source_derivs, re_eq_outer_update,               &
           re_eq_write_output, re_eq_finalize, re_eq_done,                      &
           re_eq_ph_beam_max, re_eq_restart_outer, re_eq_lcfs_update,        &
-          re_eq_finishing
+          re_eq_finishing, re_eq_size_active
 ! --- exposed for the standalone unit test (util/re_equilibrium_prototype)
 public :: re_cl_alpha, re_cl_A_edge
 
@@ -223,6 +223,13 @@ real*8              :: re_eq_c_glob = 1.d0
 !> anchors the excursion clamp.
 real*8              :: re_eq_rs_prev = 0.d0, re_eq_a_prev = 0.d0
 real*8              :: re_eq_R_ref_0 = 0.d0
+!> Is the size control actually running? Set by the caller when the
+!> FREE-BOUNDARY phase starts, false everywhere else. re_eq_lcfs_a > 0 alone is
+!> NOT the right test: the fixed-boundary phase has its boundary frozen by the
+!> Dirichlet data, so the LCFS is whatever the input prescribes and no actuator
+!> can move it. Making the size part of the convergence test there gives Phase 1
+!> a criterion it can never satisfy, and it simply never converges.
+logical             :: re_eq_size_active = .false.
 logical             :: re_eq_rs_have = .false.
 integer             :: re_eq_n_qlast   = 0      !< last evaluated q profile, kept so it can be
 real*8, allocatable :: re_eq_ph_last(:)         !< written out even when the run does NOT converge
@@ -1924,7 +1931,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   !     relative size error shows up as twice that relative q-amplitude error,
   !     so comparing 2*|a/a_t - 1| against re_eq_tol_q holds the amplitude to
   !     the same tolerance the q match is held to, without a second knob.
-  siz_active = (re_eq_lcfs_a .gt. 0.d0)
+  siz_active = re_eq_size_active
   err_siz    = 0.d0
   if (siz_active .and. (ES%LCFS_a .gt. 0.d0)) &
     err_siz = 2.d0 * abs(ES%LCFS_a / re_eq_lcfs_a - 1.d0)
@@ -1987,7 +1994,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
         ' re_eq: the edge polish worsened the in-beam max|q/q_t-1| (', re_eq_best_err, &
         ' -> ', err_ctl, '); reverting to the unpolished best profile'
       re_nprof(1:re_eq_n_l) = re_eq_best_nprof(1:re_eq_n_l)
-      if (re_eq_lcfs_a .gt. 0.d0) R_axis_ref = re_eq_best_R_ref
+      if (re_eq_size_active) R_axis_ref = re_eq_best_R_ref
       call re_eq_apply_beam_envelope()
       re_eq_reverted = .true.
       write(RE_EQ_LOG_UNIT,'(I6,I8,3ES16.6)') re_eq_outer_iter, n_inner, err, I_now, maxval(re_cl_edge_frac)
@@ -2027,7 +2034,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
     ! only meaningful when the size control owns the setpoint; harmless
     ! otherwise, but recorded under the same guard as the restores so the two
     ! cannot drift apart
-    if (re_eq_lcfs_a .gt. 0.d0) re_eq_best_R_ref = R_axis_ref
+    if (re_eq_size_active) re_eq_best_R_ref = R_axis_ref
   endif
   if (cur_active) then
     if (err_cur .lt. 0.98d0 * re_eq_best_err_cur) improved = .true.
@@ -2076,7 +2083,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
     !     the final verdict on that state
     if (re_eq_best_err .lt. err_ctl) then
       re_nprof(1:re_eq_n_l) = re_eq_best_nprof(1:re_eq_n_l)
-      if (re_eq_lcfs_a .gt. 0.d0) R_axis_ref = re_eq_best_R_ref
+      if (re_eq_size_active) R_axis_ref = re_eq_best_R_ref
     endif
     call re_eq_smooth_nprof()          ! includes the beam-edge table hygiene
     write(*,'(A,I4,A,ES10.2)') ' re_eq: finishing after ', re_eq_outer_iter, &
