@@ -1053,6 +1053,24 @@ subroutine re_eq_q_transplant(n_inner)
   call update_equil_state(my_id,node_list, element_list, bnd_elm_list, xpoint, xcase)
   call re_eq_update_labels(my_id, node_list, element_list, bnd_node_list)
 
+  ! --- LCFS geometry, measured once per OUTER iteration.
+  !     Called directly rather than by ungating the call inside
+  !     update_equil_state: that one is guarded by equil_initialized, which is
+  !     only set at the very end of this routine, so the LCFS fields read zero
+  !     throughout the solve (they did in every RE run so far). Ungating it
+  !     there would trace a flux surface on every INNER Picard iteration --
+  !     several hundred per run -- and would charge that to every JOREK
+  !     equilibrium, RE or not. Here it costs one trace per outer iteration and
+  !     touches no shared path.
+  !     R_geo and a are the quantities in which "the same plasma at a different
+  !     RE energy" is meaningful: unlike the magnetic axis they do not move
+  !     with the internal Shafranov shift, which grows strongly with the drift
+  !     parameter (measured: the drift axis moves 4.5 cm out from 100 keV to
+  !     10 MeV while R_axis was held fixed at 2.59).
+  call LCFS_shape_parameters(node_list, element_list)
+  write(*,'(A,F9.5,A,F9.5,A,F9.5)') ' re_eq: LCFS  R_geo = ', ES%LCFS_Rgeo, &
+    '   a = ', ES%LCFS_a, '   kappa = ', ES%LCFS_kappa
+
   n_lev_q = re_eq_n_q_levels
   surface_list_q%n_psi = n_lev_q + 1     ! entry 1 (magnetic axis) is skipped by determine_q_profile
   if (allocated(surface_list_q%psi_values)) call tr_deallocate(surface_list_q%psi_values,"surface_list_q%psi_values",CAT_GRID)
