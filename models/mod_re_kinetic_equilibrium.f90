@@ -249,7 +249,11 @@ real*8              :: re_eq_best_err_siz = 1.d99 !< best 2|a/a_t - 1| so far; o
                                                    !< LCFS is requested
 real*8              :: re_eq_best_err_cur = 1.d99 !< best |I_RE/target - 1| so far; only used when the
                                                    !< total-current control is active
-real*8              :: re_eq_best_err = 1.d99   !< best IN-BEAM max|q/q_t - 1| so far
+real*8              :: re_eq_best_err = 1.d99   !< best value of the COMBINED objective so far:
+                                                 !< the worst of the in-beam q error and, when
+                                                 !< active, the current and size errors. Combined
+                                                 !< so the finishing pass cannot restore a state
+                                                 !< that is best in q but wrong in size
                                                  !< (the controllable objective; the verdict
                                                  !<  uses the full-range error, see below)
 real*8, allocatable :: re_eq_best_nprof(:)      !< Nprof of the best iterate
@@ -1734,7 +1738,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   real*8  :: q_acc(re_eq_n_l), qt_acc(re_eq_n_l)
   real*8  :: cw(re_eq_n_class), cw_sum, ph_beam_cl(re_eq_n_class)
   real*8  :: c_amp, num, den, err, err_ctl, I_now, ph_ctl_max, ph_beam, l_eff, err_cur
-  real*8  :: err_siz
+  real*8  :: err_siz, err_best
   real*8  :: c_glob
   real*8  :: C(re_eq_n_l), dl, qq
 
@@ -1943,6 +1947,15 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   if (cur_active) converged = converged .and. (err_cur .lt. re_eq_tol_q)
   if (siz_active) converged = converged .and. (err_siz .lt. re_eq_tol_q)
 
+  ! The single number the outer loop minimises: the worst active channel, all
+  ! of them normalised against re_eq_tol_q. Used for best-iterate tracking and
+  ! for the finishing pass's accept/revert decision, so those two always judge
+  ! the same quantity. Computed here because the finishing branch below needs
+  ! it too. With only q active it is err_ctl, i.e. the previous behaviour.
+  err_best = err_ctl
+  if (cur_active) err_best = max(err_best, err_cur)
+  if (siz_active) err_best = max(err_best, err_siz)
+
   ! --- The two errors have DIFFERENT roles and must not be conflated:
   !       err     (full range)  -> the VERDICT: convergence and the soft
   !                               tolerance, so re_eq_tol_q means what it says
@@ -1989,10 +2002,10 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
     !     the match. In that case revert to the unpolished best profile and
     !     re-converge once more, then accept that -- the polish must never
     !     lose a match the transplant had already achieved.
-    if ((.not. re_eq_reverted) .and. (err_ctl .gt. re_eq_best_err)) then
+    if ((.not. re_eq_reverted) .and. (err_best .gt. re_eq_best_err)) then
       write(*,'(A,ES10.2,A,ES10.2,A)') &
-        ' re_eq: the edge polish worsened the in-beam max|q/q_t-1| (', re_eq_best_err, &
-        ' -> ', err_ctl, '); reverting to the unpolished best profile'
+        ' re_eq: the edge polish worsened the objective (', re_eq_best_err, &
+        ' -> ', err_best, '); reverting to the unpolished best profile'
       re_nprof(1:re_eq_n_l) = re_eq_best_nprof(1:re_eq_n_l)
       if (re_eq_size_active) R_axis_ref = re_eq_best_R_ref
       call re_eq_apply_beam_envelope()
@@ -2022,28 +2035,37 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
     call flush_it(RE_EQ_LOG_UNIT)
     return
   endif
-  ! Best-iterate tracking stays on the q error alone, so the finishing pass
-  ! still restores the best q match. Stagnation, however, must not fire while
-  ! the CURRENT is still improving: with the total-current control on, the
-  ! early phase legitimately trades q error for current progress, and a
-  ! q-only counter would abort the run in the middle of it.
-  improved = (err_ctl .lt. 0.98d0 * re_eq_best_err)
+  ! --- Best-iterate tracking runs on the COMBINED objective, not on q alone.
+  !     All three errors are already normalised against re_eq_tol_q, so the
+  !     worst of them is the right thing to minimise, and it is exactly what
+  !     the convergence test asks for.
+  !
+  !     Why not q alone (as it used to be): a size step deliberately trades q
+  !     error for size progress -- one step moved a by 12 mm and put q_err up
+  !     from 4.3e-3 to 7.7e-3 -- so the stored profile would never be updated
+  !     on those iterations, and the finishing pass would restore the ORIGINAL,
+  !     wrong-size state at the end. That is the same reversion that threw away
+  !     the first good size step, reached by a different route: blocking the
+  !     control during the finishing pass fixes what RUNS there, not what the
+  !     pass restores TO.
+  !
+  !     With only q active this reduces to the previous behaviour exactly.
+  improved = (err_best .lt. 0.98d0 * re_eq_best_err)
   if (improved) then
-    re_eq_best_err = err_ctl
+    re_eq_best_err = err_best
     re_eq_best_nprof(1:re_eq_n_l) = re_nprof(1:re_eq_n_l)
-    ! only meaningful when the size control owns the setpoint; harmless
-    ! otherwise, but recorded under the same guard as the restores so the two
-    ! cannot drift apart
+    ! the setpoint that produced this profile: the equilibrium is a function of
+    ! the pair, so they must be restored together
     if (re_eq_size_active) re_eq_best_R_ref = R_axis_ref
   endif
+  ! Stagnation additionally must not fire while any INDIVIDUAL channel is still
+  ! improving, even when the combined worst-case has not moved: the early phase
+  ! legitimately trades one against another, and a counter that ignored that
+  ! would abort the run mid-way.
   if (cur_active) then
     if (err_cur .lt. 0.98d0 * re_eq_best_err_cur) improved = .true.
     re_eq_best_err_cur = min(re_eq_best_err_cur, err_cur)
   endif
-  ! Same reasoning for the size: the early free-boundary iterations legitimately
-  ! trade q error for size progress -- moving the boundary perturbs the profile
-  ! match before it recovers -- so a q-only stall counter would abort the run
-  ! in the middle of the size control doing its job.
   if (siz_active) then
     if (err_siz .lt. 0.98d0 * re_eq_best_err_siz) improved = .true.
     re_eq_best_err_siz = min(re_eq_best_err_siz, err_siz)
@@ -2081,13 +2103,13 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
     !     invisible to q, but it imprints element-scale-looking oscillations
     !     on the edge current density), re-converge psi once more, and give
     !     the final verdict on that state
-    if (re_eq_best_err .lt. err_ctl) then
+    if (re_eq_best_err .lt. err_best) then
       re_nprof(1:re_eq_n_l) = re_eq_best_nprof(1:re_eq_n_l)
       if (re_eq_size_active) R_axis_ref = re_eq_best_R_ref
     endif
     call re_eq_smooth_nprof()          ! includes the beam-edge table hygiene
     write(*,'(A,I4,A,ES10.2)') ' re_eq: finishing after ', re_eq_outer_iter, &
-      ' outer iterations (best in-beam max|q/q_t-1| = ', min(re_eq_best_err, err_ctl)
+      ' outer iterations (best objective = ', min(re_eq_best_err, err_best)
     write(*,'(A)') '        ): applied the edge null-space polish to Nprof;'
     write(*,'(A)') '        final convergence is evaluated on the polished profile'
     re_eq_finishing = .true.
