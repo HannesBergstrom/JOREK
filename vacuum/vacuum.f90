@@ -53,16 +53,19 @@ module vacuum
   real*8, allocatable :: Y_coils0(:)                     !< imposed STARWALL coil currents source
   real*8              :: vertical_FB                     !< a variable for the feedback control of the plasma's vertical position
   real*8              :: radial_FB                       !< a variable for the feedback control of the plasma's radial position   (during equilibrium)
-  !> Global multiplier on every PF coil current, driven by the kinetic-RE
-  !> q-amplitude control (re_eq_coil_control). 1.0 = untouched, which is the
-  !> value for every run that does not enable that control. Deliberately a
-  !> UNIFORM scale rather than a per-coil channel: it composes with the
-  !> vertical/radial feedbacks instead of competing with them for coils (a
-  !> coil may serve only one feedback channel, see equilibrium_VFB), and
-  !> scaling all coils by one factor is equivalent to scaling all circuits by
-  !> it, so it stays realizable on machines whose coils are wired into
-  !> circuits (e.g. JET's 20 coils / 10 circuits).
-  real*8              :: re_coil_scale = 1.d0
+  !> Scalar control riding the re_eq_coil_amp direction, driven by the q
+  !> amplitude. Zero = coil currents untouched, the value for every run that
+  !> does not enable re_eq_coil_control.
+  !>
+  !> This replaced a uniform multiplicative scale, which was measured and
+  !> rejected: on the 10 MeV JET case a 40% swing of every coil current bought
+  !> 2.6% of q amplitude (gain ~0.053, and saturating), c_glob = 1 extrapolated
+  !> to a scale of ~2.0, and at that setting the free-boundary iteration no
+  !> longer converged at all. The reason is geometric -- a uniform scale is
+  !> overwhelmingly a B_z knob, so it displaces the plasma and the radial
+  !> position feedback then cancels it, taking most of the field-gradient
+  !> change with it.
+  real*8              :: re_coil_ctl = 0.d0
   real*8, allocatable :: bext_tan(:,:)                   !< external tangential field
   real*8, allocatable :: bext_nor(:,:)                   !< external normal field
   real*8, allocatable :: bext_psi(:,:)                   !< external poloidal flux      
@@ -182,6 +185,18 @@ module vacuum
   type(t_coil_curr_time_trace)    :: coil_curr_time_trace(4*MAX_COILS)
   real*8 :: vert_FB_amp(MAX_COILS) = 0.d0 !< Tune direction and magnitude of vert feedback for each poloidal field coil ([[jorek-starwall-faqs|eq_FAQs]])
   real*8 :: rad_FB_amp(MAX_COILS) = 0.d0  !< Tune direction and magnitude of vert feedback for each poloidal field coil ([[jorek-starwall-faqs|eq_FAQs]])
+  !> Kinetic-RE q-amplitude actuator: per-coil direction in A/turn per unit of
+  !> the scalar control re_coil_ctl, in the same idiom as vert_FB_amp above.
+  !> ADDITIVE rather than multiplicative, because this is a specific shaping
+  !> CURRENT PATTERN, not a rescaling of the existing currents.
+  !> Generate it with util/re_equilibrium_prototype/coil_circuit_response.py:
+  !> that solves, in CIRCUIT space so the result is realizable on a machine
+  !> whose coils are wired together, for the combination that maximises
+  !> dB_z/dR at the axis subject to zero net B_z (and B_r) there -- i.e. it
+  !> compresses the plasma without moving it, so the position feedbacks are
+  !> never excited. Measured on JET: 14.9x the effective gradient of a uniform
+  !> current scale, which the position loop had been cancelling.
+  real*8 :: re_eq_coil_amp(MAX_COILS) = 0.d0
   
   ! --- Parameters for the feedback on the vertical position during timestepping (VFB), see ([[active_controller_model_for_vertical_stabilization|documentation]])
   character(len=256)  :: vert_pos_file = 'none'

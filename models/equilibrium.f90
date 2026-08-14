@@ -377,8 +377,9 @@ if (freeboundary_equil) then
         re_eq_max_it_out, ' outer iterations around the free-boundary solve.'
       write(*,'(A)')      '        Nprof starts from the converged fixed-boundary profile.'
       if (re_eq_coil_control) then
-        write(*,'(A)') '        Coil-scale control ON: the q amplitude is carried by a global'
-        write(*,'(A)') '        multiplier on the PF coil currents (secant, clamped to +/-25%).'
+        write(*,'(A)') '        Coil control ON: the q amplitude is carried by an additive'
+        write(*,'(A)') '        shaping current along re_eq_coil_amp (secant, clamped to 50%'
+        write(*,'(A)') '        of the base currents).'
         if (trim(re_eq_match_mode) .ne. 'full_q') then
           write(*,'(A)') ' WARNING: re_eq: re_eq_coil_control has nothing to do in q_shape mode --'
           write(*,'(A)') '          that mode divides the amplitude out of the residual, so c_glob'
@@ -566,7 +567,7 @@ if (freeboundary_equil) then
       ! the verdict is in, Nprof is frozen and moving the coils would
       ! invalidate it.
       if (re_eq_coil_control .and. (.not. re_eq_converged) .and. (.not. re_eq_done)) &
-        call re_eq_coil_update(re_coil_scale)
+        call re_eq_coil_update(re_coil_ctl)
       if (re_eq_converged) then
         write(*,'(A,I4,A)') ' re_eq: free-boundary q-profile matching converged after ', &
           iter_outer, ' outer iterations'
@@ -576,7 +577,7 @@ if (freeboundary_equil) then
     endif
     call MPI_bcast(re_eq_converged, 1, MPI_LOGICAL, 0, MPI_COMM_WORLD, ierr)
     call MPI_bcast(re_eq_done,      1, MPI_LOGICAL, 0, MPI_COMM_WORLD, ierr)
-    call MPI_bcast(re_coil_scale,   1, MPI_DOUBLE_PRECISION, 0, MPI_COMM_WORLD, ierr)
+    call MPI_bcast(re_coil_ctl,     1, MPI_DOUBLE_PRECISION, 0, MPI_COMM_WORLD, ierr)
     if (re_eq_converged .or. re_eq_done) exit
   else
     exit                        ! no q matching: one free-boundary solve only

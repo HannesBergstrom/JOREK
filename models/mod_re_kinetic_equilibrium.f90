@@ -213,9 +213,9 @@ real*8              :: re_eq_ph_beam_max = 0.d0
 !> q offset is not in the transplant's reach (measured: it sat at 0.9783 for
 !> 20 outer iterations on the 100 keV free-boundary case).
 real*8              :: re_eq_c_glob = 1.d0
-!> Coil-scale secant state: the previous (scale, c_glob) pair and whether one
-!> exists yet. The fixed-gain law was shown to run past its optimum, so the
-!> step is taken from the MEASURED dc_glob/d(scale).
+!> Coil-control secant state: the previous (control, c_glob) pair and whether
+!> one exists yet. The fixed-gain law was shown to run past its optimum, so the
+!> step is taken from the MEASURED dc_glob/d(control).
 real*8              :: re_eq_cs_prev = 0.d0, re_eq_cg_prev = 0.d0
 logical             :: re_eq_cs_have = .false.
 integer             :: re_eq_n_qlast   = 0      !< last evaluated q profile, kept so it can be
@@ -238,13 +238,13 @@ real*8              :: re_eq_best_err = 1.d99   !< best IN-BEAM max|q/q_t - 1| s
                                                  !< (the controllable objective; the verdict
                                                  !<  uses the full-range error, see below)
 real*8, allocatable :: re_eq_best_nprof(:)      !< Nprof of the best iterate
-!> Coil scale that PRODUCED the best iterate. The equilibrium is a function of
-!> (Nprof, coil currents) jointly, so restoring the profile without the coil
+!> Coil control that PRODUCED the best iterate. The equilibrium is a function
+!> of (Nprof, coil currents) jointly, so restoring the profile without the coil
 !> state that went with it hands back a pair that was never solved together --
-!> and since I_coils is derived as pf_coils%current * re_coil_scale * (1+FB)
-!> every iteration, and I_coils is what the restart stores, the mismatch would
-!> be written out as the delivered equilibrium.
-real*8              :: re_eq_best_coil_scale = 1.d0
+!> and since I_coils is rebuilt from pf_coils%current, re_eq_coil_amp and
+!> re_coil_ctl every iteration, and I_coils is what the restart stores, the
+!> mismatch would be written out as the delivered equilibrium.
+real*8              :: re_eq_best_coil_ctl = 0.d0
 integer             :: re_eq_n_stall  = 0       !< outer iterations without improvement
 logical :: re_eq_finishing     = .false.        !< best profile restored; final evaluation pass
 logical :: re_eq_soft_accepted = .false.        !< finished above tol_q but below tol_q_soft
@@ -1700,7 +1700,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   ! local, not a module-level dependency: only the best-iterate bookkeeping
   ! needs the coil scale, and importing it here keeps mod_re_kinetic_equilibrium
   ! free of vacuum at module scope. No cycle -- vacuum does not use this module.
-  use vacuum, only: re_coil_scale
+  use vacuum, only: re_coil_ctl
   implicit none
   integer,                  intent(in)  :: my_id
   type (type_node_list),    intent(in)  :: node_list
@@ -1961,7 +1961,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
         ' re_eq: the edge polish worsened the in-beam max|q/q_t-1| (', re_eq_best_err, &
         ' -> ', err_ctl, '); reverting to the unpolished best profile'
       re_nprof(1:re_eq_n_l) = re_eq_best_nprof(1:re_eq_n_l)
-      re_coil_scale         = re_eq_best_coil_scale
+      re_coil_ctl           = re_eq_best_coil_ctl
       call re_eq_apply_beam_envelope()
       re_eq_reverted = .true.
       write(RE_EQ_LOG_UNIT,'(I6,I8,3ES16.6)') re_eq_outer_iter, n_inner, err, I_now, maxval(re_cl_edge_frac)
@@ -1997,7 +1997,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   if (improved) then
     re_eq_best_err = err_ctl
     re_eq_best_nprof(1:re_eq_n_l) = re_nprof(1:re_eq_n_l)
-    re_eq_best_coil_scale         = re_coil_scale
+    re_eq_best_coil_ctl           = re_coil_ctl
   endif
   if (cur_active) then
     if (err_cur .lt. 0.98d0 * re_eq_best_err_cur) improved = .true.
@@ -2035,7 +2035,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
     !     the final verdict on that state
     if (re_eq_best_err .lt. err_ctl) then
       re_nprof(1:re_eq_n_l) = re_eq_best_nprof(1:re_eq_n_l)
-      re_coil_scale         = re_eq_best_coil_scale
+      re_coil_ctl           = re_eq_best_coil_ctl
     endif
     call re_eq_smooth_nprof()          ! includes the beam-edge table hygiene
     write(*,'(A,I4,A,ES10.2)') ' re_eq: finishing after ', re_eq_outer_iter, &
@@ -2112,8 +2112,10 @@ end subroutine re_eq_outer_update
 !> The iteration BUDGET is restarted too, so re_eq_max_it_out means the same
 !> thing in each phase rather than being shared between them.
 !=======================================================================
-!> Stage C: drive the global PF coil-current scale so that the achieved q
-!> AMPLITUDE matches the target, i.e. re_eq_c_glob -> 1.
+!> Stage C: drive an ADDITIVE shaping current on the PF coils so that the
+!> achieved q AMPLITUDE matches the target, i.e. re_eq_c_glob -> 1.
+!> The direction is re_eq_coil_amp (per coil, A/turn per unit control); this
+!> routine drives only the scalar riding it.
 !>
 !> Why this is the missing degree of freedom, not a convenience: with the
 !> external field fixed, Nprof alone determines BOTH q(psihat) and I_RE, so
@@ -2130,16 +2132,28 @@ end subroutine re_eq_outer_update
 !> dilation control:  shape <- transplant,  amplitude <- THIS,
 !> current <- re_eq_rescale_current.
 !>
+!> Why an additive SHAPING direction rather than a uniform current scale: a
+!> uniform scale is overwhelmingly a B_z knob, so it moves the plasma and the
+!> radial position feedback cancels it. Measured on JET at 10 MeV: a 40% swing
+!> of every coil bought 2.6% of q amplitude (gain ~0.053, saturating), c_glob=1
+!> extrapolated to a scale of ~2.0, and there the free-boundary iteration no
+!> longer converged. Computing the coil combination that maximises dB_z/dR at
+!> the axis at zero net B_z gives 14.9x that effective gradient -- see
+!> util/re_equilibrium_prototype/coil_circuit_response.py, which solves in
+!> CIRCUIT space so the answer is realizable on a wired machine.
+!>
 !> Secant, not fixed gain: the fixed-gain law was shown to run past its
 !> optimum. The first call takes a blind probe step, every later call uses the
-!> measured dc_glob/d(scale).
-subroutine re_eq_coil_update(scale)
+!> measured dc_glob/d(control).
+subroutine re_eq_coil_update(ctl)
+  use vacuum, only: re_eq_coil_amp, pf_coils, n_pf_coils
   implicit none
-  real*8, intent(inout) :: scale
-  real*8            :: err, slope, step, new
-  real*8, parameter :: PROBE  = 1.d-2    ! blind first step, 1% of the coil set
-  real*8, parameter :: CLAMP  = 0.25d0   ! max fractional excursion from the input currents
-  real*8, parameter :: MAXSTP = 5.d-2    ! max change per outer iteration
+  real*8, intent(inout) :: ctl
+  real*8            :: err, slope, step, new_ctl, ref
+  integer           :: i
+  real*8, parameter :: PROBE_F = 2.d-2   ! blind first step, fraction of ref
+  real*8, parameter :: CLAMP_F = 5.d-1   ! max |ctl|, fraction of ref
+  real*8, parameter :: MAXST_F = 1.d-1   ! max change per outer iteration
   real*8, parameter :: AMP_FRAC = 0.25d0 ! share of re_eq_tol_q the amplitude may use
 
   err = re_eq_c_glob - 1.d0
@@ -2151,57 +2165,67 @@ subroutine re_eq_coil_update(scale)
   ! amplitude at the tolerance guarantees the total never gets below it.
   ! Measured on the 100 keV free-boundary case -- the amplitude froze at
   ! 4.0e-3 and the total floored at 4.75e-3, never reaching the tolerance.
-  ! A quarter leaves three quarters of the budget for the shape match.
   if (abs(err) .lt. AMP_FRAC * re_eq_tol_q) then
     write(*,'(A,ES10.2,A)') ' re_eq: coil control satisfied (|c_glob-1| = ', &
-      abs(err), '); scale frozen'
+      abs(err), '); control frozen'
+    return
+  endif
+
+  ! --- reference current: the largest base current among the coils this
+  !     actuator actually drives. All step sizes are fractions of it, so the
+  !     control is dimensionally sensible on any machine without per-case
+  !     tuning (re_coil_ctl is in A/turn, like pf_coils%current).
+  ref = 0.d0
+  do i = 1, n_pf_coils
+    if (abs(re_eq_coil_amp(i)) .gt. 1.d-12) &
+      ref = max(ref, abs(pf_coils(i)%current))
+  enddo
+  if (ref .le. 0.d0) then
+    write(*,'(A)') ' WARNING: re_eq: re_eq_coil_control is on but re_eq_coil_amp is zero'
+    write(*,'(A)') '          on every coil with a non-zero current -- the control has no'
+    write(*,'(A)') '          actuator. Generate the direction with'
+    write(*,'(A)') '          util/re_equilibrium_prototype/coil_circuit_response.py'
     return
   endif
 
   if (.not. re_eq_cs_have) then
-    ! No slope yet. Probe in the physically expected sense: a stronger
-    ! external field compresses the plasma, and q ~ a^2 B0/(R0 I) at pinned
-    ! current, so MORE coil current LOWERS q. Hence err = c_glob - 1 < 0
-    ! (q too low) wants less coil current, i.e. step and err share a sign.
-    ! Verified against both scans: at 100 keV err < 0 and c_glob rose as the
-    ! scale came down; at 10 MeV err > 0 and c_glob fell as it went up. (The
-    ! original form had this inverted, which cost two iterations before the
-    ! secant corrected it.)
-    step = sign(PROBE, err)
+    ! No slope yet. The sign of dc_glob/d(ctl) depends on how the chosen field
+    ! perturbation maps onto the plasma size for this machine, which is not
+    ! worth predicting -- probe one way and let the secant invert it on the
+    ! next call if it guessed wrong. Costs at most one iteration.
+    step = PROBE_F * ref
   else
-    slope = (re_eq_c_glob - re_eq_cg_prev) / max(abs(scale - re_eq_cs_prev), 1.d-12) &
-            * sign(1.d0, scale - re_eq_cs_prev)
-    if (abs(slope) .lt. 1.d-8) then
-      ! No measurable response: the coils cannot move the q amplitude (wrong
-      ! set, or the area iteration is holding the size). Say so rather than
-      ! dividing by ~0 and throwing the scale to a rail.
-      write(*,'(A)') ' WARNING: re_eq: the coil scale has no measurable effect on the q'
-      write(*,'(A)') '          amplitude (dc_glob/dscale ~ 0). Check that'
-      write(*,'(A)') '          freeb_equil_iterate_area is off and that the coil set can'
-      write(*,'(A)') '          actually change the plasma size; the control is doing nothing.'
+    slope = (re_eq_c_glob - re_eq_cg_prev) / (ctl - re_eq_cs_prev)
+    if (abs(slope) .lt. 1.d-14) then
+      ! No measurable response: the actuator cannot move the q amplitude.
+      write(*,'(A)') ' WARNING: re_eq: the coil control has no measurable effect on the q'
+      write(*,'(A)') '          amplitude (dc_glob/dctl ~ 0). Check that'
+      write(*,'(A)') '          freeb_equil_iterate_area is off, and that re_eq_coil_amp is'
+      write(*,'(A)') '          the position-neutral SHAPING direction rather than something'
+      write(*,'(A)') '          the position feedbacks simply cancel.'
       return
     endif
     step = -err / slope
   endif
 
-  step = sign(min(abs(step), MAXSTP), step)
-  new  = scale + step
-  new  = min(max(new, 1.d0 - CLAMP), 1.d0 + CLAMP)
-  if (new .eq. scale) then
-    write(*,'(A,F8.4,A)') ' WARNING: re_eq: coil scale is against its limit (', new, &
-      '); the q amplitude cannot be reached within +/-25% of the input currents'
+  step    = sign(min(abs(step), MAXST_F * ref), step)
+  new_ctl = ctl + step
+  new_ctl = min(max(new_ctl, -CLAMP_F * ref), CLAMP_F * ref)
+  if (new_ctl .eq. ctl) then
+    write(*,'(A,ES11.3,A)') ' WARNING: re_eq: coil control is against its limit (', new_ctl, &
+      ' A/turn); the q amplitude cannot be reached within 50% of the base currents'
     return
   endif
 
   ! record BEFORE overwriting, so the next call differences the pair that
   ! actually bracketed this residual measurement
-  re_eq_cs_prev = scale
+  re_eq_cs_prev = ctl
   re_eq_cg_prev = re_eq_c_glob
   re_eq_cs_have = .true.
 
-  write(*,'(A,F10.5,A,F9.5,A,F9.5)') ' re_eq: coil control: c_glob = ', re_eq_c_glob, &
-    '   coil scale ', scale, ' -> ', new
-  scale = new
+  write(*,'(A,F10.5,A,ES12.4,A,ES12.4,A)') ' re_eq: coil control: c_glob = ', re_eq_c_glob, &
+    '   ctl ', ctl, ' -> ', new_ctl, ' A/turn'
+  ctl = new_ctl
 
 end subroutine re_eq_coil_update
 
