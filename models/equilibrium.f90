@@ -589,7 +589,18 @@ if (freeboundary_equil) then
       ! on the LCFS just measured, and only while the loop is still running:
       ! once the verdict is in, Nprof is frozen and moving the boundary would
       ! invalidate it.
-      if ((re_eq_lcfs_a .gt. 0.d0) .and. (.not. re_eq_converged) .and. (.not. re_eq_done)) &
+      !
+      ! NOT during the finishing pass. That pass freezes Nprof and exists only
+      ! to judge whether the edge polish helped, by comparing the q error
+      ! before and after; moving the boundary underneath it makes the size
+      ! control's effect look like the polish's. Observed exactly that on the
+      ! first 10 MeV run: one good size step (a 0.71711 -> 0.70516) was
+      ! attributed to the polish, which then reverted BOTH, and the run
+      ! finished at the size it started with. The size control must have
+      ! finished its work before the endgame begins -- which it will, now that
+      ! the size error is part of the convergence test.
+      if ((re_eq_lcfs_a .gt. 0.d0) .and. (.not. re_eq_converged) &
+          .and. (.not. re_eq_done) .and. (.not. re_eq_finishing)) &
         call re_eq_lcfs_update(R_axis_ref)
       if (re_eq_converged) then
         write(*,'(A,I4,A)') ' re_eq: free-boundary q-profile matching converged after ', &

@@ -59,7 +59,8 @@ public :: re_eq_init, re_eq_update_labels, re_eq_rescale_current,              &
           re_eq_shift_labels,                                                  &
           re_eq_source, re_eq_source_derivs, re_eq_outer_update,               &
           re_eq_write_output, re_eq_finalize, re_eq_done,                      &
-          re_eq_ph_beam_max, re_eq_restart_outer, re_eq_lcfs_update
+          re_eq_ph_beam_max, re_eq_restart_outer, re_eq_lcfs_update,        &
+          re_eq_finishing
 ! --- exposed for the standalone unit test (util/re_equilibrium_prototype)
 public :: re_cl_alpha, re_cl_A_edge
 
@@ -237,6 +238,8 @@ real*8, allocatable :: re_eq_q_last(:)
 real*8, allocatable :: re_eq_N_prev(:)      !< Nprof at the START of the previous outer update
 real*8, allocatable :: re_eq_r_prev(:)      !< the residual it acted on, size n_lev
 logical             :: re_eq_have_hist = .false.
+real*8              :: re_eq_best_err_siz = 1.d99 !< best 2|a/a_t - 1| so far; only used when a target
+                                                   !< LCFS is requested
 real*8              :: re_eq_best_err_cur = 1.d99 !< best |I_RE/target - 1| so far; only used when the
                                                    !< total-current control is active
 real*8              :: re_eq_best_err = 1.d99   !< best IN-BEAM max|q/q_t - 1| so far
@@ -691,6 +694,7 @@ subroutine re_eq_init_nprof(my_id)
   enddo
   re_eq_best_err      = 1.d99
   re_eq_best_err_cur  = 1.d99
+  re_eq_best_err_siz  = 1.d99
   re_eq_have_hist     = .false.
   re_eq_n_stall       = 0
   re_eq_finishing     = .false.
@@ -1701,9 +1705,11 @@ end subroutine re_eq_operator_update
 subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_lev, &
                               n_inner, converged)
   use data_structure
-  ! local, not a module-level dependency: only the best-iterate bookkeeping
-  ! needs the coil scale, and importing it here keeps mod_re_kinetic_equilibrium
-  ! free of vacuum at module scope. No cycle -- vacuum does not use this module.
+  use equil_info, only: ES
+  ! local, not a module-level dependency: only the size-control bookkeeping
+  ! needs the radial setpoint, and importing it here keeps
+  ! mod_re_kinetic_equilibrium free of vacuum at module scope. No cycle --
+  ! vacuum does not use this module.
   use vacuum, only: R_axis_ref
   implicit none
   integer,                  intent(in)  :: my_id
@@ -1716,11 +1722,12 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   logical,                  intent(out) :: converged
 
   integer :: k, i, s
-  logical :: cur_active, improved
+  logical :: cur_active, improved, siz_active
   real*8  :: phm(re_eq_n_l), phe, q_at, qt_at, ratio(re_eq_n_l), lr(re_eq_n_l)
   real*8  :: q_acc(re_eq_n_l), qt_acc(re_eq_n_l)
   real*8  :: cw(re_eq_n_class), cw_sum, ph_beam_cl(re_eq_n_class)
   real*8  :: c_amp, num, den, err, err_ctl, I_now, ph_ctl_max, ph_beam, l_eff, err_cur
+  real*8  :: err_siz
   real*8  :: c_glob
   real*8  :: C(re_eq_n_l), dl, qq
 
@@ -1908,11 +1915,26 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   err_cur    = 0.d0
   if (cur_active) err_cur = abs(abs(I_now)/abs(re_eq_I_RE) - 1.d0)
 
-  ! Both criteria must be met: a run that matched q but is still far from the
-  ! requested current has not finished the job. Reuses re_eq_tol_q rather than
-  ! introducing a second tolerance.
+  ! --- Size error, on the same footing as the current error and active only
+  !     when a target LCFS is actually requested. Without this the loop can
+  !     and does declare success on the q shape alone while the plasma is the
+  !     wrong size: measured on the 10 MeV free-boundary run, it converged on
+  !     the first outer iteration with a = 0.71711 against a target of
+  !     0.69489, i.e. 3.2% out. The factor 2 is the q ~ a^2 scaling -- a
+  !     relative size error shows up as twice that relative q-amplitude error,
+  !     so comparing 2*|a/a_t - 1| against re_eq_tol_q holds the amplitude to
+  !     the same tolerance the q match is held to, without a second knob.
+  siz_active = (re_eq_lcfs_a .gt. 0.d0)
+  err_siz    = 0.d0
+  if (siz_active .and. (ES%LCFS_a .gt. 0.d0)) &
+    err_siz = 2.d0 * abs(ES%LCFS_a / re_eq_lcfs_a - 1.d0)
+
+  ! All active criteria must be met: a run that matched q but is still far
+  ! from the requested current, or the requested size, has not finished the
+  ! job. Reuses re_eq_tol_q rather than introducing further tolerances.
   converged   = (err .lt. re_eq_tol_q)
   if (cur_active) converged = converged .and. (err_cur .lt. re_eq_tol_q)
+  if (siz_active) converged = converged .and. (err_siz .lt. re_eq_tol_q)
 
   ! --- The two errors have DIFFERENT roles and must not be conflated:
   !       err     (full range)  -> the VERDICT: convergence and the soft
@@ -1974,7 +1996,8 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
     endif
     if (.not. converged) then
       if ((err .lt. re_eq_tol_q_soft) .and. &
-          ((.not. cur_active) .or. (err_cur .lt. re_eq_tol_q_soft))) then
+          ((.not. cur_active) .or. (err_cur .lt. re_eq_tol_q_soft)) .and. &
+          ((.not. siz_active) .or. (err_siz .lt. re_eq_tol_q_soft))) then
         write(*,'(A)')        ' WARNING: re_eq: q matching stagnated above re_eq_tol_q;'
         write(*,'(A,ES10.2)') '          accepted at the soft tolerance with max|q/q_t-1| = ', err
         write(*,'(A)')        '          (a drift surface spans a RANGE of psihat, so Nprof cannot'
@@ -2010,6 +2033,14 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
     if (err_cur .lt. 0.98d0 * re_eq_best_err_cur) improved = .true.
     re_eq_best_err_cur = min(re_eq_best_err_cur, err_cur)
   endif
+  ! Same reasoning for the size: the early free-boundary iterations legitimately
+  ! trade q error for size progress -- moving the boundary perturbs the profile
+  ! match before it recovers -- so a q-only stall counter would abort the run
+  ! in the middle of the size control doing its job.
+  if (siz_active) then
+    if (err_siz .lt. 0.98d0 * re_eq_best_err_siz) improved = .true.
+    re_eq_best_err_siz = min(re_eq_best_err_siz, err_siz)
+  endif
   if (improved) then
     re_eq_n_stall = 0
   else
@@ -2025,6 +2056,9 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   if (cur_active) &
     write(*,'(A,ES11.3,A,ES12.4,A)') '                |I_RE/target - 1| = ', err_cur, &
       '   (target ', re_eq_I_RE, ' A)'
+  if (siz_active) &
+    write(*,'(A,ES11.3,A,F9.5,A,F9.5,A)') '                2|a/a_t - 1|      = ', err_siz, &
+      '   (a = ', ES%LCFS_a, ', target ', re_eq_lcfs_a, ' m)'
   write(*,'(A,F10.5)') '                q amplitude (achieved/target) = ', c_glob
   if (maxval(re_cl_edge_frac) .gt. 2.d-1) &
     write(*,'(A,ES10.2,A)') ' WARNING: re_eq: ', maxval(re_cl_edge_frac), &
@@ -2235,6 +2269,7 @@ subroutine re_eq_restart_outer()
   re_eq_outer_iter    = 0
   re_eq_best_err      = 1.d99
   re_eq_best_err_cur  = 1.d99
+  re_eq_best_err_siz  = 1.d99
   re_eq_n_stall       = 0
   re_eq_have_hist     = .false.
   re_eq_finishing     = .false.
