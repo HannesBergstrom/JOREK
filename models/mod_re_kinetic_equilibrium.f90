@@ -2162,6 +2162,13 @@ subroutine re_eq_lcfs_update(R_ref)
   real*8, parameter :: TOL_F   = 0.25d0  ! share of re_eq_tol_q the size may use
   real*8, parameter :: A_RES   = 1.d-5   ! LCFS_a is reported to 0.01 mm
 
+  ! Anchor for the excursion clamp: the setpoint this phase started from.
+  ! Captured on first use rather than set by the caller, so the anchor cannot
+  ! be forgotten or get out of step with the value actually in force. Zero is
+  ! an unambiguous "not yet set" -- the caller refuses to start the control
+  ! with R_axis_ref <= 0, since that switches the radial feedback off entirely.
+  if (re_eq_R_ref_0 .eq. 0.d0) re_eq_R_ref_0 = R_ref
+
   a_now = ES%LCFS_a
   if (a_now .le. 0.d0) then
     write(*,'(A)') ' WARNING: re_eq: LCFS_a is not positive; the size control cannot run.'

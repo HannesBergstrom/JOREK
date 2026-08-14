@@ -377,7 +377,6 @@ if (freeboundary_equil) then
         re_eq_max_it_out, ' outer iterations around the free-boundary solve.'
       write(*,'(A)')      '        Nprof starts from the converged fixed-boundary profile.'
       if (re_eq_lcfs_a .gt. 0.d0) then
-        re_eq_R_ref_0 = R_axis_ref
         write(*,*)
         write(*,'(A,F9.5,A)') '        SIZE CONTROL ON: driving the LCFS minor radius to ', &
           re_eq_lcfs_a, ' m'
