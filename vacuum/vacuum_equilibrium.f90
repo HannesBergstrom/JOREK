@@ -351,13 +351,26 @@ module vacuum_equilibrium
    if (my_id == 0) write(*,*) ' vertical_FB = ', vertical_FB
    if (my_id == 0) write(*,*) ' radial_FB = ', radial_FB
    
+   if ((my_id == 0) .and. (re_coil_ctl .ne. 0.d0)) &
+     write(*,*) ' re_coil_ctl = ', re_coil_ctl
+
    do i=1, n_pf_coils
+     ! Kinetic-RE elongation actuator: an ADDITIVE shaping current, applied to
+     ! every PF coil including those carrying no position feedback (those are
+     ! set once at allocation and never revisited below). It composes with the
+     ! position feedbacks rather than competing for coils -- a coil may serve
+     ! only one FEEDBACK channel (see the abort below), but this is a separate
+     ! additive term. Guarded on /= 0 so a run without it is bit-identical.
+     if (re_coil_ctl .ne. 0.d0) &
+       I_coils(i) = pf_coils(i)%current + re_eq_coil_amp(i) * re_coil_ctl
      if( abs(vert_FB_amp(i)) .gt. 1.d-6 ) then
-       I_coils(i) =  pf_coils(i)%current * (1 + vert_FB_amp(i) * vertical_FB ) 
+       I_coils(i) =  pf_coils(i)%current * (1 + vert_FB_amp(i) * vertical_FB ) &
+                  +  re_eq_coil_amp(i) * re_coil_ctl
        if (my_id == 0) write(*,'(a,I7,a,1es12.4)') 'FB coil ==> I_coil(', i, ') = ', I_coils(i)
      endif
      if( abs(rad_FB_amp(i)) .gt. 1.d-6 ) then
-       I_coils(i) =  pf_coils(i)%current * (1 + rad_FB_amp(i) * radial_FB ) 
+       I_coils(i) =  pf_coils(i)%current * (1 + rad_FB_amp(i) * radial_FB ) &
+                  +  re_eq_coil_amp(i) * re_coil_ctl
        if (my_id == 0) write(*,'(a,I7,a,1es12.4)') 'FB coil ==> I_coil(', i, ') = ', I_coils(i)
      endif
      if (( abs(vert_FB_amp(i)) .gt. 1.d-6 ) .and. (abs(rad_FB_amp(i)) .gt. 1.d-6 ))  then

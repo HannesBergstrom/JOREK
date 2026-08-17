@@ -398,6 +398,17 @@ if (freeboundary_equil) then
           write(*,*) '       is no actuator. Set R_axis_ref to a sensible starting value.'
           stop 1
         endif
+        if (re_eq_lcfs_kappa .gt. 0.d0) then
+          write(*,'(A,F9.5)') '        Elongation channel ON: target kappa = ', re_eq_lcfs_kappa
+          write(*,'(A)')      '        Actuator: additive coil current along re_eq_coil_amp.'
+        else
+          write(*,'(A)') '        Elongation is NOT controlled: only the minor radius is held.'
+          write(*,'(A)') '        The shape is then free, and it moves with RE energy -- the'
+          write(*,'(A)') '        vertical field needed to hold the beam radially grows with'
+          write(*,'(A)') '        energy and squeezes the plasma taller (measured at matched a:'
+          write(*,'(A)') '        kappa 1.187 at 100 keV against 1.207 at 10 MeV, i.e. 2% of q'
+          write(*,'(A)') '        amplitude). Set re_eq_lcfs_kappa to hold it.'
+        endif
         if (trim(re_eq_match_mode) .ne. 'q_shape') then
           write(*,'(A)') ' WARNING: re_eq: the size control fixes the LCFS while re_eq_I_RE fixes'
           write(*,'(A)') '          the current, and those two together DETERMINE the q amplitude.'
@@ -606,7 +617,7 @@ if (freeboundary_equil) then
       ! the size error is part of the convergence test.
       if (re_eq_size_active .and. (.not. re_eq_converged) &
           .and. (.not. re_eq_done) .and. (.not. re_eq_finishing)) &
-        call re_eq_lcfs_update(R_axis_ref)
+        call re_eq_lcfs_update(R_axis_ref, re_coil_ctl)
       if (re_eq_converged) then
         write(*,'(A,I4,A)') ' re_eq: free-boundary q-profile matching converged after ', &
           iter_outer, ' outer iterations'
@@ -617,6 +628,7 @@ if (freeboundary_equil) then
     call MPI_bcast(re_eq_converged, 1, MPI_LOGICAL, 0, MPI_COMM_WORLD, ierr)
     call MPI_bcast(re_eq_done,      1, MPI_LOGICAL, 0, MPI_COMM_WORLD, ierr)
     call MPI_bcast(R_axis_ref,      1, MPI_DOUBLE_PRECISION, 0, MPI_COMM_WORLD, ierr)
+    call MPI_bcast(re_coil_ctl,     1, MPI_DOUBLE_PRECISION, 0, MPI_COMM_WORLD, ierr)
     if (re_eq_converged .or. re_eq_done) exit
   else
     exit                        ! no q matching: one free-boundary solve only

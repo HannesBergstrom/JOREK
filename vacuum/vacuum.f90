@@ -172,6 +172,23 @@ module vacuum
   type(t_coil_curr_time_trace)    :: coil_curr_time_trace(4*MAX_COILS)
   real*8 :: vert_FB_amp(MAX_COILS) = 0.d0 !< Tune direction and magnitude of vert feedback for each poloidal field coil ([[jorek-starwall-faqs|eq_FAQs]])
   real*8 :: rad_FB_amp(MAX_COILS) = 0.d0  !< Tune direction and magnitude of vert feedback for each poloidal field coil ([[jorek-starwall-faqs|eq_FAQs]])
+  !> Kinetic-RE ELONGATION actuator: per-coil direction in A/turn per unit of
+  !> re_coil_ctl, in the same idiom as vert_FB_amp above but ADDITIVE, since
+  !> this is a specific shaping current pattern rather than a rescaling.
+  !> Only the elongation channel uses it -- the minor radius is controlled
+  !> through R_axis_ref and the existing radial feedback, which needs no coil
+  !> vector at all.
+  !> Generate it with util/re_equilibrium_prototype/scan_circuit_response.py:
+  !> that measures dLCFS_a/dI and dkappa/dI per CIRCUIT (so the result is
+  !> realizable on a machine whose coils are wired together) and reports
+  !> |dkappa/da| per circuit. Pick the largest -- it reshapes without resizing.
+  !> On JET that is the up/down symmetric P2-vs-P3 circuit at |dkappa/da| = 25.5,
+  !> against <= 2.3 for everything else.
+  real*8 :: re_eq_coil_amp(MAX_COILS) = 0.d0
+  !> Scalar riding re_eq_coil_amp, driven by the elongation error. Zero leaves
+  !> the coil currents untouched, which is the case for every run that does not
+  !> set re_eq_lcfs_kappa.
+  real*8 :: re_coil_ctl = 0.d0
   
   ! --- Parameters for the feedback on the vertical position during timestepping (VFB), see ([[active_controller_model_for_vertical_stabilization|documentation]])
   character(len=256)  :: vert_pos_file = 'none'

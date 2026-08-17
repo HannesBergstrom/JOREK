@@ -51,7 +51,7 @@ public :: re_kinetic_equilibrium, re_eq_dist_file, re_eq_dist_format,          &
           re_eq_xi_min, re_eq_alpha_out, re_eq_tol_q, re_eq_tol_q_soft,        &
           re_eq_edge_taper, re_eq_l_beam, re_eq_l_beam_width,                  &
           re_eq_ratio_clamp, re_eq_absorbing_edge, re_eq_op_lambda,             &
-          re_eq_lcfs_a,                                                        &
+          re_eq_lcfs_a, re_eq_lcfs_kappa,                                      &
           re_eq_max_it_out, re_eq_n_l, re_eq_n_q_levels,                       &
           re_eq_finite_pitch
 ! --- driver interface (used by equilibrium.f90 and the GS element assembly)
@@ -159,6 +159,20 @@ real*8             :: re_eq_lcfs_a      = -1.d0       !< FREE BOUNDARY ONLY: tar
                                                       !< Use with re_eq_match_mode = 'q_shape'.
                                                       !< Negative (default) leaves R_axis_ref and
                                                       !< all existing behaviour untouched.
+real*8             :: re_eq_lcfs_kappa  = -1.d0       !< FREE BOUNDARY ONLY: target LCFS elongation.
+                                                      !< Optional second channel of the size control.
+                                                      !< Matching only the minor radius leaves the
+                                                      !< SHAPE free, and it does not stay put: the
+                                                      !< vertical field needed to hold a RE beam
+                                                      !< radially grows with energy (the beam has no
+                                                      !< thermal pressure term, see Ficker et al,
+                                                      !< Nucl. Fusion 59 096036), and that field
+                                                      !< squeezes the plasma taller. Measured at a
+                                                      !< common a = 0.69489: kappa 1.187 at 100 keV
+                                                      !< against 1.20741 at 10 MeV, worth 2.0% of q
+                                                      !< amplitude via q ~ a^2 (1+kappa^2)/2. Needs
+                                                      !< re_eq_coil_amp for its actuator. Negative
+                                                      !< (default) controls the minor radius only.
 real*8             :: re_eq_op_lambda   = 1.d-2       !< smoothness regularization of the 'operator'
                                                       !< transplant variant (damped least squares on the
                                                       !< relative Nprof correction); unused otherwise
@@ -216,13 +230,24 @@ real*8              :: re_eq_ph_beam_max = 0.d0
 !> q offset is not in the transplant's reach (measured: it sat at 0.9783 for
 !> 20 outer iterations on the 100 keV free-boundary case).
 real*8              :: re_eq_c_glob = 1.d0
-!> Size-control secant state: the previous (R_axis_ref, LCFS_a) pair and
-!> whether one exists yet. The response is MEASURED rather than assumed -- it
-!> depends on how the plasma meets the wall, which is a property of the case,
-!> not of the machine. re_eq_R_ref_0 is the setpoint the run started from and
-!> anchors the excursion clamp.
-real*8              :: re_eq_rs_prev = 0.d0, re_eq_a_prev = 0.d0
+!> Size-control state. The actuators are x = (R_axis_ref, re_coil_ctl) and the
+!> targets f = (LCFS_a, LCFS_kappa); with only the minor radius controlled this
+!> degenerates to the 1x1 secant it started as.
+!>
+!> A 2x2 Jacobian rather than two independent loops, because the cross terms
+!> are not small: measured on the 10 MeV JET case, the ~27 mm of R_axis_ref
+!> needed to fix the minor radius moves kappa by 0.011, which is HALF the kappa
+!> error being corrected. Two SISO loops would keep undoing each other.
+!>
+!> The Jacobian is MEASURED, never assumed: one probe per actuator fills a
+!> column, and Broyden keeps it current after that. re_eq_R_ref_0 anchors the
+!> setpoint excursion clamp, re_eq_ctl_ref scales the kappa actuator.
+real*8              :: re_eq_J(2,2)    = 0.d0   !< df/dx, columns filled by probing
+real*8              :: re_eq_x_prev(2) = 0.d0   !< actuators at the last call
+real*8              :: re_eq_f_prev(2) = 0.d0   !< residuals they produced
+integer             :: re_eq_nprobe    = 0      !< columns of re_eq_J filled so far
 real*8              :: re_eq_R_ref_0 = 0.d0
+real*8              :: re_eq_ctl_ref = 0.d0
 !> Is the size control actually running? Set by the caller when the
 !> FREE-BOUNDARY phase starts, false everywhere else. re_eq_lcfs_a > 0 alone is
 !> NOT the right test: the fixed-boundary phase has its boundary frozen by the
@@ -230,7 +255,6 @@ real*8              :: re_eq_R_ref_0 = 0.d0
 !> can move it. Making the size part of the convergence test there gives Phase 1
 !> a criterion it can never satisfy, and it simply never converges.
 logical             :: re_eq_size_active = .false.
-logical             :: re_eq_rs_have = .false.
 integer             :: re_eq_n_qlast   = 0      !< last evaluated q profile, kept so it can be
 real*8, allocatable :: re_eq_ph_last(:)         !< written out even when the run does NOT converge
 real*8, allocatable :: re_eq_q_last(:)
@@ -263,6 +287,7 @@ real*8, allocatable :: re_eq_best_nprof(:)      !< Nprof of the best iterate
 !> solved together, and the coil currents the restart stores would not be the
 !> ones that produced the delivered profile.
 real*8              :: re_eq_best_R_ref = 0.d0
+real*8              :: re_eq_best_ctl   = 0.d0   !< and the elongation actuator with it
 integer             :: re_eq_n_stall  = 0       !< outer iterations without improvement
 logical :: re_eq_finishing     = .false.        !< best profile restored; final evaluation pass
 logical :: re_eq_soft_accepted = .false.        !< finished above tol_q but below tol_q_soft
@@ -1721,7 +1746,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   ! needs the radial setpoint, and importing it here keeps
   ! mod_re_kinetic_equilibrium free of vacuum at module scope. No cycle --
   ! vacuum does not use this module.
-  use vacuum, only: R_axis_ref
+  use vacuum, only: R_axis_ref, re_coil_ctl
   implicit none
   integer,                  intent(in)  :: my_id
   type (type_node_list),    intent(in)  :: node_list
@@ -1939,6 +1964,16 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   err_siz    = 0.d0
   if (siz_active .and. (ES%LCFS_a .gt. 0.d0)) &
     err_siz = 2.d0 * abs(ES%LCFS_a / re_eq_lcfs_a - 1.d0)
+  ! The elongation feeds the q amplitude through the same route the minor
+  ! radius does -- q ~ a^2 (1+kappa^2)/2 -- so it belongs in the same error,
+  ! taking whichever channel is worse. d ln q / d ln kappa = 2 kappa^2/(1+kappa^2)
+  ! is the weight, ~1.2 at kappa ~ 1.2, against 2 for the minor radius.
+  ! Without this the loop converges on a with the shape still drifting: measured
+  ! at matched a = 0.69489, kappa was 1.187 at 100 keV against 1.20741 at
+  ! 10 MeV, worth 2.0% of q amplitude that nothing was watching.
+  if (siz_active .and. (re_eq_lcfs_kappa .gt. 0.d0) .and. (ES%LCFS_kappa .gt. 0.d0)) &
+    err_siz = max(err_siz, 2.d0 * ES%LCFS_kappa**2 / (1.d0 + ES%LCFS_kappa**2) &
+                           * abs(ES%LCFS_kappa / re_eq_lcfs_kappa - 1.d0))
 
   ! All active criteria must be met: a run that matched q but is still far
   ! from the requested current, or the requested size, has not finished the
@@ -2007,7 +2042,10 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
         ' re_eq: the edge polish worsened the objective (', re_eq_best_err, &
         ' -> ', err_best, '); reverting to the unpolished best profile'
       re_nprof(1:re_eq_n_l) = re_eq_best_nprof(1:re_eq_n_l)
-      if (re_eq_size_active) R_axis_ref = re_eq_best_R_ref
+      if (re_eq_size_active) then
+        R_axis_ref  = re_eq_best_R_ref
+        re_coil_ctl = re_eq_best_ctl
+      endif
       call re_eq_apply_beam_envelope()
       re_eq_reverted = .true.
       write(RE_EQ_LOG_UNIT,'(I6,I8,3ES16.6)') re_eq_outer_iter, n_inner, err, I_now, maxval(re_cl_edge_frac)
@@ -2056,7 +2094,10 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
     re_eq_best_nprof(1:re_eq_n_l) = re_nprof(1:re_eq_n_l)
     ! the setpoint that produced this profile: the equilibrium is a function of
     ! the pair, so they must be restored together
-    if (re_eq_size_active) re_eq_best_R_ref = R_axis_ref
+    if (re_eq_size_active) then
+      re_eq_best_R_ref = R_axis_ref
+      re_eq_best_ctl   = re_coil_ctl
+    endif
   endif
   ! Stagnation additionally must not fire while any INDIVIDUAL channel is still
   ! improving, even when the combined worst-case has not moved: the early phase
@@ -2085,9 +2126,13 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   if (cur_active) &
     write(*,'(A,ES11.3,A,ES12.4,A)') '                |I_RE/target - 1| = ', err_cur, &
       '   (target ', re_eq_I_RE, ' A)'
-  if (siz_active) &
-    write(*,'(A,ES11.3,A,F9.5,A,F9.5,A)') '                2|a/a_t - 1|      = ', err_siz, &
+  if (siz_active) then
+    write(*,'(A,ES11.3,A,F9.5,A,F9.5,A)') '                geometry error    = ', err_siz, &
       '   (a = ', ES%LCFS_a, ', target ', re_eq_lcfs_a, ' m)'
+    if (re_eq_lcfs_kappa .gt. 0.d0) &
+      write(*,'(A,F9.5,A,F9.5,A)') '                                        (kappa = ', &
+        ES%LCFS_kappa, ', target ', re_eq_lcfs_kappa, ')'
+  endif
   write(*,'(A,F10.5)') '                q amplitude (achieved/target) = ', c_glob
   if (maxval(re_cl_edge_frac) .gt. 2.d-1) &
     write(*,'(A,ES10.2,A)') ' WARNING: re_eq: ', maxval(re_cl_edge_frac), &
@@ -2105,7 +2150,10 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
     !     the final verdict on that state
     if (re_eq_best_err .lt. err_best) then
       re_nprof(1:re_eq_n_l) = re_eq_best_nprof(1:re_eq_n_l)
-      if (re_eq_size_active) R_axis_ref = re_eq_best_R_ref
+      if (re_eq_size_active) then
+        R_axis_ref  = re_eq_best_R_ref
+        re_coil_ctl = re_eq_best_ctl
+      endif
     endif
     call re_eq_smooth_nprof()          ! includes the beam-edge table hygiene
     write(*,'(A,I4,A,ES10.2)') ' re_eq: finishing after ', re_eq_outer_iter, &
@@ -2214,80 +2262,171 @@ end subroutine re_eq_outer_update
 !> diagnostic runs -- taken to a common LCFS at fixed I_RE, the 100 keV and
 !> 10 MeV q amplitudes agree to 0.22%. So the amplitude is a consistency check
 !> and the geometry is the constraint. Use re_eq_match_mode = 'q_shape'.
-subroutine re_eq_lcfs_update(R_ref)
+subroutine re_eq_lcfs_update(R_ref, ctl)
   use equil_info, only: ES
+  use vacuum,     only: re_eq_coil_amp, pf_coils, n_pf_coils
   implicit none
-  real*8, intent(inout) :: R_ref
-  real*8            :: err, slope, step, new_ref, a_now
-  real*8, parameter :: PROBE_F = 2.d-2   ! probe, as a fraction of the minor radius
-  real*8, parameter :: CLAMP_F = 2.5d-1  ! max setpoint excursion, fraction of a
-  real*8, parameter :: MAXST_F = 5.d-2   ! max setpoint step per outer iteration
-  real*8, parameter :: TOL_F   = 0.25d0  ! share of re_eq_tol_q the size may use
-  real*8, parameter :: A_RES   = 1.d-5   ! LCFS_a is reported to 0.01 mm
+  real*8, intent(inout) :: R_ref     !< radial position setpoint -> minor radius
+  real*8, intent(inout) :: ctl       !< coil amplitude along re_eq_coil_amp -> elongation
 
-  ! Anchor for the excursion clamp: the setpoint this phase started from.
-  ! Captured on first use rather than set by the caller, so the anchor cannot
-  ! be forgotten or get out of step with the value actually in force. Zero is
-  ! an unambiguous "not yet set" -- the caller refuses to start the control
-  ! with R_axis_ref <= 0, since that switches the radial feedback off entirely.
+  integer :: n, i, ipiv(2), info
+  logical :: kap_on
+  real*8  :: x(2), f(2), dx(2), df(2), step(2), Jl(2,2), rhs(2), lo(2), hi(2)
+  real*8  :: probe(2), maxst(2), scal(2), det, moved
+  real*8, parameter :: PROBE_F = 2.d-2   ! probe, as a fraction of the actuator scale
+  real*8, parameter :: CLAMP_R = 2.5d-1  ! R_axis_ref excursion, fraction of a
+  real*8, parameter :: CLAMP_C = 2.0d0   ! ctl excursion, multiples of the base current
+  real*8, parameter :: MAXST_F = 5.d-2   ! max step per outer iteration, fraction of scale
+  real*8, parameter :: TOL_F   = 0.25d0  ! share of re_eq_tol_q each channel may use
+  real*8, parameter :: A_RES   = 1.d-5   ! LCFS_a resolution as reported, 0.01 mm
+  real*8, parameter :: K_RES   = 1.d-5   ! LCFS_kappa resolution as reported
+
   if (re_eq_R_ref_0 .eq. 0.d0) re_eq_R_ref_0 = R_ref
-
-  a_now = ES%LCFS_a
-  if (a_now .le. 0.d0) then
+  if (ES%LCFS_a .le. 0.d0) then
     write(*,'(A)') ' WARNING: re_eq: LCFS_a is not positive; the size control cannot run.'
     return
   endif
-  err = a_now - re_eq_lcfs_a
 
-  ! q ~ a^2 B0/(R0 I) at pinned current, so a relative size error maps to
-  ! TWICE that relative q-amplitude error. Converging the size to a quarter of
-  ! re_eq_tol_q therefore leaves the q amplitude well inside tolerance while
-  ! spending only a small part of the error budget.
-  if (abs(err) / re_eq_lcfs_a .lt. TOL_F * re_eq_tol_q) then
-    write(*,'(A,ES10.2,A)') ' re_eq: size control satisfied (|a/a_t - 1| = ', &
-      abs(err) / re_eq_lcfs_a, '); R_axis_ref frozen'
-    return
-  endif
+  kap_on = (re_eq_lcfs_kappa .gt. 0.d0)
+  n      = merge(2, 1, kap_on)
 
-  if (.not. re_eq_rs_have) then
-    ! Probe toward the target in the physically expected sense: pushing the
-    ! plasma inward compresses it against the inboard limiter, so a smaller
-    ! setpoint gives a smaller plasma. If that is inverted for this geometry
-    ! (an outboard-limited plasma, say) the secant corrects it on the next
-    ! call, at a cost of one iteration.
-    step = -sign(PROBE_F * re_eq_lcfs_a, err)
-  else
-    if (abs(a_now - re_eq_a_prev) .lt. A_RES) then
-      write(*,'(A)') ' WARNING: re_eq: moving R_axis_ref did not change LCFS_a by more'
-      write(*,'(A)') '          than the reported resolution. The plasma size is not'
-      write(*,'(A)') '          radial-position-controllable in this configuration --'
-      write(*,'(A)') '          a diverted boundary, or a plasma not in contact with the'
-      write(*,'(A)') '          wall, would both do this. The size control is inactive.'
-      return
+  ! --- actuator scales, so every step and clamp below is dimensionless in the
+  !     right units on any machine. The kappa actuator is scaled by the largest
+  !     base current among the coils it actually drives.
+  if (kap_on .and. (re_eq_ctl_ref .eq. 0.d0)) then
+    do i = 1, n_pf_coils
+      if (abs(re_eq_coil_amp(i)) .gt. 1.d-12) &
+        re_eq_ctl_ref = max(re_eq_ctl_ref, abs(pf_coils(i)%current))
+    enddo
+    if (re_eq_ctl_ref .le. 0.d0) then
+      write(*,'(A)') ' ERROR: re_eq: re_eq_lcfs_kappa is set but re_eq_coil_amp is zero on'
+      write(*,'(A)') '        every coil carrying current -- the elongation channel has no'
+      write(*,'(A)') '        actuator. Generate the direction with'
+      write(*,'(A)') '        util/re_equilibrium_prototype/scan_circuit_response.py, which'
+      write(*,'(A)') '        reports dkappa/dI per circuit; pick the one with the largest'
+      write(*,'(A)') '        |dkappa/da| (it reshapes without resizing).'
+      stop 1
     endif
-    slope = (a_now - re_eq_a_prev) / (R_ref - re_eq_rs_prev)
-    step  = -err / slope
   endif
+  scal(1) = re_eq_lcfs_a
+  scal(2) = re_eq_ctl_ref
 
-  step    = sign(min(abs(step), MAXST_F * re_eq_lcfs_a), step)
-  new_ref = R_ref + step
-  new_ref = min(max(new_ref, re_eq_R_ref_0 - CLAMP_F * re_eq_lcfs_a), &
-                             re_eq_R_ref_0 + CLAMP_F * re_eq_lcfs_a)
-  if (new_ref .eq. R_ref) then
-    write(*,'(A,F9.5,A)') ' WARNING: re_eq: R_axis_ref is against its limit (', new_ref, &
-      '); the target LCFS_a cannot be reached within 25% of the minor radius'
+  x(1) = R_ref;  x(2) = ctl
+  f(1) = ES%LCFS_a     - re_eq_lcfs_a
+  f(2) = 0.d0
+  if (kap_on) f(2) = ES%LCFS_kappa - re_eq_lcfs_kappa
+
+  ! --- converged? Relative errors, each held to a quarter of re_eq_tol_q.
+  !     q ~ a^2 (1+kappa^2)/2, so both channels feed the q amplitude and both
+  !     have to be tight for the amplitude to come out right.
+  if ((abs(f(1))/re_eq_lcfs_a .lt. TOL_F*re_eq_tol_q) .and. &
+      ((.not. kap_on) .or. (abs(f(2))/re_eq_lcfs_kappa .lt. TOL_F*re_eq_tol_q))) then
+    if (kap_on) then
+      write(*,'(A,ES10.2,A,ES10.2,A)') ' re_eq: size control satisfied (|a/a_t-1| = ', &
+        abs(f(1))/re_eq_lcfs_a, ', |k/k_t-1| = ', abs(f(2))/re_eq_lcfs_kappa, '); frozen'
+    else
+      write(*,'(A,ES10.2,A)') ' re_eq: size control satisfied (|a/a_t-1| = ', &
+        abs(f(1))/re_eq_lcfs_a, '); R_axis_ref frozen'
+    endif
     return
   endif
 
-  ! record BEFORE overwriting, so the next call differences the pair that
-  ! actually bracketed this measurement
-  re_eq_rs_prev = R_ref
-  re_eq_a_prev  = a_now
-  re_eq_rs_have = .true.
+  probe(1:2) = PROBE_F * scal(1:2)
+  maxst(1:2) = MAXST_F * scal(1:2)
 
-  write(*,'(A,F9.5,A,F9.5,A,F9.5,A,F9.5)') ' re_eq: size control: a = ', a_now, &
-    ' (target ', re_eq_lcfs_a, ')   R_axis_ref ', R_ref, ' -> ', new_ref
-  R_ref = new_ref
+  ! --- Jacobian: one probe per actuator, then Broyden. Probing one actuator at
+  !     a time is what makes the columns separable; a simultaneous step would
+  !     leave the two responses inseparable in a single measurement.
+  if (re_eq_nprobe .lt. n) then
+    if (re_eq_nprobe .ge. 1) then
+      ! the previous call probed actuator re_eq_nprobe -- read its column off
+      dx = x - re_eq_x_prev
+      df = f - re_eq_f_prev
+      i  = re_eq_nprobe
+      if (abs(dx(i)) .gt. 0.d0) re_eq_J(1:n,i) = df(1:n) / dx(i)
+      moved = abs(df(1))
+      if (kap_on) moved = max(moved, abs(df(2)) * (A_RES/K_RES))
+      if (moved .lt. A_RES) then
+        write(*,'(A,I2,A)') ' WARNING: re_eq: actuator ', i, ' moved the LCFS by less than the'
+        write(*,'(A)')      '          reported resolution. It has no authority here -- for the'
+        write(*,'(A)')      '          radial setpoint that means a diverted or non-contacting'
+        write(*,'(A)')      '          boundary; for the coil channel, a re_eq_coil_amp direction'
+        write(*,'(A)')      '          that does not reshape. The size control is inactive.'
+        return
+      endif
+    endif
+    re_eq_nprobe = re_eq_nprobe + 1
+    re_eq_x_prev = x
+    re_eq_f_prev = f
+    i = re_eq_nprobe
+    ! probe toward the target on the channel this actuator mainly drives; the
+    ! sign only has to be a guess, the measured column supersedes it at once
+    step    = 0.d0
+    step(i) = -sign(probe(i), f(min(i,n)))
+    goto 100
+  endif
+
+  ! --- Broyden update, then a Newton step on the measured Jacobian
+  dx = x - re_eq_x_prev
+  df = f - re_eq_f_prev
+  if (sum(dx(1:n)*dx(1:n)) .gt. 0.d0) &
+    re_eq_J(1:n,1:n) = re_eq_J(1:n,1:n) + &
+      spread(df(1:n) - matmul(re_eq_J(1:n,1:n), dx(1:n)), 2, n) * &
+      spread(dx(1:n), 1, n) / sum(dx(1:n)*dx(1:n))
+
+  det = re_eq_J(1,1)
+  if (n .eq. 2) det = re_eq_J(1,1)*re_eq_J(2,2) - re_eq_J(1,2)*re_eq_J(2,1)
+  if (abs(det) .le. 0.d0) then
+    write(*,'(A)') ' WARNING: re_eq: the size-control Jacobian is singular -- the two'
+    write(*,'(A)') '          actuators move the minor radius and the elongation in the same'
+    write(*,'(A)') '          proportion, so they cannot be set independently. Pick a'
+    write(*,'(A)') '          re_eq_coil_amp direction with a larger |dkappa/da|.'
+    return
+  endif
+
+  re_eq_x_prev = x
+  re_eq_f_prev = f
+  Jl(1:n,1:n)  = re_eq_J(1:n,1:n)
+  rhs(1:n)     = -f(1:n)
+  call dgesv(n, 1, Jl, 2, ipiv, rhs, 2, info)
+  if (info .ne. 0) then
+    write(*,'(A,I4)') ' WARNING: re_eq: size-control solve failed, info = ', info
+    return
+  endif
+  step(1:n) = rhs(1:n)
+  step(n+1:2) = 0.d0
+
+100 continue
+  do i = 1, n
+    step(i) = sign(min(abs(step(i)), maxst(i)), step(i))
+  enddo
+  lo(1) = re_eq_R_ref_0 - CLAMP_R*re_eq_lcfs_a
+  hi(1) = re_eq_R_ref_0 + CLAMP_R*re_eq_lcfs_a
+  lo(2) = -CLAMP_C*re_eq_ctl_ref
+  hi(2) =  CLAMP_C*re_eq_ctl_ref
+  do i = 1, n
+    x(i) = min(max(x(i) + step(i), lo(i)), hi(i))
+  enddo
+
+  if (kap_on) then
+    write(*,'(A,F9.5,A,F9.5,A)') ' re_eq: size control: a = ', ES%LCFS_a, &
+      ' (target ', re_eq_lcfs_a, ')'
+    write(*,'(A,F9.5,A,F9.5,A)') '                      kappa = ', ES%LCFS_kappa, &
+      ' (target ', re_eq_lcfs_kappa, ')'
+    write(*,'(A,F9.5,A,F9.5,A,ES12.4,A,ES12.4)') '                      R_axis_ref ', &
+      R_ref, ' -> ', x(1), ',  coil ctl ', ctl, ' -> ', x(2)
+    if ((x(1) .eq. lo(1)) .or. (x(1) .eq. hi(1)) .or. &
+        (x(2) .eq. lo(2)) .or. (x(2) .eq. hi(2))) &
+      write(*,'(A)') ' WARNING: re_eq: a size-control actuator is against its limit'
+  else
+    write(*,'(A,F9.5,A,F9.5,A,F9.5,A,F9.5)') ' re_eq: size control: a = ', ES%LCFS_a, &
+      ' (target ', re_eq_lcfs_a, ')   R_axis_ref ', R_ref, ' -> ', x(1)
+    if ((x(1) .eq. lo(1)) .or. (x(1) .eq. hi(1))) &
+      write(*,'(A)') ' WARNING: re_eq: R_axis_ref is against its limit'
+  endif
+
+  R_ref = x(1)
+  if (kap_on) ctl = x(2)
 
 end subroutine re_eq_lcfs_update
 
@@ -2305,10 +2444,11 @@ subroutine re_eq_restart_outer()
   re_eq_reverted      = .false.
   re_eq_done          = .false.
   re_eq_soft_accepted = .false.
-  ! the size secant relates a setpoint to an LCFS_a measured on the OLD
-  ! boundary; keep the setpoint itself (it is a real machine setting) but drop
-  ! the stale pair so the next call re-probes
-  re_eq_rs_have       = .false.
+  ! the size Jacobian relates actuator moves to an LCFS measured on the OLD
+  ! boundary; keep the actuator VALUES (they are real machine settings) but
+  ! drop the stale Jacobian so the next phase re-probes for it
+  re_eq_nprobe        = 0
+  re_eq_J             = 0.d0
 end subroutine re_eq_restart_outer
 
 
