@@ -230,6 +230,13 @@ real*8              :: re_eq_ph_beam_max = 0.d0
 !> q offset is not in the transplant's reach (measured: it sat at 0.9783 for
 !> 20 outer iterations on the 100 keV free-boundary case).
 real*8              :: re_eq_c_glob = 1.d0
+!> RE current enclosed by the LCFS (psihat <= 1), against re_eq_I_now which is
+!> the total over the whole domain. re_eq_I_RE pins the TOTAL, but q responds to
+!> the enclosed part, and the two separate at high energy because drift surfaces
+!> are not flux surfaces. Diagnostic only for now -- it decides whether the
+!> residual q-amplitude difference between energies at matched LCFS geometry is
+!> leaked current or internal flux-surface shape.
+real*8              :: re_eq_I_lcfs = 0.d0
 !> Size-control state. The actuators are x = (R_axis_ref, re_coil_ctl) and the
 !> targets f = (LCFS_a, LCFS_kappa); with only the minor radius controlled this
 !> degenerates to the 1x1 secant it started as.
@@ -399,7 +406,7 @@ subroutine re_eq_init(my_id)
   enddo
 
   open(RE_EQ_LOG_UNIT, file='re_eq_convergence.log', action='write', status='replace')
-  write(RE_EQ_LOG_UNIT,'(A)') '# outer  #inner   max|q/qt-1|    I_RE[A]        max_edge_fraction'
+  write(RE_EQ_LOG_UNIT,'(A)') '# outer  #inner   max|q/qt-1|    I_RE[A]        I_RE_in_LCFS[A]  max_edge_fraction'
 
   re_eq_outer_iter  = 0
   re_eq_initialized = .true.
@@ -1241,6 +1248,7 @@ subroutine re_eq_total_current(my_id, node_list, element_list, I_RE)
   use gauss
   use basis_at_gaussian
   use mod_model_settings, only: var_psi
+  use equil_info, only: ES
   implicit none
   integer,                  intent(in)  :: my_id
   type (type_node_list),    intent(in)  :: node_list
@@ -1251,8 +1259,11 @@ subroutine re_eq_total_current(my_id, node_list, element_list, I_RE)
   real*8  :: x_g, y_g, x_s, x_t, y_s, y_t, eq_g, eq_s, eq_t
   real*8  :: xjac, wst, lhat, Nval
   real*8  :: I_cl(re_eq_n_class), edge_cl(re_eq_n_class), tot_cl(re_eq_n_class)
+  real*8  :: I_in, dpsi, phn
 
   I_cl = 0.d0;  edge_cl = 0.d0;  tot_cl = 0.d0
+  I_in = 0.d0
+  dpsi = ES%psi_bnd - ES%psi_axis
 
   do i = 1, element_list%n_elements
     do ms = 1, n_gauss
@@ -1292,6 +1303,20 @@ subroutine re_eq_total_current(my_id, node_list, element_list, I_RE)
           ! lost, so the quantity worth reporting is the edge sharpness.
           tot_cl(s) = tot_cl(s) + abs(Nval) / x_g * wst
           if (lhat .gt. 0.95d0) edge_cl(s) = edge_cl(s) + abs(Nval) / x_g * wst
+          ! --- and the same current gated on the FLUX label instead of the
+          !     drift label. The two differ by construction: a drift surface
+          !     spans a range of psihat (|alpha|(R_out-R_in)/|dpsi|, about
+          !     0.008 at 100 keV but 0.21 at 10 MeV), so at high energy a
+          !     surface well inside Ahat = 1 can still cross psihat = 1 over
+          !     part of its circumference. That current counts toward the
+          !     pinned re_eq_I_RE but contributes nothing to the flux enclosed
+          !     by the LCFS, and q responds to the enclosed current -- which is
+          !     also the one an experiment measures.
+          if (abs(dpsi) .gt. 0.d0) then
+            phn = (eq_g - ES%psi_axis) / dpsi
+            if (phn .le. 1.d0) &
+              I_in = I_in - EL_CHG * re_cl_vpar(s) * re_cl_w(s) * Nval / x_g * wst
+          endif
         enddo
       enddo
     enddo
@@ -1306,6 +1331,7 @@ subroutine re_eq_total_current(my_id, node_list, element_list, I_RE)
   enddo
   I_RE = sum(I_cl)
   re_eq_I_now = I_RE
+  re_eq_I_lcfs = I_in
 
 end subroutine re_eq_total_current
 
@@ -2058,7 +2084,8 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
       endif
       call re_eq_apply_beam_envelope()
       re_eq_reverted = .true.
-      write(RE_EQ_LOG_UNIT,'(I6,I8,3ES16.6)') re_eq_outer_iter, n_inner, err, I_now, maxval(re_cl_edge_frac)
+      write(RE_EQ_LOG_UNIT,'(I6,I8,4ES16.6)') re_eq_outer_iter, n_inner, err, I_now, &
+      re_eq_I_lcfs, maxval(re_cl_edge_frac)
       call flush_it(RE_EQ_LOG_UNIT)
       return                          ! caller re-converges psi on the best profile
     endif
@@ -2079,7 +2106,8 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
     ! Nprof is frozen in this branch, so further outer iterations would only
     ! re-converge and re-evaluate the identical state -- stop the loop here.
     re_eq_done = .true.
-    write(RE_EQ_LOG_UNIT,'(I6,I8,3ES16.6)') re_eq_outer_iter, n_inner, err, I_now, maxval(re_cl_edge_frac)
+    write(RE_EQ_LOG_UNIT,'(I6,I8,4ES16.6)') re_eq_outer_iter, n_inner, err, I_now, &
+      re_eq_I_lcfs, maxval(re_cl_edge_frac)
     call flush_it(RE_EQ_LOG_UNIT)
     return
   endif
@@ -2136,6 +2164,13 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   if (cur_active) &
     write(*,'(A,ES11.3,A,ES12.4,A)') '                |I_RE/target - 1| = ', err_cur, &
       '   (target ', re_eq_I_RE, ' A)'
+  ! Total vs LCFS-enclosed RE current. They coincide when drift surfaces follow
+  ! flux surfaces and separate when they do not, so the gap is a direct measure
+  ! of how much of the pinned current sits outside the boundary and therefore
+  ! does not act on q.
+  if (abs(I_now) .gt. 0.d0) &
+    write(*,'(A,ES13.5,A,F8.4,A)') '                I_RE inside LCFS  = ', re_eq_I_lcfs, &
+      '   (', 100.d0*(1.d0 - re_eq_I_lcfs/I_now), '% of the total lies outside)'
   if (siz_active) then
     write(*,'(A,ES11.3,A,F9.5,A,F9.5,A)') '                geometry error    = ', err_siz, &
       '   (a = ', ES%LCFS_a, ', target ', re_eq_lcfs_a, ' m)'
@@ -2149,7 +2184,8 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
       ' of the current of the worst class is carried on the outermost 5% of'  // &
       ' the label range: the beam edge is hard against the loss boundary'
 
-  write(RE_EQ_LOG_UNIT,'(I6,I8,3ES16.6)') re_eq_outer_iter, n_inner, err, I_now, maxval(re_cl_edge_frac)
+  write(RE_EQ_LOG_UNIT,'(I6,I8,4ES16.6)') re_eq_outer_iter, n_inner, err, I_now, &
+      re_eq_I_lcfs, maxval(re_cl_edge_frac)
   call flush_it(RE_EQ_LOG_UNIT)
 
   if (converged .or. (re_eq_n_stall .ge. 15) .or. (re_eq_outer_iter .ge. re_eq_max_it_out)) then
