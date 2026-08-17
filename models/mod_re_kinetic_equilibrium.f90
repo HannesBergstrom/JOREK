@@ -248,6 +248,16 @@ real*8              :: re_eq_f_prev(2) = 0.d0   !< residuals they produced
 integer             :: re_eq_nprobe    = 0      !< columns of re_eq_J filled so far
 real*8              :: re_eq_R_ref_0 = 0.d0
 real*8              :: re_eq_ctl_ref = 0.d0
+!> Trust region on the step size, one radius per actuator. A fixed cap cannot
+!> serve both channels: relative to its own natural scale the minor radius
+!> needed 4% (one step) while the elongation needed 125% (25 steps, every one
+!> of them pinned to the cap). The radius therefore adapts -- it grows while the
+!> Jacobian's prediction keeps matching what actually happened, and shrinks when
+!> it does not, so a well-behaved channel accelerates without letting a
+!> badly-modelled one overshoot.
+real*8              :: re_eq_trust(2) = 0.d0    !< current step limit per actuator
+real*8              :: re_eq_pred(2)  = 0.d0    !< residual the last step predicted
+logical             :: re_eq_have_pred = .false.
 !> Is the size control actually running? Set by the caller when the
 !> FREE-BOUNDARY phase starts, false everywhere else. re_eq_lcfs_a > 0 alone is
 !> NOT the right test: the fixed-boundary phase has its boundary frozen by the
@@ -2272,7 +2282,13 @@ subroutine re_eq_lcfs_update(R_ref, ctl)
   integer :: n, i, ipiv(2), info
   logical :: kap_on
   real*8  :: x(2), f(2), dx(2), df(2), step(2), Jl(2,2), rhs(2), lo(2), hi(2)
-  real*8  :: probe(2), maxst(2), scal(2), det, moved
+  real*8  :: probe(2), scal(2), det, moved
+  real*8  :: fn_old, fn_new, fn_pred, den, rho, grow
+  logical :: clamped
+  real*8, parameter :: TR_GROW = 2.0d0   ! radius factor when the model is good
+  real*8, parameter :: TR_SHRK = 0.5d0   !            ... and when it is not
+  real*8, parameter :: TR_MIN  = 1.d-2   ! floor, fraction of the actuator scale
+  real*8, parameter :: TR_MAX  = 1.0d0   ! ceiling, ditto
   real*8, parameter :: PROBE_F = 2.d-2   ! probe, as a fraction of the actuator scale
   real*8, parameter :: CLAMP_R = 2.5d-1  ! R_axis_ref excursion, fraction of a
   real*8, parameter :: CLAMP_C = 2.0d0   ! ctl excursion, multiples of the base current
@@ -2332,7 +2348,35 @@ subroutine re_eq_lcfs_update(R_ref, ctl)
   endif
 
   probe(1:2) = PROBE_F * scal(1:2)
-  maxst(1:2) = MAXST_F * scal(1:2)
+  if (re_eq_trust(1) .le. 0.d0) re_eq_trust(1:2) = MAXST_F * scal(1:2)
+
+  ! --- trust-region update on the step just taken. rho compares the reduction
+  !     in |f| that actually happened against the one the Jacobian predicted;
+  !     near 1 means the linear model is holding and larger steps are safe.
+  if (re_eq_have_pred) then
+    fn_old  = sqrt(sum(re_eq_f_prev(1:n)**2))
+    fn_new  = sqrt(sum(f(1:n)**2))
+    fn_pred = sqrt(sum(re_eq_pred(1:n)**2))
+    den     = fn_old - fn_pred
+    if (den .gt. 0.d0) then
+      rho = (fn_old - fn_new) / den
+      if (rho .gt. 0.75d0) then
+        grow = TR_GROW
+      else if (rho .lt. 0.25d0) then
+        grow = TR_SHRK
+      else
+        grow = 1.d0
+      endif
+      do i = 1, n
+        re_eq_trust(i) = min(max(grow * re_eq_trust(i), TR_MIN * scal(i)), &
+                             TR_MAX * scal(i))
+      enddo
+      if (grow .ne. 1.d0) &
+        write(*,'(A,F7.3,A,ES10.3,A,ES10.3)') '        (trust: rho = ', rho, &
+          ' -> step limits ', re_eq_trust(1), ' , ', re_eq_trust(2)
+    endif
+  endif
+  re_eq_have_pred = .false.
 
   ! --- Jacobian: one probe per actuator, then Broyden. Probing one actuator at
   !     a time is what makes the columns separable; a simultaneous step would
@@ -2397,9 +2441,17 @@ subroutine re_eq_lcfs_update(R_ref, ctl)
   step(n+1:2) = 0.d0
 
 100 continue
+  clamped = .false.
   do i = 1, n
-    step(i) = sign(min(abs(step(i)), maxst(i)), step(i))
+    if (abs(step(i)) .gt. re_eq_trust(i)) clamped = .true.
+    step(i) = sign(min(abs(step(i)), re_eq_trust(i)), step(i))
   enddo
+  ! Only a step that was actually held back by the radius tells us anything
+  ! about whether the radius is too small, so only those are worth scoring.
+  if ((re_eq_nprobe .ge. n) .and. clamped) then
+    re_eq_pred(1:n)  = f(1:n) + matmul(re_eq_J(1:n,1:n), step(1:n))
+    re_eq_have_pred  = .true.
+  endif
   lo(1) = re_eq_R_ref_0 - CLAMP_R*re_eq_lcfs_a
   hi(1) = re_eq_R_ref_0 + CLAMP_R*re_eq_lcfs_a
   lo(2) = -CLAMP_C*re_eq_ctl_ref
@@ -2449,6 +2501,8 @@ subroutine re_eq_restart_outer()
   ! drop the stale Jacobian so the next phase re-probes for it
   re_eq_nprobe        = 0
   re_eq_J             = 0.d0
+  re_eq_trust         = 0.d0
+  re_eq_have_pred     = .false.
 end subroutine re_eq_restart_outer
 
 
