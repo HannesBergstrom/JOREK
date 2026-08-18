@@ -106,6 +106,24 @@ module equil_info
   
 
   type(t_equil_state), target   :: ES  
+
+  !> Optional per-flux-surface diagnostics from determine_q_profile. Filled only
+  !> when the caller has allocated them, so no existing caller is affected.
+  !>
+  !>   q_diag_C1  = closed_int dl/R                (pure geometry)
+  !>   q_diag_C2  = closed_int |grad psi|/R dl     (= mu_0 I_enc, by Ampere)
+  !>   q_diag_Lam = C2*C3/C1**2,  C3 = closed_int dl/(R |grad psi|)
+  !>
+  !> Lam >= 1 by Cauchy-Schwarz, equality iff |grad psi| is CONSTANT on the
+  !> surface (i.e. B_p proportional to 1/R). It is a dimensionless measure of how
+  !> poloidally NON-UNIFORM the poloidal field is, hence of how asymmetrically
+  !> the enclosed current sits inside the surface. F and mu_0 cancel out of it
+  !> entirely, so it needs no normalisation convention.
+  !>
+  !> This is exactly the quantity the textbook "q from enclosed current" assumes
+  !> to be 1: Ampere fixes closed_int B_p dl, but q integrates dl/(R^2 B_p), and
+  !> fixing the first does not fix the second.
+  real*8, allocatable :: q_diag_C1(:), q_diag_C2(:), q_diag_Lam(:)
   
   
   contains
