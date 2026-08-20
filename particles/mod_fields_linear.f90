@@ -304,10 +304,12 @@ function last_file_before_time(time) result(file_number)
 
     ! Get list of filenumbers. The number of digits of the step index is not
     ! fixed: older restart files use 5 digits, newer ones 6, so take whatever
-    ! sits between the basename and the extension.
+    ! sits between the basename and the extension. Sort numerically (not in the
+    ! lexicographic order of ls), since the bisection below needs the step
+    ! indices in increasing order even if both digit formats are present.
     write(my_id_s,"(i0.5)") my_id
     call execute_command_line("ls jorek[0-9]*.h5 | sed -n 's/^jorek\([0-9]*\)\.h5$/\1/p'"// &
-      " > .jorek_filenums."//my_id_s)
+      " | sort -nu > .jorek_filenums."//my_id_s)
     open(newunit=u,file=".jorek_filenums."//my_id_s)
     allocate(filenums_tmp(100000)) ! maximum number of restart files handled
     n=0
@@ -324,39 +326,45 @@ function last_file_before_time(time) result(file_number)
     if (n .le. 0) then
       write(*,*) "No files found!"
       file_number = 0
-      return
-    end if
+    else
+      ! Bracket the requested time by the first and the last restart file
+      i_lower = 1 ! index into filenumber array
+      t_lower = get_jorek_hdf5_time(find_jorek_restart_file('jorek',filenums(i_lower)))*t_norm
+      i_upper = n
+      t_upper = get_jorek_hdf5_time(find_jorek_restart_file('jorek',filenums(i_upper)))*t_norm
 
-    ! Calculate upper and lower bounds
-    i_lower = 1 ! index into filenumber array
-    t_lower = get_jorek_hdf5_time(find_jorek_restart_file('jorek',filenums(i_lower)))*t_norm
-    i_upper = n
-    t_upper = get_jorek_hdf5_time(find_jorek_restart_file('jorek',filenums(i_upper)))*t_norm
-    i_guess = nint((time-t_lower)/(t_upper-t_lower)*real(i_upper - i_lower)) + i_lower
-
-    do i=1,20
-      if (i_guess .le. 1 .or. i_guess .gt. n) then
-        if (my_id .eq. 0) write(*,*) "ERROR: requested time out of range"
-        exit
-      end if
-      if (i_guess .eq. i_lower .or. i_guess .eq. i_upper) exit
-
-      t_guess = get_jorek_hdf5_time(find_jorek_restart_file('jorek',filenums(i_guess)))*t_norm
-      if (my_id .eq. 0) write(*,"(i5,A,g14.7,A,i5,A,g14.7,A,i5,A,g14.7,A)") i_lower, " (", t_lower, &
-        ")    ", i_guess, " (", t_guess, &
-        ")    ", i_upper, " (", t_upper, ")    "
-      ! Based on the value of t_guess, replace either the lower or upper bound
-      if (t_guess .le. time) then
-        t_lower = t_guess
-        i_lower = i_guess
+      if (time .lt. t_lower) then
+        ! Requested time lies before the first restart file
+        write(*,*) "WARNING: requested time ", time, " [s] lies before the first restart file at ", &
+          t_lower, " [s]. Using the first restart file."
+      else if (time .ge. t_upper) then
+        ! Requested time lies at or after the last restart file
+        i_lower = i_upper
+        t_lower = t_upper
       else
-        t_upper = t_guess
-        i_upper = i_guess
+        ! Bisect while maintaining the invariant t(i_lower) <= time < t(i_upper),
+        ! until the two bounds are neighbours in the list of restart files
+        do while (i_upper - i_lower .gt. 1)
+          i_guess = (i_lower + i_upper)/2
+          t_guess = get_jorek_hdf5_time(find_jorek_restart_file('jorek',filenums(i_guess)))*t_norm
+          write(*,"(i5,A,g14.7,A,i5,A,g14.7,A,i5,A,g14.7,A)") i_lower, " (", t_lower, &
+            ")    ", i_guess, " (", t_guess, &
+            ")    ", i_upper, " (", t_upper, ")    "
+          ! Based on the value of t_guess, replace either the lower or upper bound
+          if (t_guess .le. time) then
+            t_lower = t_guess
+            i_lower = i_guess
+          else
+            t_upper = t_guess
+            i_upper = i_guess
+          end if
+        end do
       end if
-      i_guess = i_lower + (i_upper-i_lower)/2
-    end do
-    file_number = filenums(i_lower)
-    write(*,"(A,i5,A,g14.7,A,g14.7,A)") 'Selected ', i_lower, " (", t_lower, ') as last file before (', time, ')'
+
+      file_number = filenums(i_lower)
+      write(*,"(A,i5,A,i7,A,g14.7,A,g14.7,A)") 'Selected ', i_lower, ' (file index ', file_number, &
+        ', t = ', t_lower, ') as last file before (', time, ')'
+    end if
   end if
   call MPI_Bcast(file_number, 1, MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)
 end function last_file_before_time
