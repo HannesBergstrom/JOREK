@@ -73,7 +73,8 @@ type octree_node
    integer      :: depth         !< The depth of this node, for root depth = 1
    real(kind=8) :: boundary(2,3) !< [x_min, x_max; y_min, y_max, z_min, z_max] of the volume belonging this node
    type(octree_triangle), allocatable :: contained(:) !< Triangles contained within this node.
-   type(octree_node), pointer         :: children(:)  !< Child nodes this element has.
+   type(octree_node), pointer         :: children(:) => null() !< Child nodes this element has. Leaf nodes never
+                                                               !< assign this, so it must start out nullified.
 end type octree_node
 
 contains
