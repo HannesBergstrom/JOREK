@@ -406,7 +406,7 @@ subroutine re_eq_init(my_id)
   enddo
 
   open(RE_EQ_LOG_UNIT, file='re_eq_convergence.log', action='write', status='replace')
-  write(RE_EQ_LOG_UNIT,'(A)') '# outer  #inner   max|q/qt-1|    I_RE[A]        I_RE_in_LCFS[A]  max_edge_fraction'
+  call re_eq_log_header('fixed')
 
   re_eq_outer_iter  = 0
   re_eq_initialized = .true.
@@ -2084,9 +2084,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
       endif
       call re_eq_apply_beam_envelope()
       re_eq_reverted = .true.
-      write(RE_EQ_LOG_UNIT,'(I6,I8,4ES16.6)') re_eq_outer_iter, n_inner, err, I_now, &
-      re_eq_I_lcfs, maxval(re_cl_edge_frac)
-      call flush_it(RE_EQ_LOG_UNIT)
+      call re_eq_log_line(n_inner, err, err_siz, siz_active, I_now)
       return                          ! caller re-converges psi on the best profile
     endif
     if (.not. converged) then
@@ -2106,9 +2104,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
     ! Nprof is frozen in this branch, so further outer iterations would only
     ! re-converge and re-evaluate the identical state -- stop the loop here.
     re_eq_done = .true.
-    write(RE_EQ_LOG_UNIT,'(I6,I8,4ES16.6)') re_eq_outer_iter, n_inner, err, I_now, &
-      re_eq_I_lcfs, maxval(re_cl_edge_frac)
-    call flush_it(RE_EQ_LOG_UNIT)
+    call re_eq_log_line(n_inner, err, err_siz, siz_active, I_now)
     return
   endif
   ! --- Best-iterate tracking runs on the COMBINED objective, not on q alone.
@@ -2184,9 +2180,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
       ' of the current of the worst class is carried on the outermost 5% of'  // &
       ' the label range: the beam edge is hard against the loss boundary'
 
-  write(RE_EQ_LOG_UNIT,'(I6,I8,4ES16.6)') re_eq_outer_iter, n_inner, err, I_now, &
-      re_eq_I_lcfs, maxval(re_cl_edge_frac)
-  call flush_it(RE_EQ_LOG_UNIT)
+  call re_eq_log_line(n_inner, err, err_siz, siz_active, I_now)
 
   if (converged .or. (re_eq_n_stall .ge. 15) .or. (re_eq_outer_iter .ge. re_eq_max_it_out)) then
     ! --- enter the finishing pass: take the best profile, remove the
@@ -2520,6 +2514,56 @@ end subroutine re_eq_lcfs_update
 
 
 !=======================================================================
+!> Banner + column labels for a phase of the convergence log. Written once per
+!> phase so the two phases are visually separated and the column set can differ:
+!> the geometry error only exists in free boundary, where the LCFS targets are
+!> active, and printing an always-blank column in fixed boundary would be
+!> misleading.
+subroutine re_eq_log_header(phase)
+  implicit none
+  character(len=*), intent(in) :: phase
+  logical :: geo
+  ! the geometry channel is requested iff a target LCFS minor radius is set;
+  ! the elongation target is optional on top of it
+  geo = (trim(phase) .eq. 'free') .and. (re_eq_lcfs_a .gt. 0.d0)
+  write(RE_EQ_LOG_UNIT,'(A)') '#'
+  if (trim(phase) .eq. 'free') then
+    write(RE_EQ_LOG_UNIT,'(A)') '# ===== Start of free boundary iterations ====='
+  else
+    write(RE_EQ_LOG_UNIT,'(A)') '# ===== Start of fixed boundary iterations ====='
+  endif
+  if (geo) then
+    write(RE_EQ_LOG_UNIT,'(A)') '# outer  #inner   max(q_err)     max(geo_err)   ' // &
+      'I_RE[A]        I_RE_in_LCFS[A]  max_edge_fraction'
+  else
+    write(RE_EQ_LOG_UNIT,'(A)') '# outer  #inner   max(q_err)     ' // &
+      'I_RE[A]        I_RE_in_LCFS[A]  max_edge_fraction'
+  endif
+  call flush_it(RE_EQ_LOG_UNIT)
+end subroutine re_eq_log_header
+
+
+!=======================================================================
+!> One data line of the convergence log. Kept in one place because it is
+!> written from three sites in re_eq_outer_update (polish revert, finishing
+!> verdict, normal iteration) and they must not drift apart.
+subroutine re_eq_log_line(n_inner, err, err_siz, siz_active, I_now)
+  implicit none
+  integer, intent(in) :: n_inner
+  real*8,  intent(in) :: err, err_siz, I_now
+  logical, intent(in) :: siz_active
+  if (siz_active) then
+    write(RE_EQ_LOG_UNIT,'(I6,I8,5ES16.6)') re_eq_outer_iter, n_inner, err, err_siz, &
+      I_now, re_eq_I_lcfs, maxval(re_cl_edge_frac)
+  else
+    write(RE_EQ_LOG_UNIT,'(I6,I8,4ES16.6)') re_eq_outer_iter, n_inner, err, &
+      I_now, re_eq_I_lcfs, maxval(re_cl_edge_frac)
+  endif
+  call flush_it(RE_EQ_LOG_UNIT)
+end subroutine re_eq_log_line
+
+
+!=======================================================================
 subroutine re_eq_restart_outer()
   implicit none
   re_eq_outer_iter    = 0
@@ -2532,6 +2576,12 @@ subroutine re_eq_restart_outer()
   re_eq_reverted      = .false.
   re_eq_done          = .false.
   re_eq_soft_accepted = .false.
+  ! New phase: banner + column labels, so the free-boundary block is visually
+  ! separated in the log and can carry the geometry column. Written here rather
+  ! than by the caller because this routine is exactly the "new phase" hook and
+  ! the two cannot then get out of step.
+  call re_eq_log_header('free')
+
   ! the size Jacobian relates actuator moves to an LCFS measured on the OLD
   ! boundary; keep the actuator VALUES (they are real machine settings) but
   ! drop the stale Jacobian so the next phase re-probes for it
