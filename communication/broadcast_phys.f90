@@ -20,7 +20,7 @@ use pellet_module
 #endif
 use mod_parameters
 use mod_re_kinetic_equilibrium, only: re_kinetic_equilibrium, re_eq_dist_file,     &
-      re_eq_dist_format, re_eq_q_file, re_eq_match_mode, re_eq_transplant,         &
+      re_eq_dist_format, re_eq_q_file, re_eq_match_mode,         &
       re_eq_map_mode,                                                             &
       re_eq_I_RE, re_eq_xi_min, re_eq_alpha_out, re_eq_tol_q, re_eq_tol_q_soft,    &
       re_eq_edge_taper, re_eq_l_beam, re_eq_l_beam_width, re_eq_ratio_clamp,       &
@@ -828,7 +828,6 @@ if (my_id .eq. 0) then
   call MPI_PACK(re_eq_dist_format,     32,MPI_CHARACTER,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(re_eq_q_file,         256,MPI_CHARACTER,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(re_eq_match_mode,      16,MPI_CHARACTER,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
-  call MPI_PACK(re_eq_transplant,      16,MPI_CHARACTER,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(re_eq_map_mode,        16,MPI_CHARACTER,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(re_eq_I_RE,             1,MPI_REAL8,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(re_eq_xi_min,           1,MPI_REAL8,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
@@ -1847,7 +1846,6 @@ if (my_id .ne. 0) then
   call MPI_UNPACK(buffer,bufsize,position,re_eq_dist_format,     32,MPI_CHARACTER,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,re_eq_q_file,         256,MPI_CHARACTER,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,re_eq_match_mode,      16,MPI_CHARACTER,MPI_COMM_WORLD,ierr)
-  call MPI_UNPACK(buffer,bufsize,position,re_eq_transplant,      16,MPI_CHARACTER,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,re_eq_map_mode,        16,MPI_CHARACTER,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,re_eq_I_RE,             1,MPI_REAL8,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,re_eq_xi_min,           1,MPI_REAL8,MPI_COMM_WORLD,ierr)

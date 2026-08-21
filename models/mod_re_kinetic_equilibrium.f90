@@ -46,7 +46,7 @@ private
 
 ! --- namelist parameters
 public :: re_kinetic_equilibrium, re_eq_dist_file, re_eq_dist_format,          &
-          re_eq_q_file, re_eq_match_mode, re_eq_transplant, re_eq_map_mode,    &
+          re_eq_q_file, re_eq_match_mode, re_eq_map_mode,                      &
           re_eq_I_RE,                                                          &
           re_eq_xi_min, re_eq_alpha_out, re_eq_tol_q, re_eq_tol_q_soft,        &
           re_eq_edge_taper, re_eq_l_beam, re_eq_l_beam_width,                  &
@@ -73,15 +73,8 @@ character(len=32)  :: re_eq_dist_format = 'ekin_xi_w' !< table format (see re_eq
 character(len=256) :: re_eq_q_file      = 'none'      !< target q profile table: psihat_n, q_t
 character(len=16)  :: re_eq_match_mode  = 'full_q'    !< 'full_q': match q_t incl. amplitude, I_RE is an output;
                                                       !< 'q_shape': match the shape at prescribed re_eq_I_RE
-character(len=16)  :: re_eq_transplant  = 'operator'  !< outer update variant. 'operator' (default): damped
-                                                      !< least squares against the exact fixed-psi response
-                                                      !< operator K, with a Broyden correction for the
-                                                      !< geometry term K cannot contain. 'cumulative' /
-                                                      !< 'pointwise': the older label-map transplants, which
-                                                      !< place the update through a single psihat per label
-character(len=16)  :: re_eq_map_mode    = 'midplane'  !< label map Ahat<->psihat: 'midplane' (default, the
-                                                      !< 2-point midplane average, Eq. 8 of the doc) or
-                                                      !< 'contour' (average psihat_n over the WHOLE drift
+character(len=16)  :: re_eq_map_mode    = 'contour'   !< label map Ahat<->psihat: 'contour' (default;
+                                                      !< average psihat_n over the WHOLE drift
                                                       !< surface A_s=const by nodal kernel regression;
                                                       !< faithful in shaped geometry, where two midplane
                                                       !< points poorly represent the surface and floor the
@@ -92,9 +85,9 @@ real*8             :: re_eq_I_RE        = 0.d0        !< prescribed RE current [
                                                       !< nonzero it is held EXACTLY at every inner Picard
                                                       !< iteration by re_eq_rescale_current
 real*8             :: re_eq_xi_min      = 0.9d0       !< minimum |pitch|; abort below (trapped REs out of scope)
-real*8             :: re_eq_alpha_out   = 0.3d0       !< under-relaxation of the outer transplant update
-real*8             :: re_eq_tol_q       = 1.d-3       !< outer convergence: max|q/q_t - 1|
-real*8             :: re_eq_tol_q_soft  = 1.d-2       !< soft tolerance: a stagnated iteration with best error
+real*8             :: re_eq_alpha_out   = 0.15d0       !< under-relaxation of the outer transplant update
+real*8             :: re_eq_tol_q       = 5.d-3       !< outer convergence: max|q/q_t - 1|
+real*8             :: re_eq_tol_q_soft  = 8.d-3       !< soft tolerance: a stagnated iteration with best error
                                                       !< below this is accepted with a warning (with one common
                                                       !< Nprof and strongly different class drift shifts, exactly
                                                       !< matching q_t can be outside the range of the ansatz)
@@ -177,8 +170,8 @@ real*8             :: re_eq_op_lambda   = 1.d-2       !< smoothness regularizati
                                                       !< transplant variant (damped least squares on the
                                                       !< relative Nprof correction); unused otherwise
 real*8             :: re_eq_ratio_clamp = 2.d0        !< per-iteration clamp of the transplant ratio
-integer            :: re_eq_max_it_out  = 50          !< maximum outer iterations
-integer            :: re_eq_n_l         = 101         !< number of points of the Nprof(l) table
+integer            :: re_eq_max_it_out  = 200          !< maximum outer iterations
+integer            :: re_eq_n_l         = 201         !< number of points of the Nprof(l) table
 integer            :: re_eq_n_q_levels  = 80          !< number of psihat levels of the q evaluation
 logical            :: re_eq_finite_pitch = .false.    !< use A_s with R*B_phi/B and mu-conserving v_par (not
                                                       !< yet implemented; the small-pitch default neglects
@@ -370,13 +363,6 @@ subroutine re_eq_init(my_id)
     stop 1
   endif
 
-  if ((trim(re_eq_transplant) .ne. 'cumulative') .and. &
-      (trim(re_eq_transplant) .ne. 'pointwise')  .and. &
-      (trim(re_eq_transplant) .ne. 'operator')) then
-    write(*,*) 'ERROR: re_eq_transplant must be ''cumulative'', ''pointwise'' or'
-    write(*,*) '       ''operator'', got: ', trim(re_eq_transplant)
-    stop 1
-  endif
 
   call re_eq_read_distribution(my_id)
   call re_eq_read_q_target(my_id)
@@ -390,7 +376,6 @@ subroutine re_eq_init(my_id)
   write(*,*) '*******************************************************'
   write(*,'(A,I4)')     '   number of RE classes : ', re_eq_n_class
   write(*,'(A,A)')      '   match mode           : ', trim(re_eq_match_mode)
-  write(*,'(A,A)')      '   transplant variant   : ', trim(re_eq_transplant)
   write(*,'(A,A)')      '   label map            : ', trim(re_eq_map_mode)
   if (re_eq_I_RE .ne. 0.d0) &
     write(*,'(A,ES12.4,A)') '   current held at      : ', re_eq_I_RE, ' A (exact, every inner iteration)'
@@ -1626,7 +1611,7 @@ end subroutine re_eq_response_operator
 
 
 !=======================================================================
-!> Outer update via the response operator (re_eq_transplant = 'operator').
+!> Outer update via the response operator.
 !>
 !> q ~ 1/I_enc (exact in the cylindrical limit; the same relation the
 !> cumulative transplant and re_eq_init_nprof already assume), so the
@@ -1801,7 +1786,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   real*8  :: c_amp, num, den, err, err_ctl, I_now, ph_ctl_max, ph_beam, l_eff, err_cur
   real*8  :: err_siz, err_best
   real*8  :: c_glob
-  real*8  :: C(re_eq_n_l), dl, qq
+  real*8  :: qq
 
   re_eq_outer_iter = re_eq_outer_iter + 1
 
@@ -2212,35 +2197,16 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
     ratio(k) = exp(0.25d0*lr(k-1) + 0.5d0*lr(k) + 0.25d0*lr(k+1))
   enddo
 
-  select case (trim(re_eq_transplant))
-  case ('pointwise')
-    do k = 1, re_eq_n_l
-      re_nprof(k) = re_nprof(k) * ratio(k)**re_eq_alpha_out
-    enddo
-  case ('cumulative')
-    dl = re_nprof_l(2) - re_nprof_l(1)
-    C(1) = 0.d0
-    do k = 2, re_eq_n_l
-      C(k) = C(k-1) + 0.5d0*(re_nprof(k) + re_nprof(k-1)) * dl
-    enddo
-    do k = 1, re_eq_n_l
-      C(k) = C(k) * ratio(k)**re_eq_alpha_out
-    enddo
-    do k = 2, re_eq_n_l - 1
-      re_nprof(k) = (C(k+1) - C(k-1)) / (2.d0*dl)
-    enddo
-    re_nprof(1)         = (-1.5d0*C(1) + 2.d0*C(2) - 0.5d0*C(3)) / dl
-    re_nprof(re_eq_n_l) = ( 1.5d0*C(re_eq_n_l) - 2.d0*C(re_eq_n_l-1) + 0.5d0*C(re_eq_n_l-2)) / dl
-    re_nprof = max(re_nprof, 0.d0)
-  case ('operator')
-    call re_eq_operator_update(node_list, element_list, n_lev, ph_lev, q_lev, c_amp)
-  case default
-    write(*,*) 'ERROR: unknown re_eq_transplant: ', trim(re_eq_transplant)
-    stop 1
-  end select
+  ! --- the response-operator update: a damped least-squares solve for the
+  !     relative correction to Nprof, using the measured dI(psihat)/dN_k.
+  !     Two earlier variants were removed as strictly dominated -- a pointwise
+  !     ratio update, which has vanishing gain exactly where the error lives
+  !     and leaves a very slow tail, and a cumulative (enclosed-current proxy)
+  !     update, which converges but leaves null-space ripple at the beam edge.
+  !     Both are described in the .tex if the history is ever needed.
+  call re_eq_operator_update(node_list, element_list, n_lev, ph_lev, q_lev, c_amp)
 
-  ! confine the updated profile to the beam (the cumulative update can
-  ! regenerate small current beyond the beam edge when differentiating C)
+  ! confine the updated profile to the beam
   call re_eq_apply_beam_envelope()
 
 
