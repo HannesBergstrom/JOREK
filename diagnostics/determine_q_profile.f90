@@ -34,7 +34,6 @@ real*8  :: RRgi, dRRgi_dr, dRRgi_ds, ZZgi, dZZgi_dr, dZZgi_ds, dRRgi_dt, dZZgi_d
 real*8  :: PSgi, dPSgi_dr, dPSgi_ds, PSI_R, PSI_Z, RZJAC, grad_psi, psi_n
 real*8  :: Fgi,dFgi_dr,dFgi_ds,dFgi_drs,dFgi_drr,dFgi_dss
 real*8  :: sum_dl, B_tot2
-real*8  :: dq_C1, dq_C2, dq_C3, gpm
 real*8  :: dRRgi_drs,dRRgi_drr,dRRgi_dss, dZZgi_drs,dZZgi_drr,dZZgi_dss, dPSgi_drs,dPSgi_drr,dPSgi_dss
 integer :: i,m, ig, ip
 
@@ -48,9 +47,6 @@ do i=2, surface_list%n_psi
   rad(i) = 0.d0
   q(i)   = 0.d0
   sum_dl = 0.d0
-  dq_C1  = 0.d0
-  dq_C2  = 0.d0
-  dq_C3  = 0.d0
   do k=1, surface_list%flux_surfaces(i)%n_pieces
     do ig = 1, 4
       t = xgs(ig)
@@ -101,38 +97,12 @@ do i=2, surface_list%n_psi
 
       sum_dl = sum_dl +  wgs(ig) * dl
 
-      ! --- optional diagnostics, on the MAGNITUDE of grad psi so the three
-      !     integrals satisfy Cauchy-Schwarz as stated (C1**2 <= C2*C3)
-      gpm   = abs(grad_psi)
-      if (gpm .gt. 0.d0) then
-        dq_C1 = dq_C1 + wgs(ig) * dl / RRgi
-        dq_C2 = dq_C2 + wgs(ig) * dl * gpm / RRgi
-        dq_C3 = dq_C3 + wgs(ig) * dl / (RRgi * gpm)
-      endif
-
       q(i) = q(i) +  wgs(ig) / (RRgi * grad_psi) * dl
       rad(i)= rad(i) + sqrt( (RRgi-R_geo)**2.+(ZZgi-Z_geo)**2.)
     end do
   end do
 
   q(i) = Fgi * q(i) / (2.d0 * PI)
-
-  ! --- hand back the decomposition if the caller asked for it. C1 is pure
-  !     geometry, C2 is mu_0 times the enclosed current (Ampere), and Lam is
-  !     what is left: the penalty for the poloidal field not going as 1/R.
-  !     Together they account for q exactly, with no modelling assumption --
-  !     q = F*C3/(2 pi) and C3 = Lam*C1**2/C2.
-  if (allocated(q_diag_C1)) then
-    if (size(q_diag_C1) .ge. surface_list%n_psi) then
-      q_diag_C1(i) = dq_C1
-      q_diag_C2(i) = dq_C2
-      if ((dq_C1 .gt. 0.d0) .and. (dq_C2 .gt. 0.d0)) then
-        q_diag_Lam(i) = dq_C2 * dq_C3 / (dq_C1*dq_C1)
-      else
-        q_diag_Lam(i) = 0.d0
-      endif
-    endif
-  endif
   if ( surface_list%flux_surfaces(i)%n_pieces /= 0 ) then
     rad(i)=rad(i)/(4.d0*surface_list%flux_surfaces(i)%n_pieces)
   end if

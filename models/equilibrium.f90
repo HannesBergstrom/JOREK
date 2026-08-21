@@ -1162,34 +1162,10 @@ subroutine re_eq_q_transplant(n_inner)
   enddo
   surface_list_q%psi_values(1) = ES%psi_axis + 0.01d0 * (ES%psi_bnd - ES%psi_axis)
 
-  ! --- ask determine_q_profile for the per-surface decomposition of q. It is
-  !     free (same quadrature loop) and it is the only way to say WHY two
-  !     equilibria with the same boundary and the same enclosed current have
-  !     different q: C1 is the surface geometry, C2 = mu_0 I_enc is Ampere, and
-  !     Lam is the poloidal non-uniformity of the field that the usual
-  !     "q from enclosed current" reasoning silently assumes away.
-  if (.not. allocated(q_diag_C1)) then
-    allocate(q_diag_C1(surface_list_q%n_psi), q_diag_C2(surface_list_q%n_psi), &
-             q_diag_Lam(surface_list_q%n_psi))
-  endif
-  q_diag_C1 = 0.d0;  q_diag_C2 = 0.d0;  q_diag_Lam = 0.d0
-
   call find_flux_surfaces(my_id,xpoint2,xcase2,node_list,element_list,surface_list_q)
   call determine_q_profile(node_list,element_list,surface_list_q,ES%psi_axis,ES%psi_xpoint,ES%Z_xpoint, &
                            q_lev,rad_lev)
   if (allocated(surface_list_q%flux_surfaces)) deallocate(surface_list_q%flux_surfaces)
-
-  ! written every outer iteration, so the two energies can be differenced
-  ! surface by surface rather than compared through a fitted amplitude
-  open(781, file='re_qdecomp.dat', status='replace', action='write')
-  write(781,'(A)') '# per-flux-surface decomposition of q (see equil_info: q_diag_*)'
-  write(781,'(A)') '# q = F*C3/(2 pi),  C3 = Lam*C1^2/C2,  C2 = mu_0*I_enc,  Lam >= 1'
-  write(781,'(A)') '#  psihat_n         q             C1            C2(=mu0 Ienc)      Lambda'
-  do i_lev = 1, n_lev_q
-    write(781,'(5ES16.6)') ph_lev(i_lev), q_lev(i_lev+1), q_diag_C1(i_lev+1), &
-                           q_diag_C2(i_lev+1), q_diag_Lam(i_lev+1)
-  enddo
-  close(781)
 
   call re_eq_outer_update(my_id, node_list, element_list, n_lev_q, ph_lev, q_lev(2:n_lev_q+1), &
                           n_inner, re_eq_converged)
