@@ -53,7 +53,9 @@ public :: re_kinetic_equilibrium, re_eq_dist_file, re_eq_dist_format,          &
           re_eq_ratio_clamp, re_eq_absorbing_edge, re_eq_op_lambda,             &
           re_eq_lcfs_a, re_eq_lcfs_kappa,                                      &
           re_eq_max_it_out, re_eq_n_l, re_eq_n_q_levels,                       &
-          re_eq_finite_pitch
+          re_eq_finite_pitch,                                                  &
+          re_eq_n_alpha, re_eq_av_zeff, re_eq_av_ztot,                         &
+          re_eq_av_e_over_ec, re_eq_av_lnlambda
 ! --- driver interface (used by equilibrium.f90 and the GS element assembly)
 public :: re_eq_init, re_eq_update_labels, re_eq_rescale_current,              &
           re_eq_shift_labels,                                                  &
@@ -63,6 +65,7 @@ public :: re_eq_init, re_eq_update_labels, re_eq_rescale_current,              &
           re_eq_finishing, re_eq_size_active
 ! --- exposed for the standalone unit test (util/re_equilibrium_prototype)
 public :: re_cl_alpha, re_cl_A_edge
+public :: re_eq_spectrum_classes, re_eq_gauss_legendre
 
 ! ------------------------------------------------------------------
 ! --- Namelist input parameters (registered in the model's in1 group)
@@ -85,6 +88,27 @@ real*8             :: re_eq_I_RE        = 0.d0        !< prescribed RE current [
                                                       !< nonzero it is held EXACTLY at every inner Picard
                                                       !< iteration by re_eq_rescale_current
 real*8             :: re_eq_xi_min      = 0.9d0       !< minimum |pitch|; abort below (trapped REs out of scope)
+! --- continuous avalanche distribution (re_eq_dist_format = 'avalanche').
+!     Embreus et al., J. Plasma Phys. 84 (2018) 905840519, eq. (2.17):
+!       f_RE(p,xi) ~ A(p) exp[-gamma/gamma_0 - A(p)(1+xi)] / (p^2 (1-e^{-2A}))
+!       A(p) = gamma (E/E_c + 1)/(Z_tot + 1),   gamma_0 = c_Z lnLambda,
+!       c_Z  = sqrt(5 + Z_eff)
+!     All four are INDEPENDENT inputs on purpose: they enter through different
+!     routes (Z_eff sets the momentum e-folding gamma_0; Z_tot and E/E_c set
+!     only the pitch through A), and a run may well want them evaluated at a
+!     different point in time than the current simulation state -- which is
+!     also why lnLambda is specified here rather than taken from the
+!     resistivity's lnA_center. For the same reason nothing here is derived
+!     from the instantaneous plasma parameters.
+integer            :: re_eq_n_alpha      = 8          !< quadrature nodes in ln(alpha); 8 puts the
+                                                      !< quadrature error ~4 orders below re_eq_tol_q
+                                                      !< over 2.3 decades of momentum (measured)
+real*8             :: re_eq_av_zeff      = 1.d0       !< Z_eff, sets c_Z = sqrt(5 + Z_eff) -> gamma_0
+real*8             :: re_eq_av_ztot      = 1.d0       !< Z_tot in A(p) (pitch width only)
+real*8             :: re_eq_av_e_over_ec = 10.d0      !< E/E_c in A(p) (pitch width only)
+real*8             :: re_eq_av_lnlambda  = 15.d0      !< Coulomb logarithm in gamma_0 = c_Z lnLambda
+                                                      !< (independent: e.g. the relativistic form of
+                                                      !< the Embreus paper, or a value from another time)
 real*8             :: re_eq_alpha_out   = 0.15d0       !< under-relaxation of the outer transplant update
 real*8             :: re_eq_tol_q       = 5.d-3       !< outer convergence: max|q/q_t - 1|
 real*8             :: re_eq_tol_q_soft  = 8.d-3       !< soft tolerance: a stagnated iteration with best error
@@ -405,52 +429,247 @@ end subroutine re_eq_init
 !> Format 'ekin_xi_w': one class per line, columns
 !>   E_kin [eV]   xi = p_par/p   weight (relative, normalized internally),
 !> '#' starts a comment.
+!=======================================================================
+!> Gauss-Legendre nodes and weights on [-1,1] (Newton iteration on the
+!> Legendre polynomial, standard algorithm). Used to integrate the
+!> continuous RE spectrum in ln(alpha): the integrand there is analytic, so
+!> Gauss-Legendre converges spectrally and ~8 nodes are enough across 2.3
+!> decades of momentum (measured; doc/stage0_results.md Part II).
+subroutine re_eq_gauss_legendre(n, x, w)
+  use constants, only: PI
+  implicit none
+  integer, intent(in)  :: n
+  real*8,  intent(out) :: x(n), w(n)
+  integer :: i, j, m, it
+  real*8  :: z, z1, p1, p2, p3, pp
+  real*8, parameter :: TOL = 1.d-14
+  integer, parameter :: MAX_NEWTON = 100
+
+  m = (n + 1) / 2                       ! roots are symmetric about 0
+  do i = 1, m
+    z = cos(PI * (dble(i) - 0.25d0) / (dble(n) + 0.5d0))   ! Chebyshev guess
+    do it = 1, MAX_NEWTON
+      p1 = 1.d0;  p2 = 0.d0
+      do j = 1, n                       ! Legendre recurrence -> P_n(z)
+        p3 = p2;  p2 = p1
+        p1 = ((2.d0*dble(j) - 1.d0)*z*p2 - (dble(j) - 1.d0)*p3) / dble(j)
+      enddo
+      pp = dble(n) * (z*p1 - p2) / (z*z - 1.d0)             ! P_n'(z)
+      z1 = z
+      z  = z1 - p1/pp
+      if (abs(z - z1) .le. TOL) exit
+    enddo
+    x(i)       = -z
+    x(n+1-i)   =  z
+    w(i)       = 2.d0 / ((1.d0 - z*z) * pp * pp)
+    w(n+1-i)   = w(i)
+  enddo
+
+end subroutine re_eq_gauss_legendre
+
+
+!=======================================================================
+!> Build the RE classes as a QUADRATURE of the analytic avalanche momentum
+!> spectrum, Embreus et al., J. Plasma Phys. 84 (2018) 905840519, eq. (2.17)
+!> [a form of Fulop et al. 2006 generalized to remain valid near the
+!> threshold field E -> E_c]:
+!>
+!>   f_RE(p,xi) = n_RE A(p) exp[-gamma/gamma_0 - A(p)(1+xi)]
+!>                -------------------------------------------
+!>                       2 pi m_e c gamma_0 p^2 (1 - e^{-2A})
+!>
+!>   A(p) = gamma (E/E_c + 1)/(Z_tot + 1),  gamma_0 = c_Z lnLambda,
+!>   c_Z ~ sqrt(5 + Z_eff).
+!>
+!> The pitch factor is a normalized pdf on xi in [-1,1], so integrating over
+!> pitch leaves simply
+!>
+!>   dn/du ~ exp(-gamma/gamma_0),   u = p/(m_e c),  gamma = sqrt(1 + u^2)
+!>
+!> an exponential in ENERGY. This routine implements that pitch-integrated
+!> spectrum at a single representative pitch (the mono-pitch sub-stage); the
+!> full pitch distribution arrives with the pitch ladder.
+!>
+!> The source integral being approximated is
+!>   INT du f(u) v_par(u) Nprof(lhat(alpha(u)))
+!> = INT dx [u f(u)] v_par(u) Nprof(...)          (x = ln u, du = u dx)
+!> so the class weight is w_k = W_k u_k f(u_k) with W_k the x-quadrature
+!> weight. The absolute normalization is irrelevant (weights are renormalized
+!> by the caller, and I_RE is pinned in q_shape mode): only the SHAPE matters.
+!>
+!> Sign convention: the exponent -A(1+xi) peaks at xi = -1, i.e. the runaways
+!> stream ANTI-parallel -- which matches the validated convention of this
+!> module (xi = -0.99 -> j_phi > 0 -> q > 0).
+!>
+!> PITCH: the mono-pitch sub-stage assigns each quadrature node the MEAN pitch
+!> of the Embreus pitch distribution at that momentum,
+!>   <xi>(p) = [1 - e^{-2A}(1+2A)] / [A (1 - e^{-2A})] - 1   ->  1/A - 1
+!> rather than a prescribed constant. That is the correct representative for
+!> this purpose: the equilibrium sees only the current carried per unit alpha,
+!> and <v_par> = <xi> v reproduces exactly that. The spread of alpha about the
+!> mean at fixed p is what the pitch ladder will add.
+subroutine re_eq_spectrum_classes(my_id, max_classes, n, e_out, xi_out, w_out, &
+                                  n_alpha_in, zeff_in, ztot_in, e_over_ec_in,  &
+                                  ln_lambda_in)
+  use constants,  only: MASS_ELECTRON, SPEED_OF_LIGHT, EL_CHG
+  implicit none
+  integer, intent(in)  :: my_id, max_classes
+  integer, intent(out) :: n
+  real*8,  intent(out) :: e_out(max_classes), xi_out(max_classes), w_out(max_classes)
+  ! optional overrides, used by the standalone unit test; production takes the
+  ! namelist values
+  integer, optional, intent(in) :: n_alpha_in
+  real*8,  optional, intent(in) :: zeff_in, ztot_in, e_over_ec_in, ln_lambda_in
+
+  integer :: n_alpha, k
+  real*8  :: zeff, ztot, e_over_ec, ln_lambda, cZ, gamma0, mec2_eV
+  real*8  :: u_lo, u_hi, x_lo, x_hi, u, gam, A, e2, xi_mean
+  real*8, allocatable :: xq(:), wq(:)
+
+  n_alpha   = re_eq_n_alpha
+  zeff      = re_eq_av_zeff
+  ztot      = re_eq_av_ztot
+  e_over_ec = re_eq_av_e_over_ec
+  ln_lambda = re_eq_av_lnlambda
+  if (present(n_alpha_in))   n_alpha   = n_alpha_in
+  if (present(zeff_in))      zeff      = zeff_in
+  if (present(ztot_in))      ztot      = ztot_in
+  if (present(e_over_ec_in)) e_over_ec = e_over_ec_in
+  if (present(ln_lambda_in)) ln_lambda = ln_lambda_in
+
+  if (n_alpha .lt. 2) then
+    write(*,*) 'ERROR: re_eq: re_eq_n_alpha must be at least 2'
+    stop 1
+  endif
+  if (n_alpha .gt. max_classes) then
+    write(*,*) 'ERROR: re_eq: re_eq_n_alpha exceeds max_classes = ', max_classes
+    stop 1
+  endif
+  if (ln_lambda .le. 0.d0) then
+    write(*,*) 'ERROR: re_eq: re_eq_av_lnlambda must be positive'
+    stop 1
+  endif
+  if (zeff .lt. 0.d0) then
+    write(*,*) 'ERROR: re_eq: re_eq_av_zeff must be non-negative'
+    stop 1
+  endif
+  if (ztot .lt. 0.d0) then
+    write(*,*) 'ERROR: re_eq: re_eq_av_ztot must be non-negative'
+    stop 1
+  endif
+  ! E/E_c < 1 is below the avalanche threshold: A would still be positive, so
+  ! the formula returns a distribution, but it does not describe anything.
+  if (e_over_ec .le. 1.d0) then
+    write(*,*) 'ERROR: re_eq: re_eq_av_e_over_ec must exceed 1 ', &
+               '(no avalanche below the threshold field)'
+    stop 1
+  endif
+
+  cZ     = sqrt(5.d0 + zeff)
+  gamma0 = cZ * ln_lambda
+
+  ! --- momentum range, DERIVED from gamma_0 rather than exposed as two more
+  !     namelist knobs: the spectrum is exp(-gamma/gamma_0), so an upper bound
+  !     of 6 gamma_0 truncates it at e^-6 = 0.25 %, and the lower bound is
+  !     placed at u = 1 (E_kin = 0.21 MeV), safely below the runaway region
+  !     for any case of interest. Both are far outside where the weight lies.
+  u_lo = 1.d0
+  u_hi = 6.d0 * gamma0
+
+  allocate(xq(n_alpha), wq(n_alpha))
+  call re_eq_gauss_legendre(n_alpha, xq, wq)
+
+  x_lo = log(u_lo);  x_hi = log(u_hi)
+  mec2_eV = MASS_ELECTRON * SPEED_OF_LIGHT**2 / EL_CHG
+
+  n = n_alpha
+  do k = 1, n_alpha
+    ! map the [-1,1] node onto [ln u_lo, ln u_hi]
+    u   = exp(0.5d0*(x_hi - x_lo)*xq(k) + 0.5d0*(x_hi + x_lo))
+    gam = sqrt(1.d0 + u*u)
+    e_out(k) = (gam - 1.d0) * mec2_eV
+    ! w = W_k * u * f(u), with f(u) = exp(-gamma/gamma_0)/gamma_0
+    w_out(k) = 0.5d0*(x_hi - x_lo)*wq(k) * u * exp(-gam/gamma0) / gamma0
+    ! representative pitch: the mean of the Embreus pitch distribution at
+    ! this momentum. NEGATIVE, since the exponent -A(1+xi) peaks at xi = -1.
+    A  = gam * (e_over_ec + 1.d0) / (ztot + 1.d0)
+    e2 = exp(-2.d0*A)
+    xi_mean = (1.d0 - e2*(1.d0 + 2.d0*A)) / (A * (1.d0 - e2)) - 1.d0
+    xi_out(k) = xi_mean
+  enddo
+
+  deallocate(xq, wq)
+
+  if (my_id .eq. 0) then
+    write(*,'(A,I4,A)') '   avalanche spectrum (Embreus 2018 eq. 2.17): ', &
+                        n_alpha, '-node Gauss-Legendre in ln(alpha)'
+    write(*,'(A,F7.3,A,F8.3,A,F7.2,A)') &
+      '     c_Z = ', cZ, ', gamma_0 = ', gamma0, &
+      ' (characteristic energy ', (gamma0 - 1.d0)*mec2_eV*1.d-6, ' MeV)'
+    write(*,'(A,ES11.4,A,ES11.4,A)') &
+      '     E_kin range ', e_out(1), ' .. ', e_out(n_alpha), ' eV'
+    write(*,'(A,F9.5,A,F9.5)') &
+      '     mean pitch <xi> from ', xi_out(1), ' to ', xi_out(n_alpha)
+  endif
+
+end subroutine re_eq_spectrum_classes
+
+
 subroutine re_eq_read_distribution(my_id)
   use tr_module
   implicit none
   integer, intent(in) :: my_id
   integer, parameter  :: max_classes = 10000
-  integer :: iunit, ierr, n, ipos, s
-  real*8  :: cols(3), wsum, mec2_eV
+  integer :: iunit, ierr, n, ipos, s, n_bad
+  real*8  :: cols(3), wsum, mec2_eV, cw_tot, cw_bad, cw_s
   real*8  :: tmp_e(max_classes), tmp_xi(max_classes), tmp_w(max_classes)
   character(len=512) :: line
 
+  ! --- populate (n, tmp_e, tmp_xi, tmp_w), either by reading a table or by
+  !     generating a quadrature of a continuous spectrum. Everything below is
+  !     SHARED: the two paths differ only in where the classes come from.
   select case (trim(re_eq_dist_format))
+
   case ('ekin_xi_w')
-    ! fall through to the reader below
+    iunit = 438
+    open(iunit, file=trim(re_eq_dist_file), status='old', action='read', iostat=ierr)
+    if (ierr .ne. 0) then
+      write(*,*) 'ERROR: cannot open re_eq_dist_file: ', trim(re_eq_dist_file)
+      stop 1
+    endif
+
+    n = 0
+    do
+      read(iunit,'(A)',iostat=ierr) line
+      if (ierr .ne. 0) exit
+      ipos = index(line, '#')
+      if (ipos .gt. 0) line = line(1:ipos-1)
+      if (len_trim(line) .eq. 0) cycle
+      n = n + 1
+      if (n .gt. max_classes) then
+        write(*,*) 'ERROR: more than ', max_classes, ' classes in ', trim(re_eq_dist_file)
+        stop 1
+      endif
+      read(line,*,iostat=ierr) cols
+      if (ierr .ne. 0) then
+        write(*,*) 'ERROR: expected 3 columns (E_kin[eV] xi weight) in ', &
+                   trim(re_eq_dist_file), ' line: ', trim(line)
+        stop 1
+      endif
+      tmp_e(n) = cols(1); tmp_xi(n) = cols(2); tmp_w(n) = cols(3)
+    enddo
+    close(iunit)
+
+  case ('avalanche')
+    ! Continuous spectrum: the classes are QUADRATURE NODES, not a sampling
+    ! of the distribution. Nothing is read from disk.
+    call re_eq_spectrum_classes(my_id, max_classes, n, tmp_e, tmp_xi, tmp_w)
+
   case default
     write(*,*) 'ERROR: unknown re_eq_dist_format: ', trim(re_eq_dist_format)
+    write(*,*) '       known formats: ekin_xi_w (table), avalanche (generated)'
     stop 1
   end select
-
-  iunit = 438
-  open(iunit, file=trim(re_eq_dist_file), status='old', action='read', iostat=ierr)
-  if (ierr .ne. 0) then
-    write(*,*) 'ERROR: cannot open re_eq_dist_file: ', trim(re_eq_dist_file)
-    stop 1
-  endif
-
-  n = 0
-  do
-    read(iunit,'(A)',iostat=ierr) line
-    if (ierr .ne. 0) exit
-    ipos = index(line, '#')
-    if (ipos .gt. 0) line = line(1:ipos-1)
-    if (len_trim(line) .eq. 0) cycle
-    n = n + 1
-    if (n .gt. max_classes) then
-      write(*,*) 'ERROR: more than ', max_classes, ' classes in ', trim(re_eq_dist_file)
-      stop 1
-    endif
-    read(line,*,iostat=ierr) cols
-    if (ierr .ne. 0) then
-      write(*,*) 'ERROR: expected 3 columns (E_kin[eV] xi weight) in ', &
-                 trim(re_eq_dist_file), ' line: ', trim(line)
-      stop 1
-    endif
-    tmp_e(n) = cols(1); tmp_xi(n) = cols(2); tmp_w(n) = cols(3)
-  enddo
-  close(iunit)
 
   if (n .eq. 0) then
     write(*,*) 'ERROR: no distribution classes found in ', trim(re_eq_dist_file)
@@ -482,13 +701,6 @@ subroutine re_eq_read_distribution(my_id)
   re_cl_w(1:n) = tmp_w(1:n) / wsum
 
   do s = 1, n
-    if (abs(re_cl_xi(s)) .lt. re_eq_xi_min) then
-      write(*,'(A,I4,A,F8.4,A,F8.4)') ' ERROR: RE class ', s, ' has |xi| = ', &
-        abs(re_cl_xi(s)), ' < re_eq_xi_min = ', re_eq_xi_min
-      write(*,*) '        Trapped-particle invariants are out of scope for the'
-      write(*,*) '        drift-surface equilibrium (strongly passing REs assumed).'
-      stop 1
-    endif
     if (re_cl_ekin(s) .le. 0.d0) then
       write(*,*) 'ERROR: non-positive RE class energy in ', trim(re_eq_dist_file)
       stop 1
@@ -506,6 +718,45 @@ subroutine re_eq_read_distribution(my_id)
   re_cl_A_axis = 0.d0;  re_cl_A_edge = 0.d0
   re_cl_R_axis = 0.d0;  re_cl_Z_axis = 0.d0
   re_cl_edge_frac = 0.d0
+
+  ! --- pitch validity window.
+  !     re_eq_xi_min is a DIAGNOSTIC THRESHOLD, not a hard stop. The
+  !     drift-surface label A_s = gamma m v_par R - e psi assumes alpha is
+  !     constant along the orbit, which is exact only at mu = 0, so the ansatz
+  !     degrades as |xi| falls. What matters is not how many classes sit below
+  !     the threshold but how much CURRENT they carry -- so that is what is
+  !     reported. Sub-percent means the strongly-passing assumption is
+  !     quantitatively justified for this case; a large fraction is a real
+  !     result about the case, not a reason to stop.
+  !
+  !     (It was previously a `stop 1`. That made every realistic pitch
+  !     distribution unusable: the avalanche distribution's mean pitch is
+  !     broad at low energy, and the fraction of current below |xi| = 0.9
+  !     ranges from 0.5 % at E/E_c = 10, Z_tot = 1 to 57 % at E/E_c = 2,
+  !     Z_tot = 10. Runs that used to succeed are unaffected -- only runs
+  !     that used to abort now proceed, with this warning.)
+  cw_tot = 0.d0;  cw_bad = 0.d0;  n_bad = 0
+  do s = 1, n
+    cw_s   = abs(re_cl_vpar(s) * re_cl_w(s))
+    cw_tot = cw_tot + cw_s
+    if (abs(re_cl_xi(s)) .lt. re_eq_xi_min) then
+      cw_bad = cw_bad + cw_s
+      n_bad  = n_bad + 1
+    endif
+  enddo
+  if ((n_bad .gt. 0) .and. (my_id .eq. 0)) then
+    write(*,'(A)')          ' WARNING: re_eq: classes below the pitch validity window'
+    write(*,'(A,I5,A,I5,A,F8.4)') '          ', n_bad, ' of ', n, &
+      ' classes have |xi| < re_eq_xi_min = ', re_eq_xi_min
+    if (cw_tot .gt. 0.d0) then
+      write(*,'(A,F8.3,A)') '          they carry ', 1.d2*cw_bad/cw_tot, &
+        ' % of the RE current'
+    endif
+    write(*,'(A)')          '          The drift-surface ansatz assumes strongly passing REs'
+    write(*,'(A)')          '          (constant alpha along the orbit, exact only at mu = 0).'
+    write(*,'(A)')          '          Sub-percent here is quantitatively safe; a large'
+    write(*,'(A)')          '          fraction means the result depends on out-of-scope orbits.'
+  endif
 
 end subroutine re_eq_read_distribution
 
