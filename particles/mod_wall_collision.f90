@@ -91,7 +91,7 @@ subroutine mod_wall_collision_export(sim, file, iangle_groups)
   real*8, allocatable  :: energy_deposition(:)   ! Deposited energy (J)
   real*8, allocatable  :: iangle_mean(:)         ! Mean angle of incidence weight by energy deposition of each marker
 
-  integer, allocatable :: particles_per_proc(:), displs(:), wall_id_all(:), wall_id(:)
+  integer, allocatable :: particles_per_proc(:), wall_id_all(:), wall_id(:)
   real*8, allocatable  :: weight_all(:), energy_all(:), weight(:), energy(:), iangle(:), iangle_all(:)
 
   character(len=5) :: group_name
@@ -134,11 +134,6 @@ subroutine mod_wall_collision_export(sim, file, iangle_groups)
              particles_per_proc,1,MPI_INTEGER,0,MPI_COMM_WORLD,ierr)
         n_total = sum(particles_per_proc,1)
 
-        ! Displacement of each process in the gathered arrays: everything sent by the
-        ! preceding processes. Only meaningful on the root process.
-        allocate(displs(0:n_cpu-1))
-        displs = [(sum(particles_per_proc(0:k-1)), k=0,n_cpu-1)]
-
         ! Collect wall IDs, weights, and evaluate energy. TODO add other particle types
         allocate( wall_id(n_here), weight(n_here), energy(n_here), iangle(n_here) )
         energy = 0.d0 !< markers whose energy cannot be evaluated below must not contribute
@@ -175,22 +170,22 @@ subroutine mod_wall_collision_export(sim, file, iangle_groups)
         ! Gather data from other processes
         allocate( wall_id_all(n_total), weight_all(n_total), energy_all(n_total), iangle_all(n_total) )
         call MPI_Gatherv(wall_id(:), n_here, MPI_INTEGER, &
-             wall_id_all(:), particles_per_proc, displs, &
+             wall_id_all(:), particles_per_proc, [(sum(particles_per_proc(1:i),1), i=0,n_cpu-1)], &
              MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)
 
         call MPI_Gatherv(weight(:), n_here, MPI_REAL8, &
-             weight_all(:), particles_per_proc, displs, &
+             weight_all(:), particles_per_proc, [(sum(particles_per_proc(1:i),1), i=0,n_cpu-1)], &
              MPI_REAL8, 0, MPI_COMM_WORLD, ierr)
 
         call MPI_Gatherv(energy(:), n_here, MPI_REAL8, &
-             energy_all(:), particles_per_proc, displs, &
+             energy_all(:), particles_per_proc, [(sum(particles_per_proc(1:i),1), i=0,n_cpu-1)], &
              MPI_REAL8, 0, MPI_COMM_WORLD, ierr)
 
         call MPI_Gatherv(iangle(:), n_here, MPI_REAL8, &
-             iangle_all(:), particles_per_proc, displs, &
+             iangle_all(:), particles_per_proc, [(sum(particles_per_proc(1:i),1), i=0,n_cpu-1)], &
              MPI_REAL8, 0, MPI_COMM_WORLD, ierr)
 
-        deallocate(particles_per_proc, displs, wall_id, energy, weight, iangle)
+        deallocate(particles_per_proc, wall_id, energy, weight, iangle)
 
         if( my_id .eq. 0 ) then
            ! Find how many unique wetted wall IDs there are
