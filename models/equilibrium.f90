@@ -297,7 +297,7 @@ if (my_id == 0) then
     ! labels. re_eq_finalize also closes the convergence log, which we still
     ! want open through the free-boundary iterations.
     if (.not. freeboundary_equil2) then
-      call re_eq_write_output(my_id)
+      call re_eq_write_output(my_id, node_list, element_list, bnd_node_list)
       call re_eq_finalize(re_eq_converged)
     else
       write(*,'(A)') ' re_eq: fixed-boundary phase done; hand-off deferred until'
@@ -719,7 +719,7 @@ if (my_id == 0) then
     ! Hand-off written HERE: psi is now in its final form, the same one the
     ! restart carries, so re_equilibrium.dat and the restart agree.
     if (freeboundary_equil) then
-      call re_eq_write_output(my_id)
+      call re_eq_write_output(my_id, node_list, element_list, bnd_node_list)
       call re_eq_finalize(re_eq_converged)
       ! q-evaluation workspace, re-allocated by re_eq_q_transplant during the
       ! free-boundary outer loop after the fixed-boundary phase released it

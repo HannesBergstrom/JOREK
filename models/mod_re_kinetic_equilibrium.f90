@@ -2905,14 +2905,69 @@ end function re_eq_interp_q
 !> sample the stationary density n_s ~ w_s Nprof(Ahat_s)/R. Plain text with
 !> a versioned header (kept easily extensible; the reader lives in
 !> particles/initialisers/initialisers_RE.f90 and must be kept in sync).
-subroutine re_eq_write_output(my_id)
+subroutine re_eq_write_output(my_id, node_list, element_list, bnd_node_list)
+  use constants, only: MASS_ELECTRON, SPEED_OF_LIGHT, EL_CHG
+  use data_structure
+  use equil_info, only: ES
   implicit none
-  integer, intent(in) :: my_id
-  integer :: iunit, s, k
+  integer,                    intent(in) :: my_id
+  type (type_node_list),      intent(in) :: node_list
+  type (type_element_list),   intent(in) :: element_list
+  type (type_bnd_node_list),  intent(in) :: bnd_node_list
+  integer :: iunit, s, k, ifail
+  ! --- alpha table for continuous marker sampling (see below)
+  integer, parameter :: N_ATAB = 65
+  real*8  :: a_tab(N_ATAB), Aax_tab(N_ATAB), Aed_tab(N_ATAB)
+  real*8  :: alpha_max, alpha_k, R_ax, Z_ax, A_ax
+  logical :: want_atab
+
+  ! ================================================================
+  ! alpha table: A_axis(alpha) and A_edge(alpha) on a UNIFORM grid
+  ! spanning both signs of alpha.
+  !
+  ! The marker loader needs these at each MARKER's alpha = xi p / e, not
+  ! at the quadrature-class values. Markers span a wider range than the
+  ! classes: a marker in the wide-pitch tail has |xi| << |<xi>|, hence
+  ! alpha -> 0 (and, in the broad-pitch cases, alpha of the OPPOSITE
+  ! sign). The class table cannot serve that -- it is log-spaced in
+  ! |alpha| with no node anywhere near 0.
+  !
+  ! A uniform grid over [-alpha_max, +alpha_max] is the right choice
+  ! because A_axis(alpha) ~ -psi_axis + alpha R_axis is near-LINEAR in
+  ! alpha, and because alpha = 0 must be represented exactly: there the
+  ! drift surface degenerates to a flux surface and the normalized label
+  ! reduces to psihat, with no singularity.
+  !
+  ! alpha_max = p_max/e is a hard bound: |alpha| = |xi| p / e <= p / e.
+  ! ================================================================
+  want_atab = (trim(re_eq_dist_format) .ne. 'ekin_xi_w')
+  if (want_atab) then
+    alpha_max = 0.d0
+    do s = 1, re_eq_n_class
+      ! p/e for this class, i.e. |alpha| at |xi| = 1
+      alpha_max = max(alpha_max, abs(re_cl_alpha(s) / re_cl_xi(s)))
+    enddo
+    alpha_max = 1.02d0 * alpha_max            ! small margin
+    do k = 1, N_ATAB
+      alpha_k = -alpha_max + 2.d0*alpha_max*dble(k-1)/dble(N_ATAB-1)
+      a_tab(k) = alpha_k
+      call re_eq_find_drift_axis(node_list, element_list, alpha_k, &
+                                 ES%R_axis, ES%Z_axis, R_ax, Z_ax, A_ax, ifail)
+      if (ifail .ne. 0) then
+        ! should not happen (alpha = 0 is the flux-surface limit and the
+        ! magnetic axis is always an extremum of A = -psi), but do not let
+        ! a table point abort a converged equilibrium: fall back to the
+        ! analytic small-drift form.
+        A_ax = alpha_k * ES%R_axis - ES%psi_axis
+      endif
+      Aax_tab(k) = A_ax
+      Aed_tab(k) = re_eq_A_edge_bnd(alpha_k, node_list, bnd_node_list)
+    enddo
+  endif
 
   iunit = 439
   open(iunit, file='re_equilibrium.dat', action='write', status='replace')
-  write(iunit,'(A)') '# JOREK kinetic RE drift-surface equilibrium, format version 1'
+  write(iunit,'(A)') '# JOREK kinetic RE drift-surface equilibrium, format version 2'
   write(iunit,'(A)') '# A_s/e = alpha_s * R - psi;  Ahat_s = (A_s/e - A_axis)/(A_edge - A_axis)'
   write(iunit,'(A)') '# n_s(R,Z) = w_s * Nprof(Ahat_s) / R  [m^-3]; psi in the units of the restart file'
   write(iunit,'(A,I6)')     'n_class ', re_eq_n_class
@@ -2920,9 +2975,20 @@ subroutine re_eq_write_output(my_id)
   write(iunit,'(A,ES23.15)') 'I_RE    ', re_eq_I_now
   write(iunit,'(A,ES23.15)') 'q_err   ', re_eq_q_err
   write(iunit,'(A,ES23.15)') 'psi_bnd ', re_eq_psi_bnd
+  write(iunit,'(A,ES23.15)') 'psi_axis', ES%psi_axis
   write(iunit,'(A,ES23.15)') 'taper   ', re_eq_edge_taper
   write(iunit,'(A,ES23.15)') 'l_beam  ', re_eq_l_beam
   write(iunit,'(A,ES23.15)') 'l_beam_w', re_eq_l_beam_width
+  ! --- continuous-distribution descriptor: lets the marker loader rebuild
+  !     the SAME f(p,xi) the equilibrium integrated, rather than being
+  !     limited to the quadrature nodes.
+  write(iunit,'(A,A)')       'dist_fmt ', trim(re_eq_dist_format)
+  write(iunit,'(A,I6)')     'n_alpha ', re_eq_n_alpha
+  write(iunit,'(A,ES23.15)') 'av_zeff ', re_eq_av_zeff
+  write(iunit,'(A,ES23.15)') 'av_ztot ', re_eq_av_ztot
+  write(iunit,'(A,ES23.15)') 'av_eec  ', re_eq_av_e_over_ec
+  write(iunit,'(A,ES23.15)') 'av_lnl  ', re_eq_av_lnlambda
+  write(iunit,'(A,I6)')     'n_atab  ', merge(N_ATAB, 0, want_atab)
   write(iunit,'(A,ES23.15)') 'R_edge  ', re_eq_R_edge
   write(iunit,'(A)') '# classes: s  E_kin[eV]  xi  weight  gamma  v_par[m/s]  alpha[Wb/m]  A_axis[Wb]  A_edge[Wb]  R_axis[m]  Z_axis[m]  edge_fraction'
   do s = 1, re_eq_n_class
@@ -2948,6 +3014,14 @@ subroutine re_eq_write_output(my_id)
   do k = 1, re_eq_n_l
     write(iunit,'(2ES23.15)') re_nprof_l(k), re_nprof(k)
   enddo
+
+  ! --- alpha table, for continuous marker sampling only
+  if (want_atab) then
+    write(iunit,'(A)') '# alpha table: alpha[Wb/m]  A_axis[Wb]  A_edge[Wb]'
+    do k = 1, N_ATAB
+      write(iunit,'(3ES23.15)') a_tab(k), Aax_tab(k), Aed_tab(k)
+    enddo
+  endif
   close(iunit)
 
   write(*,*) ' re_eq: wrote re_equilibrium.dat (per-class data + Nprof table)'
