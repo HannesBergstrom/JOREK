@@ -106,6 +106,10 @@ integer            :: re_eq_n_alpha      = 8          !< quadrature nodes in ln(
 real*8             :: re_eq_av_zeff      = 1.d0       !< Z_eff, sets c_Z = sqrt(5 + Z_eff) -> gamma_0
 real*8             :: re_eq_av_ztot      = 1.d0       !< Z_tot in A(p) (pitch width only)
 real*8             :: re_eq_av_e_over_ec = 10.d0      !< E/E_c in A(p) (pitch width only)
+real*8             :: re_eq_psi_shift    = 0.d0       !< accumulated psi offset applied by
+                                                      !< re_eq_shift_labels (free boundary); used to
+                                                      !< put re_eq_write_output's grid-derived
+                                                      !< quantities in the same frame as the labels
 real*8             :: re_eq_av_lnlambda  = 15.d0      !< Coulomb logarithm in gamma_0 = c_Z lnLambda
                                                       !< (independent: e.g. the relativistic form of
                                                       !< the Embreus paper, or a value from another time)
@@ -1087,6 +1091,14 @@ subroutine re_eq_shift_labels(dpsi)
     re_cl_A_edge(s) = re_cl_A_edge(s) + dpsi
   enddo
   re_eq_psi_bnd = re_eq_psi_bnd - dpsi
+  ! Remember the accumulated offset. re_eq_write_output runs BEFORE the node
+  ! psi data is actually shifted (equilibrium.f90: shift_labels at :718,
+  ! write_output at :722, the node loop at :740), and ES is not refreshed in
+  ! between -- so anything write_output recomputes from the grid, or reads
+  ! from ES, is still in the OLD psi frame while the class table above is
+  ! already in the new one. The offset lets write_output put both in the
+  ! final frame. Fixed boundary never calls this, so dpsi = 0 there.
+  re_eq_psi_shift = re_eq_psi_shift + dpsi
 end subroutine re_eq_shift_labels
 
 
@@ -2960,8 +2972,15 @@ subroutine re_eq_write_output(my_id, node_list, element_list, bnd_node_list)
         ! analytic small-drift form.
         A_ax = alpha_k * ES%R_axis - ES%psi_axis
       endif
-      Aax_tab(k) = A_ax
-      Aed_tab(k) = re_eq_A_edge_bnd(alpha_k, node_list, bnd_node_list)
+      ! + re_eq_psi_shift: both are computed from the grid, which in the
+      ! free-boundary path has NOT yet been shifted by psi_offset_freeb,
+      ! while the class table already has been. A = alpha R - psi, so
+      ! psi -> psi - offset maps A -> A + offset exactly. Zero for fixed
+      ! boundary. Without this the whole marker population is displaced
+      ! radially by offset/(A_edge - A_axis) in label.
+      Aax_tab(k) = A_ax + re_eq_psi_shift
+      Aed_tab(k) = re_eq_A_edge_bnd(alpha_k, node_list, bnd_node_list) &
+                   + re_eq_psi_shift
     enddo
   endif
 
@@ -2975,7 +2994,9 @@ subroutine re_eq_write_output(my_id, node_list, element_list, bnd_node_list)
   write(iunit,'(A,ES23.15)') 'I_RE    ', re_eq_I_now
   write(iunit,'(A,ES23.15)') 'q_err   ', re_eq_q_err
   write(iunit,'(A,ES23.15)') 'psi_bnd ', re_eq_psi_bnd
-  write(iunit,'(A,ES23.15)') 'psi_axis', ES%psi_axis
+  ! ES is not refreshed after the free-boundary psi shift, so put it in the
+  ! final frame explicitly (psi -> psi - offset). Zero for fixed boundary.
+  write(iunit,'(A,ES23.15)') 'psi_axis', ES%psi_axis - re_eq_psi_shift
   write(iunit,'(A,ES23.15)') 'taper   ', re_eq_edge_taper
   write(iunit,'(A,ES23.15)') 'l_beam  ', re_eq_l_beam
   write(iunit,'(A,ES23.15)') 'l_beam_w', re_eq_l_beam_width
