@@ -244,6 +244,15 @@ real*8  :: re_eq_I_now   = 0.d0         !< latest RE current [A]
 !> Ahat = l_beam surface), published so equilibrium.f90 can size the q
 !> evaluation grid to the label range instead of a hard-wired top level.
 !> Zero until the first outer update has run; the caller falls back then.
+!> Minimum share of the RE current, RELATIVE to the heaviest class, for a
+!> class to count towards the controllable-range reductions in
+!> re_eq_outer_update. Relative (not absolute) so it does not tighten as the
+!> quadrature is refined. Chosen so that no class of a hand-written table, a
+!> mono case, or the 8-node avalanche quadrature is ever excluded -- it only
+!> suppresses the vanishing-weight endpoint nodes that appear at large
+!> re_eq_n_alpha. NOT a namelist parameter: it is an internal guard, not a
+!> modelling choice.
+real*8, parameter   :: RE_EQ_CTL_WMIN = 1.d-2
 real*8              :: re_eq_ph_beam_max = 0.d0
 !> Achieved/target q amplitude from the last outer update, published for the
 !> coil-scale control. This is the residual the coils have to close: with the
@@ -2045,7 +2054,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   logical :: cur_active, improved, siz_active
   real*8  :: phm(re_eq_n_l), phe, q_at, qt_at, ratio(re_eq_n_l), lr(re_eq_n_l)
   real*8  :: q_acc(re_eq_n_l), qt_acc(re_eq_n_l)
-  real*8  :: cw(re_eq_n_class), cw_sum, ph_beam_cl(re_eq_n_class)
+  real*8  :: cw(re_eq_n_class), cw_sum, cw_max, ph_beam_cl(re_eq_n_class)
   real*8  :: c_amp, num, den, err, err_ctl, I_now, ph_ctl_max, ph_beam, l_eff, err_cur
   real*8  :: err_siz, err_best
   real*8  :: c_glob
@@ -2072,6 +2081,24 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   !     q and q_t are always evaluated at the SAME clamped argument.
   cw = abs(re_cl_w(1:re_eq_n_class) * re_cl_vpar(1:re_eq_n_class))
   cw_sum = sum(cw);  cw = cw / cw_sum
+  ! --- Reference weight for the controllability reductions below. Those take
+  !     a MAX over classes, which is weight-blind: a class carrying 1e-4 of
+  !     the current would otherwise set the controllable range for the whole
+  !     solve. That is harmless for a hand-written class table or a mono case
+  !     (every class carries a comparable share) but not for a QUADRATURE:
+  !     Gauss-Legendre clusters its nodes at the endpoints, so raising
+  !     re_eq_n_alpha adds nodes with vanishing weight AND the most extreme
+  !     drift shift. Measured on the avalanche spectrum, the outermost node
+  !     carries 7.0e-3 of the current at n_alpha = 8 but only 7.6e-5 at 64.
+  !     The controllable range then extends into surfaces the beam does not
+  !     actually populate, q there is poorly determined, and the outer error
+  !     stagnates instead of converging -- worse with MORE quadrature nodes.
+  !
+  !     The threshold is RELATIVE to the heaviest class, so it is independent
+  !     of how many nodes the quadrature uses. At n_alpha = 8, and for every
+  !     hand-written table and mono case, no class falls below it and the
+  !     behaviour is unchanged.
+  cw_max = maxval(cw(1:re_eq_n_class))
   lr = 0.d0;  q_acc = 0.d0;  qt_acc = 0.d0
   ph_ctl_max = ph_lev(1)
   do s = 1, re_eq_n_class
@@ -2110,7 +2137,8 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
       q_acc(k)  = q_acc(k)  + cw(s) * q_at
       qt_acc(k) = qt_acc(k) + cw(s) * qt_at
     enddo
-    ph_ctl_max = max(ph_ctl_max, min(ph_beam, ph_lev(n_lev)))
+    if (cw(s) .gt. RE_EQ_CTL_WMIN * cw_max) &
+      ph_ctl_max = max(ph_ctl_max, min(ph_beam, ph_lev(n_lev)))
   enddo
 
   ! Publish the outermost controllable psihat so the NEXT outer iteration can
@@ -2122,7 +2150,14 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   ! last of them to zero that band shows up as a current bump at the plasma
   ! edge. One iteration of lag is harmless -- the labels move slowly and the
   ! grid is rebuilt every outer iteration.
-  re_eq_ph_beam_max = maxval(ph_beam_cl(1:re_eq_n_class))
+  !     Same weight-blind-MAX issue as ph_ctl_max above: restrict to classes
+  !     that actually carry current. cw_max itself always passes, so this is
+  !     never empty.
+  re_eq_ph_beam_max = 0.d0
+  do s = 1, re_eq_n_class
+    if (cw(s) .gt. RE_EQ_CTL_WMIN * cw_max) &
+      re_eq_ph_beam_max = max(re_eq_ph_beam_max, ph_beam_cl(s))
+  enddo
 
   ! --- sign-consistency guard: the equilibrium q and the target q_t must
   !     share a sign. The transplant can only match the MAGNITUDE |q| (the
