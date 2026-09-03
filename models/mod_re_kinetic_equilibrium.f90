@@ -2052,6 +2052,7 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
 
   integer :: k, i, s
   logical :: cur_active, improved, siz_active
+  integer :: n_act
   real*8  :: phm(re_eq_n_l), phe, q_at, qt_at, ratio(re_eq_n_l), lr(re_eq_n_l)
   real*8  :: q_acc(re_eq_n_l), qt_acc(re_eq_n_l)
   real*8  :: cw(re_eq_n_class), cw_sum, cw_max, ph_beam_cl(re_eq_n_class)
@@ -2502,10 +2503,43 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
   !     and leaves a very slow tail, and a cumulative (enclosed-current proxy)
   !     update, which converges but leaves null-space ripple at the beam edge.
   !     Both are described in the .tex if the history is ever needed.
-  call re_eq_operator_update(node_list, element_list, n_lev, ph_lev, q_lev, c_amp)
-
-  ! confine the updated profile to the beam
-  call re_eq_apply_beam_envelope()
+  !     HELD FIXED while the size control is still probing for its Jacobian.
+  !
+  !     Why: re_eq_lcfs_update measures its Jacobian as df/dx across two
+  !     consecutive outer iterations and attributes the whole change in
+  !     (LCFS_a, LCFS_kappa) to the actuator. The q transplant runs FIRST each
+  !     iteration (equilibrium.f90: re_eq_q_transplant, then re_eq_lcfs_update),
+  !     so Nprof moves in between and
+  !           df_measured = df_actuator + df_from_the_Nprof_update.
+  !     The contamination scales with how fast Nprof is still moving, so the
+  !     Jacobian is worst EARLY -- exactly when the size control needs it --
+  !     and only becomes accurate once the q channel has settled. Observed
+  !     signature: geo_err drifts sideways for most of the run and then
+  !     collapses in the last couple of iterations.
+  !
+  !     Freezing the shape while re_eq_nprobe < n_act makes every measured
+  !     column the response to its actuator alone. The gate is on the STATE,
+  !     not on a flag set when a probe fires: the iteration that must be frozen
+  !     is the one in which the probe is APPLIED, and that happens later in the
+  !     SAME iteration (transplant first, then lcfs_update), so a flag set at
+  !     the probe would freeze one iteration too late and leave df spanning a
+  !     Nprof step after all. n_act is recomputed here from re_eq_lcfs_kappa
+  !     exactly as re_eq_lcfs_update does, so no handshake is needed and the
+  !     gate is already correct on the very first outer iteration.
+  !     Cost: n_act iterations (1-2) in which q does not advance.
+  !
+  !     Only the SHAPE is frozen. re_eq_rescale_current still pins I_RE, and
+  !     rescaling in response to the moved boundary IS part of the actuator
+  !     response, not contamination.
+  n_act = merge(2, 1, re_eq_lcfs_kappa .gt. 0.d0)
+  if (re_eq_size_active .and. (re_eq_nprobe .lt. n_act)) then
+    write(*,'(A,I2,A,I2,A)') '        (Nprof shape held: size control probing ', &
+      re_eq_nprobe + 1, ' of ', n_act, ')'
+  else
+    call re_eq_operator_update(node_list, element_list, n_lev, ph_lev, q_lev, c_amp)
+    ! confine the updated profile to the beam
+    call re_eq_apply_beam_envelope()
+  endif
 
 
 
