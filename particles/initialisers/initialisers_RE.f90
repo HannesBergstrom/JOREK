@@ -575,7 +575,7 @@ subroutine equilibrium_initialization(sim, group_num, rng)
   real*8  :: psi, U, e1(3), e2(3)
   real*8, dimension(3) :: E_fld, B_fld, B_cart, B_norm
   real*8  :: weight_s
-  real*8  :: I_loc, I_unit, w_factor, p_phi_c, gam, me_kg, phi_p
+  real*8  :: I_loc, I_unit, w_factor, p_phi_c, gam, me_kg, phi_p, mass_amu
 
   config = part_group_configs(matching_part_config_indices(group_num))
 
@@ -595,6 +595,12 @@ subroutine equilibrium_initialization(sim, group_num, rng)
     write(*,*) 'ERROR: equilibrium_initialization: inconsistent local marker count'
     stop 1
   endif
+
+  ! group mass in AMU -- the unit p_par_a/p_perp_a are in, and the one
+  ! JOREK's GC relations expect. Needed inside the population loop below
+  ! (the mu assignment), so it is set here rather than at the weight
+  ! normalization further down.
+  mass_amu = sim%groups(group_num)%mass
 
   ! ================================================================
   ! Population layout. A "population" is a class (discrete table) or an
@@ -735,9 +741,39 @@ subroutine equilibrium_initialization(sim, group_num, rng)
         particles(j)%weight = weight_s
       end do
       !$omp end parallel do
+
+    type is (particle_gc_relativistic)
+      ! Guiding-centre markers carry (p_par, mu) instead of a momentum
+      ! vector, so there is no gyro-phase to draw and no orthonormal frame
+      ! to build. Conventions taken from JOREK's own GC machinery:
+      !   p(1) = p_par                     [AMU m/s]
+      !   p(2) = mu = p_perp^2/(2 |B| m)   [AMU m^2/(T s^2)]
+      ! (mod_ccoll_relativistic.f90:546, and the inverse
+      !  p_perp = sqrt(2 m |B| mu) in generate_particle_restart_from_SOFT).
+      ! m is the group mass in AMU, matching the units of p_par_a.
+      !
+      ! NOTE: this is the type for which the drift-surface equilibrium is
+      ! strictly correct. The construction places GUIDING CENTRES on the
+      ! drift surfaces; a full-orbit marker put at the same point sits a
+      ! gyroradius away from its own guiding centre, which smears the loaded
+      ! density by ~rho (about 1 mm here, negligible, but not zero).
+      !$omp parallel do default(none) &
+      !$omp private(E_fld, B_fld, psi, U, j) &
+      !$omp shared (sim, i_lo, i_hi, p_par_a, p_perp_a, weight_s, mass_amu)
+      do j = i_lo, i_hi
+        call sim%fields%calc_EBpsiU(sim%time, particles(j)%i_elm, particles(j)%st, &
+                                    particles(j)%x(3), E_fld, B_fld, psi, U)
+        particles(j)%p(1)   = p_par_a(j)
+        particles(j)%p(2)   = p_perp_a(j)**2 / (2.d0 * norm2(B_fld) * mass_amu)
+        particles(j)%q      = -1
+        particles(j)%weight = weight_s
+      end do
+      !$omp end parallel do
+
     class default
       write(*,*) "ERROR: the 'equilibrium' RE initialization requires"
-      write(*,*) "       type = 'particle_kinetic_relativistic'"
+      write(*,*) "       type = 'particle_kinetic_relativistic' or"
+      write(*,*) "       type = 'particle_gc_relativistic'"
       stop 1
     end select
 
@@ -776,7 +812,7 @@ subroutine equilibrium_initialization(sim, group_num, rng)
   !     I_unit = sum_p w_p q e v_phi,p / (2 pi R_p), and rescale all weights
   !     by I_RE / I_unit
   I_loc = 0.d0
-  me_kg = sim%groups(group_num)%mass * ATOMIC_MASS_UNIT
+  me_kg = mass_amu * ATOMIC_MASS_UNIT
   select type (particles => sim%groups(group_num)%particles)
   type is (particle_kinetic_relativistic)
     do j = 1, n_local
@@ -788,6 +824,29 @@ subroutine equilibrium_initialization(sim, group_num, rng)
       p_phi_c = -particles(j)%p(1)*sin(phi_p) - particles(j)%p(2)*cos(phi_p)  ! [AMU m/s]
       gam     = sqrt(1.d0 + (norm2(particles(j)%p)*ATOMIC_MASS_UNIT &
                              / (me_kg*SPEED_OF_LIGHT))**2)
+      I_loc   = I_loc + particles(j)%weight * dble(particles(j)%q) * EL_CHG   &
+                * (p_phi_c*ATOMIC_MASS_UNIT / (gam*me_kg))                    &
+                / (TWOPI * particles(j)%x(1))
+    enddo
+
+  type is (particle_gc_relativistic)
+    ! Same measurement for a guiding-centre marker, whose only momentum is
+    ! p_par along bhat: project bhat on e_phi using the IDENTICAL convention
+    ! as above, so no new sign assumption enters.
+    !   gamma = sqrt(1 + (p_par/mc)^2 + 2|B|mu/(mc^2))   [mod_gc_relativistic:817]
+    ! The drift velocity is deliberately not included: it is predominantly
+    ! poloidal, and the equilibrium's own j_phi is the parallel current
+    ! projected toroidally, so this matches what the field was built from.
+    do j = 1, n_local
+      phi_p = particles(j)%x(3)
+      call sim%fields%calc_EBpsiU(sim%time, particles(j)%i_elm, particles(j)%st, &
+                                  particles(j)%x(3), E_fld, B_fld, psi, U)
+      B_cart  = vector_cylindrical_to_cartesian(particles(j)%x(3), B_fld)
+      p_phi_c = particles(j)%p(1)                                              &
+                * (-B_cart(1)*sin(phi_p) - B_cart(2)*cos(phi_p)) / norm2(B_cart)
+      gam     = sqrt(1.d0 + (particles(j)%p(1)/(mass_amu*SPEED_OF_LIGHT))**2   &
+                     + 2.d0*norm2(B_fld)*particles(j)%p(2)                     &
+                       / (mass_amu*SPEED_OF_LIGHT**2))
       I_loc   = I_loc + particles(j)%weight * dble(particles(j)%q) * EL_CHG   &
                 * (p_phi_c*ATOMIC_MASS_UNIT / (gam*me_kg))                    &
                 / (TWOPI * particles(j)%x(1))
@@ -810,6 +869,10 @@ subroutine equilibrium_initialization(sim, group_num, rng)
 
   select type (particles => sim%groups(group_num)%particles)
   type is (particle_kinetic_relativistic)
+    do j = 1, n_local
+      particles(j)%weight = particles(j)%weight * w_factor
+    enddo
+  type is (particle_gc_relativistic)
     do j = 1, n_local
       particles(j)%weight = particles(j)%weight * w_factor
     enddo
