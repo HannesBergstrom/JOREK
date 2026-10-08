@@ -630,11 +630,12 @@ end subroutine re_eq_spectrum_classes
 
 subroutine re_eq_read_distribution(my_id)
   use tr_module
+  use phys_module, only: F0
   implicit none
   integer, intent(in) :: my_id
   integer, parameter  :: max_classes = 10000
   integer :: iunit, ierr, n, ipos, s, n_bad
-  real*8  :: cols(3), wsum, mec2_eV, cw_tot, cw_bad, cw_s
+  real*8  :: cols(3), wsum, mec2_eV, cw_tot, cw_bad, cw_s, sgn_F0
   real*8  :: tmp_e(max_classes), tmp_xi(max_classes), tmp_w(max_classes)
   character(len=512) :: line
 
@@ -720,10 +721,41 @@ subroutine re_eq_read_distribution(my_id)
     endif
   enddo
 
+  ! --- Derived per-class quantities.
+  !
+  !     SIGN OF F0. The input pitch xi = p_par/p is defined relative to the
+  !     MAGNETIC FIELD, but everywhere downstream re_cl_vpar is used as a
+  !     TOROIDAL quantity:
+  !        j_phi = -e sum_s v_par,s n_s           (re_eq_source, re_eq_total_current)
+  !        A_s/e = alpha_s R - psi,  alpha_s = gamma m v_par,s / e
+  !     the latter being the canonical toroidal momentum, which is built from
+  !     the toroidal velocity v_phi, not from v_par. For a strongly passing RE
+  !        v_phi = xi v (bhat . e_phi) ~ xi v sign(F0),
+  !     since |B_phi| >> |B_pol| and B_phi = F0/R. So the conversion from the
+  !     field-aligned pitch to the toroidal velocity carries sign(F0).
+  !
+  !     Without this factor the module is only correct for F0 > 0 -- which is
+  !     every case validated so far (HANDOFF Sec. 3: "F0>0, xi=-0.99 ->
+  !     j_phi>0 -> q>0, I_RE>0"). With F0 < 0 it disagreed with the MARKER
+  !     LOADER, which builds p = p_par * Bhat + ... and projects that onto
+  !     e_phi, so the marker current follows B and does depend on sign(F0).
+  !     The two then describe opposite current directions; the symptom is a
+  !     negative w_factor = I_RE/I_unit in the loader, i.e. negative marker
+  !     weights.
+  !
+  !     sgn_F0 = +1 leaves every F0 > 0 result BIT-IDENTICAL.
+  sgn_F0 = sign(1.d0, F0)
+  if ((my_id .eq. 0) .and. (sgn_F0 .lt. 0.d0)) then
+    write(*,'(A)') ' re_eq: F0 < 0 -- the field-aligned pitch xi is converted to'
+    write(*,'(A)') '        the toroidal velocity with sign(F0), so a given xi'
+    write(*,'(A)') '        drives the OPPOSITE toroidal current to the F0 > 0 case.'
+  endif
+
   mec2_eV = MASS_ELECTRON * SPEED_OF_LIGHT**2 / EL_CHG
   do s = 1, n
     re_cl_gamma(s) = 1.d0 + re_cl_ekin(s) / mec2_eV
-    re_cl_vpar(s)  = re_cl_xi(s) * SPEED_OF_LIGHT &
+    ! toroidal velocity component: field-aligned pitch projected on e_phi
+    re_cl_vpar(s)  = sgn_F0 * re_cl_xi(s) * SPEED_OF_LIGHT &
                      * sqrt(1.d0 - 1.d0/re_cl_gamma(s)**2)
     re_cl_alpha(s) = re_cl_gamma(s) * MASS_ELECTRON * re_cl_vpar(s) / EL_CHG
   enddo
