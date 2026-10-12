@@ -688,7 +688,20 @@ subroutine equilibrium_initialization(sim, group_num, rng)
     ! local slice of this population
     i_lo = max(pop_glob_lo(s-1) + 1, i_glob_lo + 1)          - i_glob_lo
     i_hi = min(pop_glob_lo(s),       i_glob_lo + n_local)    - i_glob_lo
-    if (i_lo .gt. i_hi) cycle
+    ! EVERY rank must reach the initialise_particles call below for EVERY
+    ! population: it contains a COLLECTIVE MPI_Bcast of the random seed
+    ! (initialisers_base.f90:177). Populations are contiguous blocks of the
+    ! GLOBAL marker index, so a rank whose local range misses this population
+    ! would skip that Bcast while the others block in it -- a deadlock that
+    ! only appears for n_mpi > 1 and is invisible on a single task.
+    ! Such a rank therefore passes a zero-length slice instead of cycling.
+    ! Everything downstream (the allocate, the draw loops, the OpenMP loop)
+    ! is a no-op on a zero-length range.
+    ! (The n_in_class <= 0 test above is computed from the global partition,
+    !  so it is identical on all ranks and may cycle safely.)
+    if (i_lo .gt. i_hi) then
+      i_lo = 1;  i_hi = 0                 ! guaranteed-valid empty section
+    endif
 
     ! --- positions: rejection sampling from Nprof(Ahat)/R
     req_sup_pdf = maxval(req_nprof) / R_min
