@@ -1636,6 +1636,39 @@ subroutine re_eq_rescale_current(my_id, node_list, element_list)
   type (type_element_list), intent(in) :: element_list
   real*8 :: I_now
   call re_eq_total_current(my_id, node_list, element_list, I_now)
+
+  ! --- sign-consistency guard, the EARLY counterpart of the q-vs-q_t outcome
+  !     check in re_eq_outer_update. Rescaling by a NEGATIVE factor is never a
+  !     valid repair, and it fails SILENTLY: it puts |I_RE| exactly on target
+  !     and leaves the source term (the PRODUCT v_par * N), and hence psi and
+  !     q, completely correct -- so the first outer iteration converges
+  !     normally and logs the right I_RE -- while Nprof is now negative
+  !     everywhere. The positivity floor at the end of re_eq_operator_update
+  !     then clips the whole table to zero in a single step, after which
+  !     I_now = 0 pins it there for good (the abs(I_now) test below can no
+  !     longer recover), the source vanishes, and every later inner Picard
+  !     solve runs to its iteration limit. The outer update's outcome check
+  !     cannot catch it either, precisely because with Nprof flipped the sign
+  !     of q comes out right. So it has to be caught here, on the spot.
+  if (re_eq_I_RE * I_now .lt. 0.d0) then
+    if (my_id .eq. 0) then
+      write(*,*) 'ERROR: re_eq: the RE current carried by the distribution has'
+      write(*,*) '       the OPPOSITE sign to the requested re_eq_I_RE, so the'
+      write(*,*) '       target cannot be reached by rescaling Nprof (which'
+      write(*,*) '       must stay positive -- it is a particle number).'
+      write(*,*) '       The current direction is set by'
+      write(*,*) '         sign(j_phi) = -sign(xi) * sign(F0),'
+      write(*,*) '       i.e. by BOTH the RE pitch xi in the distribution and'
+      write(*,*) '       the sign of F0 -- so the required xi depends on the'
+      write(*,*) '       sign of F0. Flip whichever is physically correct for'
+      write(*,*) '       your scenario: the pitch xi in the distribution, the'
+      write(*,*) '       sign of re_eq_I_RE, or the sign of F0.'
+      write(*,'(A,ES12.4,A,ES12.4,A)') '        (re_eq_I_RE = ', re_eq_I_RE, &
+        ', current carried by the distribution = ', I_now, ')'
+    endif
+    stop 1
+  endif
+
   if (abs(I_now) .gt. 0.d0) then
     re_nprof = re_nprof * (re_eq_I_RE / I_now)
   endif
