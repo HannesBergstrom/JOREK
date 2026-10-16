@@ -1947,7 +1947,10 @@ module mod_expression
               !     model600/mod_elt_matrix_fft.f90 -- so currdens_re is the
               !     exact per-point analogue of currdens above and the two may
               !     be differenced directly. P_par/P_perp take the same
-              !     1/mu_zero factor as J (see fact_mu_zero).
+              !     1/mu_zero factor as J (see fact_mu_zero), and additionally
+              !     have the deposition's R / R^2 normalization removed, so
+              !     these report the PHYSICAL pressures -- matching what
+              !     mod_elt_matrix_fft reconstructs for the force term.
               case ( 'currdens_re' )
                 i_rep = rep_slot(expr_rep_jphi_idx, j_Phi_idx_kin)
                 if ( i_rep .gt. 0 ) then
@@ -1960,7 +1963,7 @@ module mod_expression
               case ( 'P_par_re' )
                 i_rep = rep_slot(expr_rep_ppar_idx, P_par_idx_kin)
                 if ( i_rep .gt. 0 ) then
-                  res = aux(i_rep) / fact_mu_zero
+                  res = aux(i_rep) / R / fact_mu_zero
                 else
                   call warn_rep_unresolved('P_par_re')
                   res = 0.d0
@@ -1969,7 +1972,7 @@ module mod_expression
               case ( 'P_perp_re' )
                 i_rep = rep_slot(expr_rep_pperp_idx, P_perp_idx_kin)
                 if ( i_rep .gt. 0 ) then
-                  res = aux(i_rep) / fact_mu_zero
+                  res = aux(i_rep) / R**2 / fact_mu_zero
                 else
                   call warn_rep_unresolved('P_perp_re')
                   res = 0.d0

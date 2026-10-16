@@ -734,8 +734,19 @@ do i=1,n_vertex_max
 
           !> kinetic runaway electrons 
           if (use_rep) then !> kinetic RE pressure coupling scheme
-            aux_P_par_re      = ( - x_t(ms,mt) * eq_aux_s(mp,P_par_idx_kin,ms,mt) + x_s(ms,mt) * eq_aux_t(mp,P_par_idx_kin,ms,mt) ) / xjac
-            aux_P_perp_re     = ( - x_t(ms,mt) * eq_aux_s(mp,P_perp_idx_kin,ms,mt) + x_s(ms,mt) * eq_aux_t(mp,P_perp_idx_kin,ms,mt) ) / xjac
+            !> The 'rep' scheme deposits R*P_par and R^2*P_perp, not P_par and
+            !> P_perp, so that the parallel projection filter smooths a quantity
+            !> that really is constant on a flux surface (see the derivation in
+            !> mod_particle_evolution:evolve_REs). Undo the normalisation here,
+            !> leaving aux_P_*_re with their original meaning -- dP/dZ of the
+            !> PHYSICAL pressure -- so the force term below is untouched.
+            !>
+            !> Dividing after the derivative is exact, not an approximation: the
+            !> combination taken here is d/dZ (the '_y' pattern, cf. ps0_y), and
+            !> R is independent of Z, so 1/R^n passes straight through with no
+            !> chain-rule term. Were this a d/dR term it would need one.
+            aux_P_par_re      = ( - x_t(ms,mt) * eq_aux_s(mp,P_par_idx_kin,ms,mt) + x_s(ms,mt) * eq_aux_t(mp,P_par_idx_kin,ms,mt) ) / xjac / BigR
+            aux_P_perp_re     = ( - x_t(ms,mt) * eq_aux_s(mp,P_perp_idx_kin,ms,mt) + x_s(ms,mt) * eq_aux_t(mp,P_perp_idx_kin,ms,mt) ) / xjac / BigR**2
             aux_jre           = eq_aux_g(mp,j_Phi_idx_kin,ms,mt)
             if (keep_current_prof) then
               aux_jre_ind = 0.d0

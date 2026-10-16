@@ -142,6 +142,7 @@ contains
 
   subroutine evolve_REs(sim, group_num, feedback_rhs, rng, tstep_part_adj, nstep_part_adj)
     use mod_project_particles
+    use equil_info, only: ES
     use mod_random_seed
     use mod_interp, only: mode_moivre
     use mod_basisfunctions
@@ -167,10 +168,40 @@ contains
     real*8    :: E(3), B(3), B_norm2(3), psi, U
     real*8    :: cylindrical_velocity(3), cylindrical_momentum(3)
     real*8    :: v_par, v_perp, gamma_m, proj_factor
-    integer   :: j, k, m, n, ifail, i_tor, n_lost
+    integer   :: j, k, m, n, ifail, i_tor, n_lost, ierr
+
+    !> --- Pitch diagnostics for the projection normalisation -----------------
+    !> R*P_par and R^2*P_perp are constant on a flux surface only while the
+    !> markers are strongly passing: both rest on p_par ~ p, and both diverge
+    !> at the trapped-passing boundary, where the underlying n*v_par/B = const
+    !> streaming assumption fails too. These accumulators measure how far the
+    !> actual marker population sits from that limit, so the assumption is a
+    !> printed number rather than a belief. Ratios only, so the per-substep
+    !> double counting (and the 1/nstep_part_adj applied to the deposit by the
+    !> caller) cancels and needs no normalisation here.
+    real*8    :: d_w_all,  d_w_trap        !< marker count, all / trapped
+    real*8    :: d_j_all,  d_j_trap        !< |j_phi| weight,  all / trapped
+    real*8    :: d_p_all,  d_p_trap        !< P_par   weight,  all / trapped
+    real*8    :: d_xi_j                    !< |j|-weighted sum of |xi|
+    real*8    :: d_err_j                   !< |j|-weighted sum of the R-normalisation error
+    real*8    :: d_xi_min                  !< smallest |xi| carried by any marker
+    real*8    :: d_w_all_a, d_w_trap_a, d_j_all_a, d_j_trap_a
+    real*8    :: d_p_all_a, d_p_trap_a, d_xi_j_a, d_err_j_a, d_xi_min_a
+    real*8    :: xi_loc, x_loc, lam_loc, r_est, R_in, jw, pw
+    real*8    :: R_ax_diag, Z_ax_diag
 
     n_norm   = CENTRAL_DENSITY * 1.d20                              ! (number) density normalisation
     rho_norm = CENTRAL_MASS * ATOMIC_MASS_UNIT * n_norm                  ! rho_SI = rho_norm * rho
+
+    !> The circular-surface surrogate below needs the magnetic axis. Copied out
+    !> of ES once, so the OpenMP region shares two plain scalars rather than a
+    !> derived type.
+    R_ax_diag = ES%R_axis
+    Z_ax_diag = ES%Z_axis
+
+    d_w_all = 0.d0;  d_w_trap = 0.d0;  d_j_all = 0.d0;  d_j_trap = 0.d0
+    d_p_all = 0.d0;  d_p_trap = 0.d0;  d_xi_j  = 0.d0;  d_err_j  = 0.d0
+    d_xi_min = 1.d0
 
     ! Loop over all particle groups
     n_lost = 0
@@ -185,10 +216,15 @@ contains
       !$omp schedule(runtime)         &
       !$omp private(j, k, m, n, HZ, HH, HH_s, HH_t, E, B, psi, U,  &
       !$omp B_norm2, proj_factor, v_Ppar, v_Pperp, v_jPhi, i_tor, ifail, &
-      !$omp cylindrical_velocity, cylindrical_momentum, v_par, v_perp, gamma_m ) &
+      !$omp cylindrical_velocity, cylindrical_momentum, v_par, v_perp, gamma_m, &
+      !$omp xi_loc, x_loc, lam_loc, r_est, R_in, jw, pw ) &
       !$omp shared (nstep_part_adj, tstep_part_adj, sim, group_num, rho_norm, &
+      !$omp R_ax_diag, Z_ax_diag, &
       !$omp P_par_idx_kin, P_perp_idx_kin, j_phi_idx_kin) &
-      !$omp reduction(+:feedback_rhs)
+      !$omp reduction(+:feedback_rhs) &
+      !$omp reduction(+:d_w_all, d_w_trap, d_j_all, d_j_trap) &
+      !$omp reduction(+:d_p_all, d_p_trap, d_xi_j, d_err_j) &
+      !$omp reduction(min:d_xi_min)
   
       do j=1,size(particles,1)
         do k=1,nstep_part_adj
@@ -209,16 +245,78 @@ contains
           v_par   = dot_product(cylindrical_velocity, B_norm2)
           v_perp  = norm2(cylindrical_velocity - v_par * B_norm2)
           gamma_m = sqrt(MASS_ELECTRON**2 + dot_product(cylindrical_momentum,cylindrical_momentum)*ATOMIC_MASS_UNIT**2/SPEED_OF_LIGHT**2)
-  
+
+          !> --- pitch diagnostics for the R / R^2 projection normalisation ---
+          !> Tested on the marker's OWN position, which is what makes the test
+          !> exact: p_perp^2 ~ B ~ 1/R, so p_perp^2 at the inboard extremum is
+          !> p_perp^2(R) * R/R_in, and the marker is trapped iff that exceeds
+          !> p^2, i.e. iff lam_loc*x_loc >= 1. The same ratio gives the
+          !> variation of R*P_par (and, inverted, of R^2*P_perp) over the
+          !> surface, which is the error the normalisation leaves behind.
+          !>
+          !> R_in comes from a circular surface concentric with the magnetic
+          !> axis and |B| ~ F0/R: an estimate, not the true surface extremum,
+          !> and it ignores B_pol. Good to O(shaping) and O((B_pol/B_tor)^2),
+          !> which is ample for deciding whether a population is anywhere near
+          !> the trapping boundary. Markers whose surrogate surface would reach
+          !> the axis or beyond (r_est >= R_axis) cannot be classified; they get
+          !> lam_loc = huge and so count as trapped, the conservative direction,
+          !> unless they are exactly field-aligned (x_loc = 0), which is never
+          !> trapped anyway. x_loc is clamped to [0,1], so huge*x_loc cannot
+          !> overflow.
+          jw     = abs(particles(j)%weight * cylindrical_velocity(3) * particles(j)%x(1))
+          pw     =     particles(j)%weight * gamma_m * v_par**2      * particles(j)%x(1)
+          xi_loc = abs(v_par) / max(norm2(cylindrical_velocity), tiny(1.d0))
+          x_loc  = min(max(1.d0 - xi_loc*xi_loc, 0.d0), 1.d0)
+          r_est  = sqrt((particles(j)%x(1) - R_ax_diag)**2 + (particles(j)%x(2) - Z_ax_diag)**2)
+          R_in   = R_ax_diag - r_est
+          if (R_in .gt. 0.d0) then
+            lam_loc = particles(j)%x(1) / R_in
+          else
+            lam_loc = huge(1.d0)
+          endif
+
+          d_w_all  = d_w_all  + 1.d0
+          d_j_all  = d_j_all  + jw
+          d_p_all  = d_p_all  + pw
+          d_xi_j   = d_xi_j   + jw * xi_loc
+          d_xi_min = min(d_xi_min, xi_loc)
+          if (lam_loc * x_loc .ge. 1.d0) then
+            d_w_trap = d_w_trap + 1.d0
+            d_j_trap = d_j_trap + jw
+            d_p_trap = d_p_trap + pw
+          else
+            d_err_j = d_err_j + jw * (sqrt((1.d0 - x_loc)/(1.d0 - lam_loc*x_loc)) - 1.d0)
+          endif
+
           do n=1,n_degrees
             do m=1,n_vertex_max
   
               proj_factor = HH(m,n) * sim%fields%element_list%element(particles(j)%i_elm)%size(m,n) * particles(j)%weight
   
 
-              ! PCS for REs
-              v_Ppar  = proj_factor * gamma_m * v_par**2 * MU_ZERO
-              v_Pperp = proj_factor * gamma_m * v_perp**2 / 2.d0 * MU_ZERO
+              ! PCS for REs.
+              !
+              ! All three moments carry the power of R that makes them constant
+              ! on a flux surface for drift-free parallel streaming, so that the
+              ! parallel projection filter -- which penalises (B.grad p)^2 and
+              ! therefore drives the deposited variable towards constant ALONG
+              ! the field -- smooths towards the physically correct answer
+              ! instead of fighting it. With K = n*v_par/B constant along a
+              ! field line, gamma conserved and mu = p_perp^2/(2 m0 B) conserved,
+              !
+              !   j_phi = -e K B_phi        -> R*j_phi   = -e K F   (exact)
+              !   P_par = K B p_par         -> R*P_par   ~ const
+              !   P_perp= K B p_perp^2/2p_par -> R^2*P_perp ~ const
+              !
+              ! P_perp takes the extra power because p_perp^2 = 2 m0 mu B is
+              ! ITSELF proportional to B (the mirror force), while P_par's
+              ! integrand is not. Both forms are accurate to O(1-xi^2), i.e.
+              ! they share the single strongly-passing assumption and both fail
+              ! at the trapped-passing boundary -- see the pitch diagnostics
+              ! below, which report how far the markers sit from that limit.
+              v_Ppar  = proj_factor * gamma_m * v_par**2 * MU_ZERO * particles(j)%x(1)
+              v_Pperp = proj_factor * gamma_m * v_perp**2 / 2.d0 * MU_ZERO * particles(j)%x(1)**2
   
               v_jPhi  = - proj_factor * real(particles(j)%q, 8) * EL_CHG * cylindrical_velocity(3) * particles(j)%x(1) * MU_ZERO
               
@@ -245,6 +343,37 @@ contains
       !$omp end parallel do 
   
     end select
+
+    !> ===================== PITCH DIAGNOSTICS (rep) =========================
+    !> Reported as fractions, so the per-substep accumulation above cancels.
+    call MPI_REDUCE(d_w_all,  d_w_all_a,  1, MPI_DOUBLE_PRECISION, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
+    call MPI_REDUCE(d_w_trap, d_w_trap_a, 1, MPI_DOUBLE_PRECISION, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
+    call MPI_REDUCE(d_j_all,  d_j_all_a,  1, MPI_DOUBLE_PRECISION, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
+    call MPI_REDUCE(d_j_trap, d_j_trap_a, 1, MPI_DOUBLE_PRECISION, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
+    call MPI_REDUCE(d_p_all,  d_p_all_a,  1, MPI_DOUBLE_PRECISION, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
+    call MPI_REDUCE(d_p_trap, d_p_trap_a, 1, MPI_DOUBLE_PRECISION, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
+    call MPI_REDUCE(d_xi_j,   d_xi_j_a,   1, MPI_DOUBLE_PRECISION, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
+    call MPI_REDUCE(d_err_j,  d_err_j_a,  1, MPI_DOUBLE_PRECISION, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
+    call MPI_REDUCE(d_xi_min, d_xi_min_a, 1, MPI_DOUBLE_PRECISION, MPI_MIN, 0, MPI_COMM_WORLD, ierr)
+
+    if ((sim%my_id .eq. 0) .and. (d_w_all_a .gt. 0.d0) .and. (d_j_all_a .gt. 0.d0)) then
+      write(*,*) '----- RE projection pitch diagnostics -----'
+      write(*,'(A46,ES14.6,A,F8.4)') ' min |xi| / <|xi|> weighted by |j_phi|: ', &
+        d_xi_min_a, '  ', d_xi_j_a / d_j_all_a
+      write(*,'(A46,F9.4,A)') ' markers past the trapped-passing boundary: ', &
+        1.d2 * d_w_trap_a / d_w_all_a, ' %'
+      write(*,'(A46,F9.4,A)') ' ... carrying this share of |j_phi|: ',  &
+        1.d2 * d_j_trap_a / d_j_all_a, ' %'
+      if (abs(d_p_all_a) .gt. 0.d0) &
+        write(*,'(A46,F9.4,A)') ' ... carrying this share of P_par: ', &
+          1.d2 * d_p_trap_a / d_p_all_a, ' %'
+      write(*,'(A46,F9.4,A)') ' R-normalisation error (passing, |j|-wtd): ', &
+        1.d2 * d_err_j_a / d_j_all_a, ' %'
+      !> The last line is the variation of R*P_par over a flux surface that the
+      !> normalisation does not remove, i.e. the residual the parallel filter
+      !> will flatten away. It scales with filter_par_n0, so if it is large the
+      !> filter strength is the knob to reach for, not the normalisation.
+    endif
     
   end subroutine evolve_REs
 
