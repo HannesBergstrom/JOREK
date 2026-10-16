@@ -823,6 +823,11 @@ module exec_commands
   subroutine load_namelist(command, ierr)
     
     use phys_module     
+    use mod_particle_group_id, only: generate_part_groups_in_use, match_part_groups_and_configs
+    use mod_coupling_settings, only: check_compatibility_and_determine_coupling_schemes,          &
+                                     determine_coupling_variables
+    use coupling_variables,    only: P_par_idx_kin, P_perp_idx_kin, j_Phi_idx_kin
+    use mod_expression,        only: expr_rep_ppar_idx, expr_rep_pperp_idx, expr_rep_jphi_idx
     ! --- Routine parameters
     type(type_command), intent(in)  :: command     !< Command to be executed
     integer,            intent(out) :: ierr        !< Error flag
@@ -830,6 +835,7 @@ module exec_commands
     ! --- Local variables
     character(len=1024) ::  filename
     logical             ::  file_exists
+    integer             ::  n_aux_var_keep
     
     ierr = 0
     
@@ -844,6 +850,28 @@ module exec_commands
       call initialise_parameters(0, filename)
       input_loaded = .true.
       input_file   = filename
+
+      ! --- Resolve which aux_node_list slot holds which particle projection,
+      !     so expressions such as currdens_re can find the RE current. A
+      !     restart file records n_aux_var but not the variable layout, so the
+      !     only source of truth is the namelist -- and we walk exactly the
+      !     path initialise_and_broadcast_parameters uses, rather than
+      !     reproducing the ordering here and letting the two drift apart.
+      !     n_aux_var is restored afterwards because import_hdf5_restart reads
+      !     it from the file only while it is still 0, and the file's value
+      !     must stay authoritative for the data actually being read.
+      if ( part_group_configs(1)%coupling_scheme /= 'non' ) then
+        n_aux_var_keep = n_aux_var
+        if ( part_groups_in_use(1) == 'non' ) call generate_part_groups_in_use()
+        n_part_groups = count(part_groups_in_use /= 'non')
+        call match_part_groups_and_configs()
+        call check_compatibility_and_determine_coupling_schemes()
+        call determine_coupling_variables()
+        n_aux_var = n_aux_var_keep
+        expr_rep_ppar_idx  = P_par_idx_kin
+        expr_rep_pperp_idx = P_perp_idx_kin
+        expr_rep_jphi_idx  = j_Phi_idx_kin
+      end if
     else
       ierr = 1
       write(*,*) 'ERROR: input file "', trim(filename), '" does not exist.'

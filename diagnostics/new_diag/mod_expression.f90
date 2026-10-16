@@ -26,6 +26,7 @@ module mod_expression
   use mod_impurity, only: radiation_function, radiation_function_linear
   use mod_atomic_coeff_deuterium, only : atomic_coeff_deuterium
   use mod_plasma_functions
+  use coupling_variables, only: P_par_idx_kin, P_perp_idx_kin, j_Phi_idx_kin
 
   implicit none
   
@@ -46,6 +47,9 @@ module mod_expression
   integer,           parameter, private :: LEN_DESCR     = 54
   integer,           parameter, private :: LEN_DOMAIN    = 12
   integer,           parameter, private :: N_EXPR_MAX    = 2000
+  !> Dimension of the local aux() array in eval_expr holding the particle
+  !! projections read from the aux_node_list. Keep the two in step.
+  integer,           parameter, private :: LEN_AUX       = 20
   !   --- Constants selecting a unit system for expression output
   integer,           parameter          :: JOREK_UNITS   = 0 !< Output expressions in JOREK units
   integer,           parameter          :: SI_UNITS      = 1 !< Output expressions in SI units
@@ -61,6 +65,19 @@ module mod_expression
   !> Coordinate expressions evaluate to this value for positions outside the JOREK domain.
   !! This value may be changed by programs using the new_diag package!
   real*8, save :: expr_outside_coord = 0.d0
+  !> Whether the "rep" projections have already been reported as unresolved.
+  logical, save, private :: rep_warned = .false.
+  !> Aux-node-list slots of the 'rep' (runaway-electron) coupling projections,
+  !! for the currdens_re / P_par_re / P_perp_re expressions.
+  !!
+  !! Inside a JOREK run these come straight from coupling_variables, which the
+  !! coupling setup has already filled. A stand-alone tool (jorek2_postproc)
+  !! has to resolve them from the input namelist and set these overrides,
+  !! because a restart file records n_aux_var but NOT which projection sits in
+  !! which slot. 0 means "use the value from coupling_variables".
+  integer, save :: expr_rep_ppar_idx  = 0
+  integer, save :: expr_rep_pperp_idx = 0
+  integer, save :: expr_rep_jphi_idx  = 0
   
   
   
@@ -127,6 +144,9 @@ module mod_expression
     call add(exprs_all, 'qpar_tot    ', 'Total parallel heat-flux (conduc + convec + kin)      ')
     call add(exprs_all, 'zj          ', 'Toroidal Current Density Multiplied by 1/R            ')
     call add(exprs_all, 'currdens    ', 'Physical Toroidal Current Density (== zj/R)           ')
+    call add(exprs_all, 'currdens_re ', 'RE Toroidal Current Density (rep; cf currdens)        ')
+    call add(exprs_all, 'P_par_re    ', 'RE parallel      dynamic pressure (rep coupling)      ')
+    call add(exprs_all, 'P_perp_re   ', 'RE perpendicular dynamic pressure (rep coupling)      ')
     call add(exprs_all, 'JR          ', 'Physical current density (R component)                ')
     call add(exprs_all, 'JZ          ', 'Physical current density (Z component)                ')
     call add(exprs_all, 'Jtor        ', 'Physical current density (phi component)              ')
@@ -563,6 +583,41 @@ module mod_expression
   
   
   
+  !> Effective aux_node_list slot of a 'rep' coupling projection: the override
+  !! a stand-alone tool resolved from the namelist when it is set, otherwise
+  !! the index the running simulation assigned. Returns 0 when the projection
+  !! is not available, so callers can say so rather than report a silent zero.
+  !! The upper bound is the dimension of the local aux() array in eval_expr,
+  !! which is only filled for slots 1..n_var.
+  integer function rep_slot(override, idx_in_run)
+    integer, intent(in) :: override, idx_in_run
+    rep_slot = idx_in_run
+    if ( override .gt. 0 ) rep_slot = override
+    if ( (rep_slot .lt. 1) .or. (rep_slot .gt. min(n_var, LEN_AUX)) ) rep_slot = 0
+  end function rep_slot
+  
+  
+  
+  
+  
+  !> Complain once if an RE expression was requested but its aux slot could not
+  !! be resolved. Without this the expression would quietly evaluate to zero,
+  !! which looks exactly like "no runaway current here".
+  subroutine warn_rep_unresolved(name)
+    character(len=*), intent(in) :: name
+    if ( rep_warned ) return
+    rep_warned = .true.
+    write(*,*) 'WARNING: '//trim(name)//': the aux_node_list slot of the "rep" '
+    write(*,*) '         coupling projections is unknown, the expression is 0.'
+    write(*,*) '         A restart file stores n_aux_var but not the variable'
+    write(*,*) '         layout, so in jorek2_postproc the input namelist must'
+    write(*,*) '         be loaded first:  namelist <your input file>'
+  end subroutine warn_rep_unresolved
+  
+  
+  
+  
+  
   !> Evaluate one/several expressions at one/several poloidal and one/several toroidal positions.
   subroutine eval_expr(eq, units, expr_list, pol_pos_list, tor_pos_list, result, ierr, flux_av, only_n0)
     use nodes_elements, only: aux_node_list
@@ -586,7 +641,7 @@ module mod_expression
     type(type_element)       :: element
     type(type_node)          :: nodes(n_vertex_max)
     type(type_node)          :: aux_nodes(n_vertex_max)
-    integer :: ipolpos, jpolpos, itorpos, iexpr, ielm, i, j, k, i_tor, n
+    integer :: ipolpos, jpolpos, itorpos, iexpr, ielm, i, j, k, i_tor, n, i_rep
     real*8  :: xjac, xjac_R, xjac_Z, R, R_s, R_t, R_st, R_ss, R_tt, Z, Z_s, Z_t, Z_st, Z_ss, Z_tt, &
       s, t, H(n_vertex_max,n_degrees), H_s(n_vertex_max,n_degrees), H_t(n_vertex_max,n_degrees),   &
       H_st(n_vertex_max,n_degrees), H_ss(n_vertex_max,n_degrees), H_tt(n_vertex_max,n_degrees),    &
@@ -619,7 +674,7 @@ module mod_expression
     real*8 :: FFprime_loc, Jpol, JpolR, JpolZ, Btot, Jpar, Jpar_ionsat, fact_jsat, Bnorm, Btan, Jtor
     real*8 :: p_prime_loc
     real*8 :: nmlR, nmlZ, theta_geo, VR, VZ, V_phi, Vpar_tot, VperpR, VperpZ
-    real*8 :: hh, hh_s, hh_t, hh_ss, hh_tt, hh_st, hhz, hhz_p, hhz_pp, sz, vv(0:n_var), va(n_var), aux(20)
+    real*8 :: hh, hh_s, hh_t, hh_ss, hh_tt, hh_st, hhz, hhz_p, hhz_pp, sz, vv(0:n_var), va(n_var), aux(LEN_AUX)
     real*8 :: delta_g(n_var), delta_s(n_var), delta_t(n_var)
     ! --- Fluxes
     real*8  ::  ZKpar_flux, ZKipar_flux, ZKepar_flux, ZKpar_flux_norm, ZKipar_flux_norm, ZKepar_flux_norm,   &
@@ -969,7 +1024,7 @@ module mod_expression
                 rimp0_pp  = rimp0_pp    + vv(var_rhoimp) * sz * hh    * hhz_pp
 
                 ! --- Particle projections
-                do n = 1, n_var
+                do n = 1, min(n_var, LEN_AUX)
                    aux(n) = aux(n) + va(n) * sz * hh    * hhz
                 end do
 
@@ -1884,6 +1939,41 @@ module mod_expression
                 
               case ( 'currdens' )
                 res = -zj0 / R / fact_mu_zero
+
+              ! --- Runaway-electron projections deposited by the 'rep'
+              !     coupling scheme. The aux variable j_Phi carries the same
+              !     normalization and sign convention as zj0 -- the fluid
+              !     equations use the two together as (zj0 - aux_jre), see
+              !     model600/mod_elt_matrix_fft.f90 -- so currdens_re is the
+              !     exact per-point analogue of currdens above and the two may
+              !     be differenced directly. P_par/P_perp take the same
+              !     1/mu_zero factor as J (see fact_mu_zero).
+              case ( 'currdens_re' )
+                i_rep = rep_slot(expr_rep_jphi_idx, j_Phi_idx_kin)
+                if ( i_rep .gt. 0 ) then
+                  res = -aux(i_rep) / R / fact_mu_zero
+                else
+                  call warn_rep_unresolved('currdens_re')
+                  res = 0.d0
+                endif
+
+              case ( 'P_par_re' )
+                i_rep = rep_slot(expr_rep_ppar_idx, P_par_idx_kin)
+                if ( i_rep .gt. 0 ) then
+                  res = aux(i_rep) / fact_mu_zero
+                else
+                  call warn_rep_unresolved('P_par_re')
+                  res = 0.d0
+                endif
+
+              case ( 'P_perp_re' )
+                i_rep = rep_slot(expr_rep_pperp_idx, P_perp_idx_kin)
+                if ( i_rep .gt. 0 ) then
+                  res = aux(i_rep) / fact_mu_zero
+                else
+                  call warn_rep_unresolved('P_perp_re')
+                  res = 0.d0
+                endif
 
               case ( 'JR' )
                 res = JpolR / fact_mu_zero
