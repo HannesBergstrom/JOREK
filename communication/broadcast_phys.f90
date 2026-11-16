@@ -24,7 +24,8 @@ use mod_re_kinetic_equilibrium, only: re_kinetic_equilibrium, re_eq_dist_file,  
       re_eq_map_mode,                                                             &
       re_eq_I_RE, re_eq_xi_min, re_eq_alpha_out, re_eq_tol_q, re_eq_tol_q_soft,    &
       re_eq_edge_taper, re_eq_l_beam, re_eq_l_beam_width, re_eq_ratio_clamp,       &
-      re_eq_absorbing_edge, re_eq_op_lambda, re_eq_lcfs_a, re_eq_lcfs_kappa,     &
+      re_eq_absorbing_edge, re_eq_op_lambda, re_eq_smooth_len,                    &
+      re_eq_lcfs_a, re_eq_lcfs_kappa,                                             &
       re_eq_max_it_out, re_eq_n_l, re_eq_n_q_levels,             &
       re_eq_finite_pitch,                                                         &
       re_eq_n_alpha, re_eq_av_zeff, re_eq_av_ztot, re_eq_av_e_over_ec,            &
@@ -842,6 +843,7 @@ if (my_id .eq. 0) then
   call MPI_PACK(re_eq_lcfs_a,          1,MPI_REAL8,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(re_eq_lcfs_kappa,      1,MPI_REAL8,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(re_eq_op_lambda,       1,MPI_REAL8,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
+  call MPI_PACK(re_eq_smooth_len,      1,MPI_REAL8,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(re_eq_l_beam_width,     1,MPI_REAL8,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(re_eq_ratio_clamp,      1,MPI_REAL8,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(re_eq_max_it_out,       1,MPI_INTEGER,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
@@ -1865,6 +1867,7 @@ if (my_id .ne. 0) then
   call MPI_UNPACK(buffer,bufsize,position,re_eq_lcfs_a,          1,MPI_REAL8,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,re_eq_lcfs_kappa,      1,MPI_REAL8,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,re_eq_op_lambda,       1,MPI_REAL8,MPI_COMM_WORLD,ierr)
+  call MPI_UNPACK(buffer,bufsize,position,re_eq_smooth_len,      1,MPI_REAL8,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,re_eq_l_beam_width,     1,MPI_REAL8,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,re_eq_ratio_clamp,      1,MPI_REAL8,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,re_eq_max_it_out,       1,MPI_INTEGER,MPI_COMM_WORLD,ierr)

@@ -51,6 +51,7 @@ public :: re_kinetic_equilibrium, re_eq_dist_file, re_eq_dist_format,          &
           re_eq_xi_min, re_eq_alpha_out, re_eq_tol_q, re_eq_tol_q_soft,        &
           re_eq_edge_taper, re_eq_l_beam, re_eq_l_beam_width,                  &
           re_eq_ratio_clamp, re_eq_absorbing_edge, re_eq_op_lambda,             &
+          re_eq_smooth_len,                                                    &
           re_eq_lcfs_a, re_eq_lcfs_kappa,                                      &
           re_eq_max_it_out, re_eq_n_l, re_eq_n_q_levels,                       &
           re_eq_finite_pitch,                                                  &
@@ -197,6 +198,20 @@ real*8             :: re_eq_lcfs_kappa  = -1.d0       !< FREE BOUNDARY ONLY: tar
 real*8             :: re_eq_op_lambda   = 1.d-2       !< smoothness regularization of the 'operator'
                                                       !< transplant variant (damped least squares on the
                                                       !< relative Nprof correction); unused otherwise
+real*8             :: re_eq_smooth_len  = 0.d0        !< smoothing length, in units of the label l, of a
+                                                      !< curvature penalty on the Nprof PROFILE inside the
+                                                      !< q-matching solve (re_eq_op_lambda only penalises
+                                                      !< the per-iteration STEP, so ripple that q cannot
+                                                      !< see is never removed by it). The solve minimises
+                                                      !<   mean (q/q_t - 1)^2 + len^4 * int (n'')^2 dl,
+                                                      !< n = Nprof/max(Nprof): structure of wavelength
+                                                      !< below ~ 2 pi len is suppressed even where q
+                                                      !< resolves it, longer q-invisible structure too.
+                                                      !< Trades q accuracy for smoothness, so the q error
+                                                      !< floors above zero: loosen re_eq_tol_q /
+                                                      !< re_eq_tol_q_soft to what is acceptable.
+                                                      !< Typical 0.01 - 0.03. 0 (default) = off, the
+                                                      !< solve is then unchanged.
 real*8             :: re_eq_ratio_clamp = 2.d0        !< per-iteration clamp of the transplant ratio
 integer            :: re_eq_max_it_out  = 200          !< maximum outer iterations
 integer            :: re_eq_n_l         = 201         !< number of points of the Nprof(l) table
@@ -1985,6 +2000,7 @@ subroutine re_eq_operator_update(node_list, element_list, n_lev, ph_lev, q_lev, 
   real*8  :: L(re_eq_n_l, re_eq_n_l), AtA(re_eq_n_l, re_eq_n_l), Atb(re_eq_n_l)
   real*8  :: sts, bfac, Ms(n_lev), yv(n_lev), s_real(re_eq_n_l)
   real*8  :: u(re_eq_n_l), qt_at, wcon, umin, umax
+  real*8  :: Bs(re_eq_n_l, re_eq_n_l), cs(re_eq_n_l), dl, n_ref, mu_s, nm, n0, np
 
   ! --- realised change of Nprof since the previous residual measurement
   if (.not. allocated(re_eq_N_prev)) allocate(re_eq_N_prev(re_eq_n_l), re_eq_r_prev(n_lev))
@@ -2049,6 +2065,43 @@ subroutine re_eq_operator_update(node_list, element_list, n_lev, ph_lev, q_lev, 
 
   AtA = matmul(transpose(M), M) + re_eq_op_lambda * matmul(transpose(L), L)
   Atb = matmul(transpose(M), rhs)
+
+  ! --- Curvature penalty on the PROFILE (re_eq_smooth_len > 0).
+  !     The L-term above penalises the curvature of the step u only, so its
+  !     fixed point is the unregularised q match and whatever ripple q does
+  !     not see stays in Nprof (there are fewer q levels than table points,
+  !     so such directions always exist). Here the curvature of the UPDATED
+  !     profile n (1 + u), n = Nprof/max(Nprof), is penalised instead:
+  !
+  !       (1/n_good) |M u - r|^2 + len^4 * dl * sum_k [ D (n (1+u)) ]_k^2
+  !
+  !     with D the second difference divided by dl^2, i.e. a discretisation
+  !     of len^4 * int (n'')^2 dl. Both terms are means/integrals, so len
+  !     keeps its meaning when re_eq_n_l or re_eq_n_q_levels change. It is
+  !     linear in u:  D (n (1+u)) = cs + Bs u,  Bs = D diag(n),  cs = D n.
+  !     The fixed point (u = 0) is then the stationary point of the
+  !     regularised objective rather than of the q misfit alone.
+  !     Rows that reach beyond the beam edge are skipped: the raw table is
+  !     zeroed there (re_eq_apply_beam_envelope) and that cut is not
+  !     curvature of the profile.
+  if (re_eq_smooth_len .gt. 0.d0) then
+    n_ref = maxval(re_nprof(1:re_eq_n_l))
+    if (n_ref .gt. 0.d0) then
+      dl   = re_nprof_l(2) - re_nprof_l(1)
+      mu_s = re_eq_smooth_len**4 * dl * real(n_good,8)
+      Bs   = 0.d0;  cs = 0.d0
+      do k = 2, re_eq_n_l - 1
+        if ((re_eq_l_beam .lt. 1.d0) .and. (re_nprof_l(k+1) .gt. re_eq_l_beam)) cycle
+        nm = re_nprof(k-1) / n_ref / dl**2
+        n0 = re_nprof(k)   / n_ref / dl**2
+        np = re_nprof(k+1) / n_ref / dl**2
+        Bs(k,k-1) = nm;  Bs(k,k) = -2.d0*n0;  Bs(k,k+1) = np
+        cs(k)     = nm - 2.d0*n0 + np
+      enddo
+      AtA = AtA + mu_s * matmul(transpose(Bs), Bs)
+      Atb = Atb - mu_s * matmul(transpose(Bs), cs)
+    endif
+  endif
 
   if (re_eq_absorbing_edge) then
     wcon = 1.d3 * max(maxval(abs(M)), 1.d0)
@@ -2524,6 +2577,13 @@ subroutine re_eq_outer_update(my_id, node_list, element_list, n_lev, ph_lev, q_l
         ES%LCFS_kappa, ', target ', re_eq_lcfs_kappa, ')'
   endif
   write(*,'(A,F10.5)') '                q amplitude (achieved/target) = ', c_glob
+  if (re_eq_smooth_len .gt. 0.d0) then
+    write(*,'(A,ES11.3,A,F7.4,A)') '                Nprof roughness   = ', re_eq_nprof_roughness(), &
+      '   (rms n'''', n = Nprof/max; smoothing length ', re_eq_smooth_len, ')'
+  else
+    write(*,'(A,ES11.3,A)') '                Nprof roughness   = ', re_eq_nprof_roughness(), &
+      '   (rms n'''', n = Nprof/max; re_eq_smooth_len = 0, not penalised)'
+  endif
   if (maxval(re_cl_edge_frac) .gt. 2.d-1) &
     write(*,'(A,ES10.2,A)') ' WARNING: re_eq: ', maxval(re_cl_edge_frac), &
       ' of the current of the worst class is carried on the outermost 5% of'  // &
@@ -2988,6 +3048,27 @@ subroutine re_eq_apply_beam_envelope()
     if (re_nprof_l(k) .gt. re_eq_l_beam) re_nprof(k) = 0.d0
   enddo
 end subroutine re_eq_apply_beam_envelope
+
+
+!=======================================================================
+!> Roughness of the Nprof table: sqrt( int (n'')^2 dl ) with
+!> n = Nprof/max(Nprof), over the same rows the re_eq_smooth_len penalty
+!> acts on. Reported every outer iteration so the q-error / smoothness
+!> trade-off of a given re_eq_smooth_len is visible.
+function re_eq_nprof_roughness() result(rough)
+  implicit none
+  real*8  :: rough, n_ref, dl
+  integer :: k
+  rough = 0.d0
+  n_ref = maxval(re_nprof(1:re_eq_n_l))
+  if (n_ref .le. 0.d0) return
+  dl = re_nprof_l(2) - re_nprof_l(1)
+  do k = 2, re_eq_n_l - 1
+    if ((re_eq_l_beam .lt. 1.d0) .and. (re_nprof_l(k+1) .gt. re_eq_l_beam)) cycle
+    rough = rough + ((re_nprof(k-1) - 2.d0*re_nprof(k) + re_nprof(k+1)) / n_ref / dl**2)**2
+  enddo
+  rough = sqrt(rough * dl)
+end function re_eq_nprof_roughness
 
 
 !=======================================================================
