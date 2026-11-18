@@ -161,8 +161,15 @@ logical            :: re_eq_absorbing_edge = .true.   !< force Nprof(Ahat = 1) =
                                                       !< only acts for lraw > 1, and re_eq_nprof_eval
                                                       !< clips to [0,1], so once Nprof(1) = 0 the source
                                                       !< already vanishes at and beyond Ahat = 1.
-real*8             :: re_eq_lcfs_a      = -1.d0       !< FREE BOUNDARY ONLY: target LCFS minor
-                                                      !< radius [m]. When set (> 0) the outer loop
+real*8             :: re_eq_lcfs_a      = -1.d0       !< target LCFS minor radius [m]. Two roles:
+                                                      !< (1) BOTH phases: when set it replaces amin as
+                                                      !< the plasma length scale of the solver (initial
+                                                      !< Nprof guess, drift-axis fit radius, printed
+                                                      !< d_s) -- with an R_Z_psi_bnd_file amin scales
+                                                      !< the DOMAIN boundary, not the plasma; see
+                                                      !< re_eq_a_scale.
+                                                      !< (2) FREE BOUNDARY ONLY, size target: when set
+                                                      !< (> 0) the outer loop
                                                       !< trims R_axis_ref until the measured LCFS_a
                                                       !< reaches it, so the beam has the same size
                                                       !< -- and hence the same q profile -- at any
@@ -365,7 +372,7 @@ contains
 !> Read the input tables, build the classes, write the startup log.
 !> Called once (my_id == 0) at the beginning of the equilibrium solve.
 subroutine re_eq_init(my_id)
-  use phys_module, only: F0, R_geo, amin, FF_coef, T_coef, num_ffprime, num_T
+  use phys_module, only: F0, R_geo, FF_coef, T_coef, num_ffprime, num_T
   implicit none
   integer, intent(in) :: my_id
   integer :: s
@@ -435,9 +442,15 @@ subroutine re_eq_init(my_id)
     write(*,'(A)')      '   absorbing edge       : ON  (Nprof(Ahat=1) = 0;'
     write(*,'(A)')      '                          re_eq_edge_taper has no effect)'
   endif
+  if (re_eq_lcfs_a .gt. 0.d0) then
+    write(*,'(A,F9.5,A)') '   plasma radius scale  : ', re_eq_a_scale(), ' m (re_eq_lcfs_a)'
+  else
+    write(*,'(A,F9.5,A)') '   plasma radius scale  : ', re_eq_a_scale(), ' m (amin; set re_eq_lcfs_a'
+    write(*,'(A)')        '                          if amin scales a domain boundary file)'
+  endif
   write(*,*) '    s    E_kin[eV]      xi        weight     gamma      v_par[m/s]     d_s'
   do s = 1, re_eq_n_class
-    d_s = re_cl_alpha(s) / (B0 * amin)
+    d_s = re_cl_alpha(s) / (B0 * re_eq_a_scale())
     write(*,'(I5,ES13.4,F10.5,ES13.4,F10.3,ES15.6,ES12.3)') &
       s, re_cl_ekin(s), re_cl_xi(s), re_cl_w(s), re_cl_gamma(s), re_cl_vpar(s), d_s
   enddo
@@ -1027,13 +1040,13 @@ end function re_eq_nprof_at
 !> only costs a few extra outer iterations.
 subroutine re_eq_init_nprof(my_id)
   use tr_module
-  use phys_module, only: F0, R_geo, amin
+  use phys_module, only: F0, R_geo
   implicit none
   integer, intent(in) :: my_id
   integer, parameter  :: nr = 512
   integer :: i, k, ipass
   real*8  :: B0, r(nr), q(nr), ph(nr), Ienc(nr), Bth(nr), j(nr), dq_dr(nr)
-  real*8  :: psi_pol, vbar, l, dl
+  real*8  :: psi_pol, vbar, l, dl, a_pl
 
   call tr_allocate(re_nprof_l, 1, re_eq_n_l, "re_nprof_l", CAT_GRID)
   call tr_allocate(re_nprof,   1, re_eq_n_l, "re_nprof",   CAT_GRID)
@@ -1051,10 +1064,11 @@ subroutine re_eq_init_nprof(my_id)
   re_eq_reverted      = .false.
   re_eq_done          = .false.
 
-  B0 = abs(F0) / R_geo
+  B0   = abs(F0) / R_geo
+  a_pl = re_eq_a_scale()
   do i = 1, nr
-    r(i)  = amin * dble(i) / dble(nr)
-    ph(i) = (r(i)/amin)**2          ! first pass: psihat ~ (r/a)^2
+    r(i)  = a_pl * dble(i) / dble(nr)
+    ph(i) = (r(i)/a_pl)**2          ! first pass: psihat ~ (r/a)^2
   enddo
 
   do ipass = 1, 2
@@ -1284,7 +1298,6 @@ subroutine re_eq_find_drift_axis(node_list, element_list, alpha, R0, Z0, &
                                  R_ax, Z_ax, A_ax, ifail)
   use data_structure
   use equil_info, only: ES
-  use phys_module, only: amin
   use mod_model_settings, only: var_psi
   implicit none
   type (type_node_list),    intent(in)  :: node_list
@@ -1329,7 +1342,7 @@ subroutine re_eq_find_drift_axis(node_list, element_list, alpha, R0, Z0, &
   ! --- least-squares paraboloid A ~ c1 + c2 x + c3 y + c4 x^2 + c5 xy + c6 y^2
   !     over the nodes within r_fit of the scan extremum (x = R-R_scan,
   !     y = Z-Z_scan); grow the radius until enough nodes participate
-  r_fit = 0.05d0 * amin
+  r_fit = 0.05d0 * re_eq_a_scale()
   do i_pass = 1, 8
     M = 0.d0;  rhs = 0.d0;  n_fit = 0
     do i = 1, node_list%n_nodes
@@ -1432,7 +1445,6 @@ subroutine re_eq_grad_psi(node_list, element_list, R, Z, psi, dpsi_dR, dpsi_dZ, 
   use data_structure
   use mod_interp, only: interp_PRZ
   use mod_model_settings, only: var_psi
-  use phys_module, only: amin
   implicit none
   interface
     subroutine find_RZ(node_list,element_list,R_find,Z_find,R_out,Z_out,ielm_out,s_out,t_out,ifail)
@@ -1458,8 +1470,8 @@ subroutine re_eq_grad_psi(node_list, element_list, R, Z, psi, dpsi_dR, dpsi_dZ, 
   real*8, parameter :: off_Z(9) = (/ 0.d0,  1.d0,  1.d0, -1.d0, -1.d0,  1.d0,  1.d0, -1.d0, -1.d0 /)
 
   do i_try = 1, 9
-    eps = 1.d-5 * amin
-    if (i_try .ge. 6) eps = 1.d-3 * amin
+    eps = 1.d-5 * re_eq_a_scale()
+    if (i_try .ge. 6) eps = 1.d-3 * re_eq_a_scale()
     R_try = R + off_R(i_try) * eps
     Z_try = Z + off_Z(i_try) * eps
     call find_RZ(node_list, element_list, R_try, Z_try, R_out, Z_out, i_elm, s, t, ifail)
@@ -3048,6 +3060,26 @@ subroutine re_eq_apply_beam_envelope()
     if (re_nprof_l(k) .gt. re_eq_l_beam) re_nprof(k) = 0.d0
   enddo
 end subroutine re_eq_apply_beam_envelope
+
+
+!=======================================================================
+!> Plasma minor-radius scale [m] for the solver's internal length scales
+!> (cylindrical initial Nprof guess, drift-axis fit radius, find_RZ retry
+!> offsets, printed d_s): re_eq_lcfs_a when set, otherwise amin. amin is the
+!> scale of the computational DOMAIN boundary -- with an R_Z_psi_bnd_file it
+!> multiplies the file contour and is then 1 for a domain taken as written,
+!> typically the vessel -- so it is the plasma radius only for an analytic
+!> boundary that coincides with the plasma edge.
+function re_eq_a_scale() result(a)
+  use phys_module, only: amin
+  implicit none
+  real*8 :: a
+  if (re_eq_lcfs_a .gt. 0.d0) then
+    a = re_eq_lcfs_a
+  else
+    a = amin
+  endif
+end function re_eq_a_scale
 
 
 !=======================================================================
